@@ -397,6 +397,12 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
 
     opts.update(speed_opts)
 
+    if not cookie:
+        for possible_cookie in ["/sdcard/Download/cookies.txt", "/sdcard/Download/youtube_cookies.txt", os.path.expanduser("~/cookies.txt")]:
+            if os.path.isfile(possible_cookie):
+                cookie = possible_cookie
+                break
+
     if cookie:
         if os.path.isfile(cookie):
             opts['cookiefile'] = cookie
@@ -1219,6 +1225,13 @@ def search_by_name(target_dir=None):
 
 def generate_adm_links_for_url(url):
     format_spec, is_audio = prompt_video_quality(url)
+    
+    # For single direct stream URL extraction (where no local FFmpeg re-muxing takes place),
+    # ensure format requests progressive audio+video combined streams unless audio-only was picked.
+    if is_audio:
+        stream_format = 'bestaudio/best'
+    else:
+        stream_format = f"{format_spec}[acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/b/best"
 
     print(f"\n➜ Extracting direct stream links for: {url}...")
     if not HAS_YTDLP:
@@ -1249,7 +1262,7 @@ def generate_adm_links_for_url(url):
                 v_url = entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
                 
                 try:
-                    with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': format_spec})) as v_ydl:
+                    with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': stream_format})) as v_ydl:
                         v_info = v_ydl.extract_info(v_url, download=False)
                         stream_url = None
                         if v_info and isinstance(v_info, dict):
@@ -1259,13 +1272,13 @@ def generate_adm_links_for_url(url):
                         if stream_url:
                             adm_links.append((idx, v_title, stream_url))
                             print(f"   [{idx}] {v_title}")
-                            print(f"       🔗 Direct Stream Link: {stream_url[:90]}...\n")
+                            print(f"       🔗 Direct Stream Link (with Audio): {stream_url[:90]}...\n")
                 except Exception as e:
                     print(f"   [{idx}] {v_title} - Error extracting stream link: {e}")
         else:
             v_title = info.get('title', 'Video')
             try:
-                with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': format_spec})) as v_ydl:
+                with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': stream_format})) as v_ydl:
                     v_info = v_ydl.extract_info(url, download=False)
                     stream_url = v_info.get('url')
                     if not stream_url and v_info.get('requested_formats'):
@@ -1275,7 +1288,7 @@ def generate_adm_links_for_url(url):
                         print("\n" + "="*65)
                         print(f" 🎬 Video: {v_title}")
                         print("="*65)
-                        print(f" 🔗 Direct Stream Link: {stream_url}\n")
+                        print(f" 🔗 Direct Stream Link (with Audio): {stream_url}\n")
             except Exception as e:
                 print(f"✖ Error extracting stream link: {e}")
 
