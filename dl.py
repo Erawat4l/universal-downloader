@@ -1218,28 +1218,7 @@ def search_by_name(target_dir=None):
             return handle_youtube_or_video(selected['url'], target_dir=target_dir)
 
 def generate_adm_links_for_url(url):
-    print("\n" + "="*65)
-    print(" Select Stream Quality / Format:")
-    print("   [1] 🌟 Best Available (Highest Quality - 4K/1080p)")
-    print("   [2] 🎬 1080p (Full HD)")
-    print("   [3] 📺 720p (HD)")
-    print("   [4] 📱 480p (SD)")
-    print("   [5] 🎵 Audio Only (Best MP3/M4A)")
-    print("="*65)
-    try:
-        q_choice = input("➜ Select choice [1-5] (Default: 1): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        q_choice = '1'
-
-    format_spec = 'bestvideo+bestaudio/best'
-    if q_choice == '2':
-        format_spec = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
-    elif q_choice == '3':
-        format_spec = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
-    elif q_choice == '4':
-        format_spec = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
-    elif q_choice == '5':
-        format_spec = 'bestaudio/best'
+    format_spec, is_audio = prompt_video_quality(url)
 
     print(f"\n➜ Extracting direct stream links for: {url}...")
     if not HAS_YTDLP:
@@ -1280,7 +1259,7 @@ def generate_adm_links_for_url(url):
                         if stream_url:
                             adm_links.append((idx, v_title, stream_url))
                             print(f"   [{idx}] {v_title}")
-                            print(f"       🔗 Direct Link: {stream_url[:90]}...\n")
+                            print(f"       🔗 Direct Stream Link: {stream_url[:90]}...\n")
                 except Exception as e:
                     print(f"   [{idx}] {v_title} - Error extracting stream link: {e}")
         else:
@@ -1296,20 +1275,41 @@ def generate_adm_links_for_url(url):
                         print("\n" + "="*65)
                         print(f" 🎬 Video: {v_title}")
                         print("="*65)
-                        print(f" 🔗 Direct Link: {stream_url}\n")
+                        print(f" 🔗 Direct Stream Link: {stream_url}\n")
             except Exception as e:
                 print(f"✖ Error extracting stream link: {e}")
 
         if adm_links:
             txt_path = "/sdcard/Download/adm_playlist_links.txt"
-            all_urls_str = "\n".join([url for _, _, url in adm_links])
+            all_urls_str = "\n".join([stream for _, _, stream in adm_links])
             with open(txt_path, "w") as f:
                 f.write(all_urls_str + "\n")
+            
+            start_local_http_server()
+            single_hosted_url = "http://localhost:8080/adm_playlist_links.txt"
+            my_ip = "127.0.0.1"
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("1.1.1.1", 80))
+                my_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                pass
+            lan_url = f"http://{my_ip}:8080/adm_playlist_links.txt"
+
             print("="*65)
             print(f" 📄 Saved {len(adm_links)} direct link(s) to: {txt_path}")
+            if len(adm_links) > 1:
+                clipboard_target = single_hosted_url
+                print(f" 🚀 Single All-in-One Link for ADM: {single_hosted_url}")
+                print(f" 🌐 Wi-Fi LAN Download Link:       {lan_url}")
+            else:
+                clipboard_target = adm_links[0][2]
+                print(f" 🚀 Single Stream Link: {clipboard_target}")
+            
             try:
-                subprocess.run(["termux-clipboard-set"], input=all_urls_str.encode('utf-8'), capture_output=True)
-                print(" 📋 All direct links copied to Android Clipboard!")
+                subprocess.run(["termux-clipboard-set"], input=clipboard_target.encode('utf-8'), capture_output=True)
+                print(" 📋 Single link copied to Android Clipboard!")
             except Exception:
                 pass
             print("="*65 + "\n")
