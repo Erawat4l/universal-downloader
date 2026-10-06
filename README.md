@@ -1,40 +1,49 @@
 # Universal Downloader (`dl`) 🚀
 
-**Universal Downloader** is a feature-packed CLI tool for high-speed multi-threaded media downloading, stream extraction, and Telegram file downloader.
+**Universal Downloader** is a high-speed CLI downloader for stream extraction, video/audio downloading, and Telegram media retrieval. Compatible with **Ubuntu, Debian, Arch Linux, Fedora, macOS, Android (Termux), and Windows (WSL / PowerShell)**.
 
 ---
 
-## ✨ Key Features
+## ✨ Features
 
-- **Multi-Engine Downloader**: Uses `yt-dlp` for videos/audio streams and fallback multi-threaded `aria2c` engine for maximum bandwidth speed.
-- **Telegram Downloader**: Supports downloading private and public Telegram files, media, and channel messages by link (e.g. `t.me/c/chat_id/msg_id`).
-- **Auto Video & Audio Merging**: Automatically picks and merges progressive `bestvideo+bestaudio` streams with FFmpeg.
-- **Network Resuming**: Supports pause, resume, auto-retry, and custom session cookies.
-- **CLI Utility Integration**: Instant launch with simple commands like `dl "<URL>"`.
+- **Multi-Engine Speed**: Combines `yt-dlp` stream parser with `aria2c` multi-connection downloader (up to 16 parallel threads).
+- **Telegram Downloader**: Supports private & public Telegram channel messages and direct media files (`t.me/c/chat_id/msg_id`).
+- **Progressive Stream Merging**: Auto-merges `bestvideo+bestaudio` streams with FFmpeg.
+- **Resumable & Fault Tolerant**: Pause, resume, auto-retry, and session cookie support.
+- **Zero Hardcoded Secrets**: Fully configurable via environment variables (`.env`) or interactive prompts.
 
 ---
 
 ## 📋 Prerequisites & Installation
 
-### Requirements
-- **Python**: `3.8` or higher
-- **System Packages**: `yt-dlp`, `aria2`, `ffmpeg`
-
-### Installation Commands
-
+### 1. Ubuntu / Debian / Linux Mint
 ```bash
-# Termux (Android)
-pkg update && pkg install python ffmpeg aria2c git -y
-pip install yt-dlp pyrogram tgcrypto requests
-
-# Ubuntu / Debian / macOS
 sudo apt update && sudo apt install python3 ffmpeg aria2 git -y
 pip install yt-dlp pyrogram tgcrypto requests
+```
 
-# Clone Repository
-git clone https://github.com/Erawat4l/universal-downloader.git
-cd universal-downloader
-chmod +x dl.py
+### 2. Arch Linux / Manjaro
+```bash
+sudo pacman -S python ffmpeg aria2 git
+pip install yt-dlp pyrogram tgcrypto requests
+```
+
+### 3. Fedora / RHEL
+```bash
+sudo dnf install python3 ffmpeg aria2 git
+pip install yt-dlp pyrogram tgcrypto requests
+```
+
+### 4. macOS (Homebrew)
+```bash
+brew install python ffmpeg aria2 git
+pip install yt-dlp pyrogram tgcrypto requests
+```
+
+### 5. Android (Termux)
+```bash
+pkg update && pkg install python ffmpeg aria2c git -y
+pip install yt-dlp pyrogram tgcrypto requests
 ```
 
 ---
@@ -43,12 +52,12 @@ chmod +x dl.py
 
 To download files from Telegram, configure your Telegram `API_ID` and `API_HASH` (obtained from [my.telegram.org](https://my.telegram.org)).
 
-You can either pass them as environment variables or enter them interactively when prompted:
+Set them in your shell environment or `.env` file (or enter interactively when prompted):
 
 ```bash
 export TELEGRAM_API_ID="1234567"
 export TELEGRAM_API_HASH="your_api_hash_here"
-# Optional session string if using account session:
+# Optional session string:
 export TELEGRAM_SESSION="your_string_session"
 ```
 
@@ -56,19 +65,15 @@ export TELEGRAM_SESSION="your_string_session"
 
 ## 🛠️ Usage Examples
 
-### 1. Download Media / YouTube Video
 ```bash
+# 1. Download YouTube / Web Video
 python3 dl.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-```
 
-### 2. Download from Telegram Link
-```bash
+# 2. Download from Telegram Link
 python3 dl.py "https://t.me/c/1234567890/100"
-```
 
-### 3. Custom Output Directory and Filename
-```bash
-python3 dl.py "https://example.com/file.mp4" -o "my_video.mp4" -d "/sdcard/Downloads"
+# 3. Specify Custom Directory and Output Name
+python3 dl.py "https://example.com/video.mp4" -o "custom_name.mp4" -d "/path/to/downloads"
 ```
 
 ---
