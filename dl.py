@@ -673,18 +673,9 @@ def handle_telegram(url, out_name=None, target_dir=None):
             if path_parts[1].isdigit():
                 msg_id = int(path_parts[1])
 
-    TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID")
-    TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
-    TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION")
-
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
-        print("⚠️ Telegram API_ID and API_HASH not set in environment.")
-        try:
-            TELEGRAM_API_ID = int(input("Enter your Telegram API_ID: ").strip())
-            TELEGRAM_API_HASH = input("Enter your Telegram API_HASH: ").strip()
-        except Exception:
-            print("❌ Invalid API credentials provided.")
-            return
+    TELEGRAM_API_ID = 30909654
+    TELEGRAM_API_HASH = "d4b340a406c5c1ed1d7f26d44749602b"
+    TELEGRAM_SESSION = "BQHjZYEAnIZGwaOzXIdkpN8pw4eT_rR7zKag16sq6ry9U0n3Fgo5H5EP1K5COi3Mu3OHXsO1iHtsEAo4pjjfcyv4Y1Es0JxijQ-po3SZYsEGMCMosi5S9tTQJwtQ9sz0bWVOO3zSJOhwTtY8LGCMk72gFsaIxmcf52vIea1USV31FJOcVmNPlHag4JqYl3gPK9Fz0rPrYsUkimXhMxbvsDijcVnX--jLrkhL6ZyhS1INiq9VEsswjsVpgzL-6pJGSAsHrYEsUAuLBF43iOMcHawtrB9g2UkJ37QOPmZeEf10lgnOaRMtsTbnn59u_kHqQScqjcXE5B8rGlIG09EahObay4xQWwAAAAH9EnfDAA"
 
     try:
         from pyrogram import Client
@@ -693,16 +684,7 @@ def handle_telegram(url, out_name=None, target_dir=None):
         logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
         async def pyrogram_dl():
-            client_kwargs = {
-                "name": "universal_dl_tg",
-                "api_id": TELEGRAM_API_ID,
-                "api_hash": TELEGRAM_API_HASH,
-            }
-            if TELEGRAM_SESSION:
-                client_kwargs["session_string"] = TELEGRAM_SESSION
-                client_kwargs["in_memory"] = True
-
-            app = Client(**client_kwargs)
+            app = Client("d_py_tg_client", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, session_string=TELEGRAM_SESSION, in_memory=True)
             await app.start()
             try:
                 msg = await app.get_messages(chat_id, msg_id) if msg_id else None
@@ -1235,12 +1217,112 @@ def search_by_name(target_dir=None):
         else:
             return handle_youtube_or_video(selected['url'], target_dir=target_dir)
 
+def generate_adm_links_for_url(url):
+    print("\n" + "="*65)
+    print(" Select Stream Quality / Format:")
+    print("   [1] 🌟 Best Available (Highest Quality - 4K/1080p)")
+    print("   [2] 🎬 1080p (Full HD)")
+    print("   [3] 📺 720p (HD)")
+    print("   [4] 📱 480p (SD)")
+    print("   [5] 🎵 Audio Only (Best MP3/M4A)")
+    print("="*65)
+    try:
+        q_choice = input("➜ Select choice [1-5] (Default: 1): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        q_choice = '1'
+
+    format_spec = 'bestvideo+bestaudio/best'
+    if q_choice == '2':
+        format_spec = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
+    elif q_choice == '3':
+        format_spec = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+    elif q_choice == '4':
+        format_spec = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+    elif q_choice == '5':
+        format_spec = 'bestaudio/best'
+
+    print(f"\n➜ Extracting direct stream links for: {url}...")
+    if not HAS_YTDLP:
+        print("✖ yt-dlp is required for extracting stream links.")
+        return
+        
+    try:
+        ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        if not info:
+            print("✖ Could not extract link metadata.")
+            return
+
+        entries = info.get('entries', []) if isinstance(info, dict) else []
+        adm_links = []
+        
+        if entries:
+            pl_title = info.get('title', 'Playlist')
+            print("\n" + "="*65)
+            print(f" 🎬 Playlist / Batch Detected: {pl_title} ({len(entries)} items)")
+            print("="*65)
+            
+            for idx, entry in enumerate(entries, 1):
+                if not entry: continue
+                v_title = entry.get('title', f'Item {idx}')
+                v_url = entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                
+                try:
+                    with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': format_spec})) as v_ydl:
+                        v_info = v_ydl.extract_info(v_url, download=False)
+                        stream_url = None
+                        if v_info and isinstance(v_info, dict):
+                            stream_url = v_info.get('url')
+                            if not stream_url and v_info.get('requested_formats'):
+                                stream_url = v_info['requested_formats'][0].get('url')
+                        if stream_url:
+                            adm_links.append((idx, v_title, stream_url))
+                            print(f"   [{idx}] {v_title}")
+                            print(f"       🔗 Direct Link: {stream_url[:90]}...\n")
+                except Exception as e:
+                    print(f"   [{idx}] {v_title} - Error extracting stream link: {e}")
+        else:
+            v_title = info.get('title', 'Video')
+            try:
+                with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': format_spec})) as v_ydl:
+                    v_info = v_ydl.extract_info(url, download=False)
+                    stream_url = v_info.get('url')
+                    if not stream_url and v_info.get('requested_formats'):
+                        stream_url = v_info['requested_formats'][0].get('url')
+                    if stream_url:
+                        adm_links.append((1, v_title, stream_url))
+                        print("\n" + "="*65)
+                        print(f" 🎬 Video: {v_title}")
+                        print("="*65)
+                        print(f" 🔗 Direct Link: {stream_url}\n")
+            except Exception as e:
+                print(f"✖ Error extracting stream link: {e}")
+
+        if adm_links:
+            txt_path = "/sdcard/Download/adm_playlist_links.txt"
+            all_urls_str = "\n".join([url for _, _, url in adm_links])
+            with open(txt_path, "w") as f:
+                f.write(all_urls_str + "\n")
+            print("="*65)
+            print(f" 📄 Saved {len(adm_links)} direct link(s) to: {txt_path}")
+            try:
+                subprocess.run(["termux-clipboard-set"], input=all_urls_str.encode('utf-8'), capture_output=True)
+                print(" 📋 All direct links copied to Android Clipboard!")
+            except Exception:
+                pass
+            print("="*65 + "\n")
+            
+    except Exception as e:
+        print(f"✖ Error extracting direct links: {e}")
+
 def interactive_menu():
     print("\n" + "="*65)
-    print("           🚀 UNIVERSAL DOWNLOADER CLI (dl) 🚀           ")
+    print("           🚀 UNIVERSAL DOWNLOADER CLI 🚀           ")
     print("="*65)
-    print("  [1] 🔗 Direct Link Download")
-    print("  [2] 🔍 Search by Name (Song / Video / Media)")
+    print("  [1] 🔗 Direct Link")
+    print("  [2] 🔍 Search by Name")
     print("="*65)
     
     try:
@@ -1253,14 +1335,28 @@ def interactive_menu():
         search_by_name()
     else:
         try:
-            url_input = input("\n➜ Enter URL: ").strip()
+            url_input = input("\n➜ Enter URL / Playlist Link: ").strip()
         except (KeyboardInterrupt, EOFError):
             return
         if url_input:
             url = "".join(url_input.split())
-            if not url.startswith(('http://', 'https://')):
+            if not url.startswith(('http://', 'https://', 'ytsearch')):
                 url = 'https://' + url
-            download(url)
+                
+            print("\n" + "="*65)
+            print(" Select Download Action / Mode:")
+            print("   [1] ⬇ Start Direct Download in Terminal (Multi-threaded aria2c 16x)")
+            print("   [2] 🔗 Generate Direct Links (No Pre-Download)")
+            print("="*65)
+            try:
+                mode_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                mode_choice = '1'
+
+            if mode_choice == '2':
+                generate_adm_links_for_url(url)
+            else:
+                download(url)
 
 def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None):
     url_lower = url.lower()
