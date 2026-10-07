@@ -97,9 +97,32 @@ def start_local_http_server():
 
 def print_adm_link(file_path):
     start_local_http_server()
-    if not file_path: return
+    if not file_path or not os.path.exists(file_path): return
     basename = os.path.basename(file_path)
-    encoded = urllib.parse.quote(basename)
+    ext = os.path.splitext(basename)[1] or ".mp4"
+    dir_name = os.path.dirname(file_path) or "/sdcard/Download"
+    
+    short_name = None
+    for i in range(1, 100):
+        cand = f"v{i}{ext}"
+        cand_p = os.path.join(dir_name, cand)
+        if not os.path.exists(cand_p):
+            try:
+                os.link(file_path, cand_p)
+                short_name = cand
+            except Exception:
+                try:
+                    shutil.copyfile(file_path, cand_p)
+                    short_name = cand
+                except Exception:
+                    pass
+            break
+        elif os.path.exists(cand_p) and os.path.getsize(cand_p) == os.path.getsize(file_path):
+            short_name = cand
+            break
+
+    display_name = short_name or basename
+    encoded = urllib.parse.quote(display_name)
     local_url = f"http://localhost:8080/{encoded}"
     my_ip = "127.0.0.1"
     try:
@@ -117,6 +140,11 @@ def print_adm_link(file_path):
     print(f" 🔗 Copy & Paste into ADM App: {local_url}")
     print(f" 🌐 Wi-Fi LAN Download Link:  {lan_url}")
     print("="*65 + "\n")
+    try:
+        subprocess.run(["termux-clipboard-set"], input=local_url.encode('utf-8'), capture_output=True)
+        print(" 📋 Short link copied to Android Clipboard!")
+    except Exception:
+        pass
 
 def clean_filename(title, default_ext=".pdf"):
     title = re.sub(r'[\\/*?:"<>|]', '', title)
@@ -557,6 +585,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
             'preferredquality': '192',
         }]
     else:
+        ydl_opts['merge_output_format'] = 'mp4'
         if shutil.which("aria2c"):
             ydl_opts['external_downloader'] = 'aria2c'
             ydl_opts['external_downloader_args'] = {'aria2c': ['-s', '16', '-x', '16', '-k', '1M', '--console-log-level=warn']}
@@ -1105,123 +1134,131 @@ def search_netmirror(query):
         pass
     return []
 
-def search_by_name(target_dir=None):
-    try:
-        query = input("\n➜ Enter Movie, Series, Song, or Video Name to Search: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-    if not query:
-        print("⚠ Search query cannot be empty.")
-        return None
-
-    PROCESS_MONITOR.set_status(f"Searching NetMirror & YouTube for '{query}'...")
-    print(f"\n➜ Searching for: \"{query}\" across NetMirror (Movies/Series) & YouTube...")
-    
-    nm_results = search_netmirror(query)
-    
-    yt_entries = []
-    if HAS_YTDLP:
+def prompt_action_mode_and_run(url):
+    while True:
+        print("\n" + "="*65)
+        print(" Select Download Action / Mode:")
+        print("   [1] ⬇ Start Direct Download in Terminal (Multi-threaded aria2c 16x)")
+        print("   [2] 🔗 Generate Direct Links (No Pre-Download)")
+        print("="*65)
         try:
-            ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                res = ydl.extract_info(f"ytsearch5:{query}", download=False)
-                yt_entries = res.get('entries', []) if res else []
-        except Exception:
-            yt_entries = []
-
-    if not nm_results and not yt_entries:
-        print("⚠ No search results found on NetMirror or YouTube.")
-        return None
-
-    options = []
-
-    print("\n" + "="*65)
-    print(f" 🔍 Search Results for: \"{query}\"")
-    print("="*65)
-
-    if nm_results:
-        print(" 🎬 NetMirror (Movies & TV Series):")
-        for item in nm_results[:5]:
-            idx = len(options) + 1
-            yr_str = f" ({item['year']})" if item['year'] else ""
-            print(f"   [{idx}] {item['title']} [{item['type']}{yr_str}]")
-            options.append({
-                'source': 'netmirror',
-                'title': item['title'],
-                'url': item['url']
-            })
-
-    if yt_entries:
-        if nm_results:
-            print("\n 🎵 YouTube (Videos, Songs & Media):")
-        else:
-            print(" 🎵 YouTube (Videos, Songs & Media):")
-
-        for entry in yt_entries:
-            if not entry: continue
-            title = entry.get('title', 'Unknown Title')
-            uploader = entry.get('uploader') or entry.get('channel') or 'Unknown Uploader'
-            duration = entry.get('duration')
-            dur_str = f"{int(duration)//60}:{int(duration)%60:02d}" if isinstance(duration, (int, float)) else "N/A"
-            url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
-            
-            idx = len(options) + 1
-            print(f"   [{idx}] {title}")
-            print(f"       Channel: {uploader} | Duration: {dur_str}")
-            options.append({
-                'source': 'youtube',
-                'title': title,
-                'uploader': uploader,
-                'dur_str': dur_str,
-                'url': url
-            })
-
-    print("="*65)
-
-    try:
-        choice = input(f"➜ Select result [1-{len(options)}] (Default: 1): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-    if not choice or not choice.isdigit() or int(choice) < 1 or int(choice) > len(options):
-        choice_idx = 0
-    else:
-        choice_idx = int(choice) - 1
-
-    selected = options[choice_idx]
-    print(f"\n➜ Selected: {selected['title']}")
-
-    if selected['source'] == 'netmirror':
-        return handle_netmirror(selected['url'], target_dir=target_dir)
-    else:
-        print("\n" + "="*55)
-        print(" Select Download Format & Quality:")
-        print("   [1] Video (Best Available / Dynamic Selector)")
-        print("   [2] Audio (Lossless FLAC / WAV Transcode)")
-        print("   [3] Audio (High Quality MP3 320kbps)")
-        print("   [4] Audio (Original AAC/Opus Stream)")
-        print("="*55)
-
-        try:
-            type_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
+            mode_choice = input("➜ Select choice [1-2]: ").strip()
         except (KeyboardInterrupt, EOFError):
-            type_choice = '1'
+            return
 
-        if type_choice == '2':
-            print("\n" + "!"*65)
-            print(" 💡 NOTE ON LOSSLESS AUDIO:")
-            print(" YouTube streams max out at ~160-256kbps AAC/Opus.")
-            print(" Extracting and encoding into 16-bit 44.1kHz FLAC Lossless format.")
-            print(" If you need true 24-bit Lossless (Apple Music / Tidal), ask me in chat!")
-            print("!"*65 + "\n")
-            return download_youtube_audio(selected['url'], codec='flac', target_dir=target_dir)
-        elif type_choice == '3':
-            return download_youtube_audio(selected['url'], codec='mp3', quality='320', target_dir=target_dir)
-        elif type_choice == '4':
-            return download_youtube_audio(selected['url'], codec='m4a', target_dir=target_dir)
+        if mode_choice == '1':
+            download(url)
+            break
+        elif mode_choice == '2':
+            generate_adm_links_for_url(url)
+            break
         else:
-            return handle_youtube_or_video(selected['url'], target_dir=target_dir)
+            print("✖ Invalid selection. Please select choice 1 or 2.")
+
+def search_by_name(target_dir=None):
+    while True:
+        print("\n" + "="*65)
+        print(" Select Search Platform:")
+        print("   [1] 🎬 NetMirror (Movies / Series / Web Shows)")
+        print("   [2] 📺 YouTube (Video / Music / Audio)")
+        print("="*65)
+        try:
+            p_choice = input("➜ Select choice [1-2]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return
+
+        if p_choice == '1':
+            while True:
+                try:
+                    query = input("\n➜ Enter Movie / Series Name to Search NetMirror: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return
+                if not query:
+                    print("✖ Search query cannot be empty.")
+                    continue
+                
+                print(f"\n➜ Searching NetMirror for: \"{query}\"...")
+                results = search_netmirror(query)
+                if not results:
+                    print("⚠ No search results found on NetMirror.")
+                    return
+                
+                print("\n" + "="*65)
+                print(f" 🎬 NetMirror Search Results for: \"{query}\"")
+                print("="*65)
+                for idx, item in enumerate(results[:10], 1):
+                    yr_str = f" ({item['year']})" if item['year'] else ""
+                    print(f"   [{idx}] {item['title']} [{item['type']}{yr_str}]")
+                print("="*65)
+
+                while True:
+                    try:
+                        sel = input(f"➜ Select result [1-{len(results[:10])}]: ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        return
+                    if sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
+                        selected = results[int(sel) - 1]
+                        print(f"\n➜ Selected: {selected['title']}")
+                        prompt_action_mode_and_run(selected['url'])
+                        return
+                    else:
+                        print(f"✖ Invalid selection. Please select choice 1 to {len(results[:10])}.")
+            break
+
+        elif p_choice == '2':
+            while True:
+                try:
+                    query = input("\n➜ Enter Video / Song Name to Search YouTube: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return
+                if not query:
+                    print("✖ Search query cannot be empty.")
+                    continue
+                
+                print(f"\n➜ Searching YouTube for: \"{query}\"...")
+                yt_entries = []
+                if HAS_YTDLP:
+                    try:
+                        ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            res = ydl.extract_info(f"ytsearch10:{query}", download=False)
+                            yt_entries = [e for e in res.get('entries', []) if e] if res else []
+                    except Exception:
+                        yt_entries = []
+                
+                if not yt_entries:
+                    print("⚠ No search results found on YouTube.")
+                    return
+
+                print("\n" + "="*65)
+                print(f" 🎵 YouTube Search Results for: \"{query}\"")
+                print("="*65)
+                for idx, entry in enumerate(yt_entries[:10], 1):
+                    title = entry.get('title', 'Unknown Title')
+                    uploader = entry.get('uploader') or entry.get('channel') or 'Unknown Uploader'
+                    duration = entry.get('duration')
+                    dur_str = f"{int(duration)//60}:{int(duration)%60:02d}" if isinstance(duration, (int, float)) else "N/A"
+                    print(f"   [{idx}] {title}")
+                    print(f"       Channel: {uploader} | Duration: {dur_str}")
+                print("="*65)
+
+                while True:
+                    try:
+                        sel = input(f"➜ Select result [1-{len(yt_entries[:10])}]: ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        return
+                    if sel.isdigit() and 1 <= int(sel) <= len(yt_entries[:10]):
+                        selected_entry = yt_entries[int(sel) - 1]
+                        selected_url = selected_entry.get('url') or selected_entry.get('webpage_url') or f"https://www.youtube.com/watch?v={selected_entry.get('id')}"
+                        print(f"\n➜ Selected: {selected_entry.get('title')}")
+                        prompt_action_mode_and_run(selected_url)
+                        return
+                    else:
+                        print(f"✖ Invalid selection. Please select choice 1 to {len(yt_entries[:10])}.")
+            break
+
+        else:
+            print("✖ Invalid selection. Please select choice 1 or 2.")
 
 def generate_adm_links_for_url(url):
     format_spec, is_audio = prompt_video_quality(url)
@@ -1331,45 +1368,40 @@ def generate_adm_links_for_url(url):
         print(f"✖ Error extracting direct links: {e}")
 
 def interactive_menu():
-    print("\n" + "="*65)
-    print("           🚀 UNIVERSAL DOWNLOADER CLI 🚀           ")
-    print("="*65)
-    print("  [1] 🔗 Direct Link")
-    print("  [2] 🔍 Search by Name")
-    print("="*65)
-    
-    try:
-        choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("\nExiting...")
-        sys.exit(0)
-
-    if choice == '2':
-        search_by_name()
-    else:
+    while True:
+        print("\n" + "="*65)
+        print("           🚀 UNIVERSAL DOWNLOADER CLI 🚀           ")
+        print("="*65)
+        print("  [1] 🔗 Direct Link")
+        print("  [2] 🔍 Search by Name")
+        print("="*65)
+        
         try:
-            url_input = input("\n➜ Enter URL / Playlist Link: ").strip()
+            choice = input("➜ Select choice [1-2]: ").strip()
         except (KeyboardInterrupt, EOFError):
-            return
-        if url_input:
-            url = "".join(url_input.split())
-            if not url.startswith(('http://', 'https://', 'ytsearch')):
-                url = 'https://' + url
-                
-            print("\n" + "="*65)
-            print(" Select Download Action / Mode:")
-            print("   [1] ⬇ Start Direct Download in Terminal (Multi-threaded aria2c 16x)")
-            print("   [2] 🔗 Generate Direct Links (No Pre-Download)")
-            print("="*65)
-            try:
-                mode_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                mode_choice = '1'
+            print("\nExiting...")
+            sys.exit(0)
 
-            if mode_choice == '2':
-                generate_adm_links_for_url(url)
-            else:
-                download(url)
+        if choice == '1':
+            while True:
+                try:
+                    url_input = input("\n➜ Enter URL / Playlist Link: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return
+                if not url_input:
+                    print("✖ Link cannot be empty. Please enter a valid URL.")
+                    continue
+                url = "".join(url_input.split())
+                if not url.startswith(('http://', 'https://', 'ytsearch')):
+                    url = 'https://' + url
+                prompt_action_mode_and_run(url)
+                break
+            break
+        elif choice == '2':
+            search_by_name()
+            break
+        else:
+            print("✖ Invalid selection. Please select choice 1 or 2.")
 
 def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None):
     url_lower = url.lower()
