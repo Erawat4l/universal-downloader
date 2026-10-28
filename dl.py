@@ -227,7 +227,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None):
                         filename += '.pdf'
                         dest_path = get_dest_path(filename, target_dir)
                     elif 'text/html' in content_type and not filename.endswith('.html'):
-                        print("⚠ Warning: The URL returned an HTML page rather than a direct file stream.")
+                        raise Exception("The server returned an HTML webpage instead of a direct file stream.")
 
                     total_length = r.headers.get('content-length')
                     total_bytes = int(total_length) if total_length and total_length.isdigit() else 0
@@ -759,6 +759,60 @@ def handle_telegram(url, out_name=None, target_dir=None):
                         print(f"\n✔ Telegram media downloaded to: {file_path}")
                         sync_to_sdcard_if_needed(file_path)
                         return file_path
+                elif msg:
+                    # Message exists but has no direct media attachment (e.g. text/update post)
+                    if msg.text or msg.caption:
+                        print("\n" + "="*65)
+                        print(f" 📄 Telegram Post {chat_id}/{msg_id} (Text Only):")
+                        print("="*65)
+                        print((msg.text or msg.caption).strip())
+                        print("="*65 + "\n")
+
+                    # Scan adjacent preceding messages for referenced media attachments (e.g. APKs, documents, videos)
+                    adjacent_media = []
+                    for offset in range(1, 5):
+                        try:
+                            adj_msg = await app.get_messages(chat_id, msg_id - offset)
+                            if adj_msg and adj_msg.media:
+                                fname = "media_file"
+                                fsize = 0
+                                if adj_msg.document:
+                                    fname = adj_msg.document.file_name or f"document_{msg_id - offset}"
+                                    fsize = adj_msg.document.file_size
+                                elif adj_msg.video:
+                                    fname = adj_msg.video.file_name or f"video_{msg_id - offset}.mp4"
+                                    fsize = adj_msg.video.file_size
+                                elif adj_msg.audio:
+                                    fname = adj_msg.audio.file_name or f"audio_{msg_id - offset}.mp3"
+                                    fsize = adj_msg.audio.file_size
+                                mb_sz = f" ({fsize / (1024*1024):.1f} MB)" if fsize else ""
+                                adjacent_media.append((adj_msg, fname, mb_sz))
+                        except Exception:
+                            pass
+
+                    if adjacent_media:
+                        print(" 📦 Detected media attachments in preceding messages from same post:")
+                        for idx, (m, fn, sz) in enumerate(adjacent_media, 1):
+                            print(f"   [{idx}] {fn}{sz} (Msg {m.id})")
+                        print("="*65)
+                        try:
+                            pick = input(f"➜ Select media to download [1-{len(adjacent_media)}] (Default: 1): ").strip()
+                            if not pick:
+                                pick = '1'
+                            if pick.isdigit() and 1 <= int(pick) <= len(adjacent_media):
+                                chosen_msg, chosen_name, _ = adjacent_media[int(pick) - 1]
+                                out_dir = target_dir or DEFAULT_DIR
+                                os.makedirs(out_dir, exist_ok=True)
+                                target_file = os.path.join(out_dir, out_name or chosen_name)
+                                print(f"\n➜ Fetching {chosen_name}...")
+                                fpath = await app.download_media(chosen_msg, file_name=target_file, progress=progress_cb)
+                                if fpath:
+                                    print(f"\n✔ Telegram media downloaded to: {fpath}")
+                                    sync_to_sdcard_if_needed(fpath)
+                                    return fpath
+                        except (KeyboardInterrupt, EOFError):
+                            pass
+                    return None
                 else:
                     print("⚠ No downloadable media found in Telegram message via Pyrogram.")
             finally:
@@ -782,13 +836,15 @@ def handle_telegram(url, out_name=None, target_dir=None):
                 return download_file_stream(video['src'], clean_filename(out_name or f"telegram_{clean_channel}_{msg_id}.mp4"), target_dir=target_dir)
             doc = soup.find('a', class_=re.compile(r'tgme_widget_message_document'))
             if doc and doc.get('href'):
-                return download_file_stream(doc['href'], clean_filename(out_name or f"telegram_{clean_channel}_{msg_id}"), target_dir=target_dir)
+                href = doc['href']
+                if not href.startswith(('https://t.me/', 'http://t.me/')):
+                    return download_file_stream(href, clean_filename(out_name or f"telegram_{clean_channel}_{msg_id}"), target_dir=target_dir)
     except Exception as e:
         print(f"✖ Web embed fallback failed: {e}")
 
     raise Exception("Could not download Telegram link media.")
 
-def handle_netmirror(url, out_name=None, target_dir=None):
+def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False):
     print("➜ Detected NetMirror link...")
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
@@ -912,10 +968,13 @@ def handle_netmirror(url, out_name=None, target_dir=None):
     print(f" 🔗 Copy & Paste into ADM App: {direct_stream_url}")
     print("="*65 + "\n")
     try:
-        subprocess.run(["termux-clipboard-set"], input=direct_stream_url.encode('utf-8'), capture_output=True)
+        subprocess.run(["termux-clipboard-set"], input=direct_stream_url.encode('utf-8'), capture_output=True, timeout=2)
         print("📋 Direct stream link copied to Android Clipboard!")
     except Exception:
         pass
+
+    if direct_link_only:
+        return direct_stream_url
 
     stream_headers = {
         'User-Agent': HEADERS['User-Agent'],
@@ -1096,45 +1155,91 @@ def download_youtube_audio(url, codec='mp3', quality='320', target_dir=None):
 
 def search_netmirror(query):
     try:
-        clean_q = query.strip().replace(' ', '+').replace('/', '--slash--')
-        headers = {
+        s = requests.Session()
+        s.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://mzfi.me/',
             'Origin': 'https://netmirror.center'
-        }
-        for host in ['api2.imdb4.shop', 'api2.imdb3.shop', 'api2.imdb2.shop']:
-            try:
-                url = f'https://{host}/api/search2/{clean_q}?page=0'
-                r = requests.get(url, headers=headers, timeout=8)
-                if r.status_code == 200:
-                    data = r.json()
-                    results = data.get('results', [])
-                    parsed = []
-                    for item in results:
-                        title = html.unescape(item.get('title') or item.get('name') or 'Unknown Title')
-                        media_id = item.get('id')
-                        m_type = item.get('type') or item.get('media_type') or 'movie'
-                        rel_date = item.get('release_date') or ''
-                        year = rel_date.split(',')[-1].strip() if rel_date else ''
-                        if media_id:
-                            nm_url = f"https://netmirror.center/{m_type}/{media_id}"
-                            parsed.append({
-                                'title': title,
-                                'type': m_type.upper(),
-                                'id': media_id,
-                                'year': year,
-                                'url': nm_url,
-                                'source': 'NetMirror'
-                            })
-                    if parsed:
-                        return parsed
-            except Exception:
-                continue
+        })
+        
+        norm_q = ' '.join(query.strip().split())
+        queries_to_try = [norm_q]
+        if '&' in norm_q:
+            queries_to_try.append(norm_q.replace('&', 'and'))
+        if ' and ' in norm_q.lower():
+            queries_to_try.append(re.sub(r'\band\b', '&', norm_q, flags=re.I))
+            
+        cleaned = ''.join(c if c.isalnum() or c.isspace() else ' ' for c in norm_q)
+        cleaned_words = ' '.join(cleaned.split())
+        if cleaned_words and cleaned_words not in queries_to_try:
+            queries_to_try.append(cleaned_words)
+
+        def query_api(q):
+            clean_q = urllib.parse.quote(q)
+            for host in ['api2.imdb3.shop', 'api2.imdb4.shop']:
+                try:
+                    url = f'https://{host}/api/search2/{clean_q}?page=0'
+                    r = s.get(url, timeout=3.5)
+                    if r.status_code == 200:
+                        data = r.json()
+                        results = data.get('results', [])
+                        parsed = []
+                        for item in results:
+                            title = html.unescape(item.get('title') or item.get('name') or 'Unknown Title')
+                            media_id = item.get('id')
+                            m_type = item.get('type') or item.get('media_type') or 'movie'
+                            rel_date = item.get('release_date') or ''
+                            year = rel_date.split(',')[-1].strip() if rel_date else ''
+                            if media_id:
+                                nm_url = f"https://netmirror.center/{m_type}/{media_id}"
+                                parsed.append({
+                                    'title': title,
+                                    'type': m_type.upper() if m_type else 'MOVIE/SERIES',
+                                    'id': media_id,
+                                    'year': year,
+                                    'url': nm_url,
+                                    'source': 'NetMirror'
+                                })
+                        if parsed:
+                            return parsed
+                except Exception:
+                    continue
+            return []
+
+        for q in queries_to_try:
+            res = query_api(q)
+            if res:
+                return res
+
+        # If still no results, use Google Suggestion for typo / spelling correction
+        try:
+            suggest_url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote(norm_q + ' series')}"
+            s_res = requests.get(suggest_url, timeout=3).json()
+            if len(s_res) > 1 and s_res[1]:
+                for sug in s_res[1][:3]:
+                    cleaned_sug = sug
+                    for noise in ['netflix series', 'web series', 'series cast', 'series review', 'series rating', 'series', 'imdb', 'cast']:
+                        cleaned_sug = re.sub(rf'\b{noise}\b', '', cleaned_sug, flags=re.I).strip()
+                    cand = ' '.join(cleaned_sug.split())
+                    if cand and len(cand) > 2 and cand.lower() != norm_q.lower():
+                        res = query_api(cand)
+                        if res:
+                            return res
+                        if '&' in cand:
+                            res = query_api(cand.replace('&', 'and'))
+                            if res: return res
+                        elif 'and' in cand.lower():
+                            res = query_api(re.sub(r'\band\b', '&', cand, flags=re.I))
+                            if res: return res
+        except Exception:
+            pass
+
     except Exception:
         pass
     return []
 
 def prompt_action_mode_and_run(url):
+    is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
     while True:
         print("\n" + "="*65)
         print(" Select Download Action / Mode:")
@@ -1142,15 +1247,23 @@ def prompt_action_mode_and_run(url):
         print("   [2] 🔗 Generate Direct Links (No Pre-Download)")
         print("="*65)
         try:
-            mode_choice = input("➜ Select choice [1-2]: ").strip()
+            mode_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+            if not mode_choice:
+                mode_choice = '1'
         except (KeyboardInterrupt, EOFError):
             return
 
         if mode_choice == '1':
-            download(url)
+            if is_netmirror:
+                handle_netmirror(url, direct_link_only=False)
+            else:
+                download(url)
             break
         elif mode_choice == '2':
-            generate_adm_links_for_url(url)
+            if is_netmirror:
+                handle_netmirror(url, direct_link_only=True)
+            else:
+                generate_adm_links_for_url(url)
             break
         else:
             print("✖ Invalid selection. Please select choice 1 or 2.")
@@ -1163,7 +1276,9 @@ def search_by_name(target_dir=None):
         print("   [2] 📺 YouTube (Video / Music / Audio)")
         print("="*65)
         try:
-            p_choice = input("➜ Select choice [1-2]: ").strip()
+            p_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+            if not p_choice:
+                p_choice = '1'
         except (KeyboardInterrupt, EOFError):
             return
 
@@ -1193,7 +1308,9 @@ def search_by_name(target_dir=None):
 
                 while True:
                     try:
-                        sel = input(f"➜ Select result [1-{len(results[:10])}]: ").strip()
+                        sel = input(f"➜ Select result [1-{len(results[:10])}] (Default: 1): ").strip()
+                        if not sel:
+                            sel = '1'
                     except (KeyboardInterrupt, EOFError):
                         return
                     if sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
@@ -1244,7 +1361,9 @@ def search_by_name(target_dir=None):
 
                 while True:
                     try:
-                        sel = input(f"➜ Select result [1-{len(yt_entries[:10])}]: ").strip()
+                        sel = input(f"➜ Select result [1-{len(yt_entries[:10])}] (Default: 1): ").strip()
+                        if not sel:
+                            sel = '1'
                     except (KeyboardInterrupt, EOFError):
                         return
                     if sel.isdigit() and 1 <= int(sel) <= len(yt_entries[:10]):
@@ -1261,14 +1380,22 @@ def search_by_name(target_dir=None):
             print("✖ Invalid selection. Please select choice 1 or 2.")
 
 def generate_adm_links_for_url(url):
+    is_yt = any(v in url.lower() for v in ['youtube.com', 'youtu.be'])
+    if is_yt:
+        print("\n" + "="*65)
+        print(" ℹ NOTE FOR YOUTUBE DIRECT LINKS:")
+        print(" • Modern YouTube splits HD/4K videos into separate video and audio streams.")
+        print(" • Raw single video links extracted for ADM will NOT contain audio.")
+        print(" • 👉 To download 1080p/4K WITH sound merged into an MP4 file,")
+        print("   select Option [1] in 'dl' (downloads at 16x speed and merges in 1s).")
+        print("="*65)
+
     format_spec, is_audio = prompt_video_quality(url)
     
-    # For single direct stream URL extraction (where no local FFmpeg re-muxing takes place),
-    # ensure format requests progressive audio+video combined streams unless audio-only was picked.
     if is_audio:
         stream_format = 'bestaudio/best'
     else:
-        stream_format = f"{format_spec}[acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/b/best"
+        stream_format = f"{format_spec}/bestvideo+bestaudio/best"
 
     print(f"\n➜ Extracting direct stream links for: {url}...")
     if not HAS_YTDLP:
@@ -1309,7 +1436,7 @@ def generate_adm_links_for_url(url):
                         if stream_url:
                             adm_links.append((idx, v_title, stream_url))
                             print(f"   [{idx}] {v_title}")
-                            print(f"       🔗 Direct Stream Link (with Audio): {stream_url[:90]}...\n")
+                            print(f"       🔗 Direct Stream Link: {stream_url[:90]}...\n")
                 except Exception as e:
                     print(f"   [{idx}] {v_title} - Error extracting stream link: {e}")
         else:
@@ -1318,14 +1445,21 @@ def generate_adm_links_for_url(url):
                 with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': stream_format})) as v_ydl:
                     v_info = v_ydl.extract_info(url, download=False)
                     stream_url = v_info.get('url')
+                    audio_stream_url = None
                     if not stream_url and v_info.get('requested_formats'):
                         stream_url = v_info['requested_formats'][0].get('url')
+                        if len(v_info['requested_formats']) > 1:
+                            audio_stream_url = v_info['requested_formats'][1].get('url')
                     if stream_url:
                         adm_links.append((1, v_title, stream_url))
                         print("\n" + "="*65)
                         print(f" 🎬 Video: {v_title}")
                         print("="*65)
-                        print(f" 🔗 Direct Stream Link (with Audio): {stream_url}\n")
+                        print(f" 🔗 Direct Video Stream Link: {stream_url}\n")
+                        if audio_stream_url:
+                            print(f" 🎵 Direct Audio Stream Link: {audio_stream_url}\n")
+                            print(" ⚠ Note: Single video stream link above has no sound because YouTube")
+                            print("   serves video and audio separately. Use Mode [1] for auto-merged MP4.\n")
             except Exception as e:
                 print(f"✖ Error extracting stream link: {e}")
 
@@ -1358,7 +1492,7 @@ def generate_adm_links_for_url(url):
                 print(f" 🚀 Single Stream Link: {clipboard_target}")
             
             try:
-                subprocess.run(["termux-clipboard-set"], input=clipboard_target.encode('utf-8'), capture_output=True)
+                subprocess.run(["termux-clipboard-set"], input=clipboard_target.encode('utf-8'), capture_output=True, timeout=2)
                 print(" 📋 Single link copied to Android Clipboard!")
             except Exception:
                 pass
@@ -1377,7 +1511,9 @@ def interactive_menu():
         print("="*65)
         
         try:
-            choice = input("➜ Select choice [1-2]: ").strip()
+            choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+            if not choice:
+                choice = '1'
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             sys.exit(0)
@@ -1421,7 +1557,7 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None)
             PROCESS_MONITOR.set_status("Completed (Bypassed)")
             return bypassed_path
 
-        if any(nm in url_lower for nm in ['netmirror.center', 'netmirror.studio', 'netmirror.plus', 'net52.cc', 'net77.cc']):
+        if any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
             PROCESS_MONITOR.set_status("Bypassing NetMirror Stream...")
             return handle_netmirror(url, out_name=out_name, target_dir=target_dir)
         elif any(tg_domain in url_lower for tg_domain in ['t.me/', 'telegram.me/', 'telegram.dog/']):
