@@ -14,25 +14,66 @@ import shutil
 import requests
 import html
 from bs4 import BeautifulSoup
-
-# Try importing yt_dlp for video/audio downloads
+import socket
 try:
-    import yt_dlp
-    HAS_YTDLP = True
-except ImportError:
-    HAS_YTDLP = False
-
-# Try importing Link-Bypasser-Bot modules if present
-SYS_PATH_BOT = os.path.expanduser("~/Projects/Link-Bypasser-Bot")
-if os.path.exists(SYS_PATH_BOT) and SYS_PATH_BOT not in sys.path:
-    sys.path.append(SYS_PATH_BOT)
-
-HAS_BYPASSER = False
-try:
-    from ddl import direct_link_generator
-    HAS_BYPASSER = True
+    import urllib3.util.connection as urllib3_conn
+    urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
 except Exception:
     pass
+
+# Lazy-loaded modules for instant CLI startup (0.2s launch)
+_YTDLP_MODULE = None
+
+def load_ytdlp():
+    global _YTDLP_MODULE
+    if _YTDLP_MODULE is None:
+        try:
+            import yt_dlp as _mod
+            _YTDLP_MODULE = _mod
+        except ImportError:
+            _YTDLP_MODULE = False
+    return _YTDLP_MODULE if _YTDLP_MODULE is not False else None
+
+class _LazyYtDlp:
+    def __getattr__(self, name):
+        mod = load_ytdlp()
+        if mod is None:
+            raise ImportError("yt-dlp is not installed or available")
+        return getattr(mod, name)
+
+    def __bool__(self):
+        return load_ytdlp() is not None
+
+yt_dlp = _LazyYtDlp()
+HAS_YTDLP = yt_dlp
+
+_DIRECT_LINK_GEN = None
+
+def get_bypasser():
+    global _DIRECT_LINK_GEN
+    if _DIRECT_LINK_GEN is None:
+        try:
+            SYS_PATH_BOT = os.path.expanduser("~/Projects/Link-Bypasser-Bot")
+            if os.path.exists(SYS_PATH_BOT) and SYS_PATH_BOT not in sys.path:
+                sys.path.append(SYS_PATH_BOT)
+            from ddl import direct_link_generator as _dlg
+            _DIRECT_LINK_GEN = _dlg
+        except Exception:
+            _DIRECT_LINK_GEN = False
+    return _DIRECT_LINK_GEN if _DIRECT_LINK_GEN is not False else None
+
+class _LazyBypasser:
+    def __call__(self, *args, **kwargs):
+        gen = get_bypasser()
+        if not gen:
+            raise ImportError("Direct link bypasser module is not available")
+        return gen(*args, **kwargs)
+
+    def __bool__(self):
+        return get_bypasser() is not None
+
+direct_link_generator = _LazyBypasser()
+HAS_BYPASSER = direct_link_generator
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -417,6 +458,10 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'logger': NetworkAwareLogger(),
     }
 
+    node_bin = shutil.which('node') or '/data/data/com.termux/files/usr/bin/node'
+    if os.path.exists(node_bin):
+        speed_opts['js_runtimes'] = {'node': {'path': node_bin}}
+
     if shutil.which('aria2c'):
         speed_opts['external_downloader'] = {'default': 'aria2c'}
         speed_opts['external_downloader_args'] = {
@@ -708,13 +753,35 @@ def handle_telegram(url, out_name=None, target_dir=None):
             if path_parts[1].isdigit():
                 msg_id = int(path_parts[1])
 
-    TELEGRAM_API_ID = 30909654
-    TELEGRAM_API_HASH = "d4b340a406c5c1ed1d7f26d44749602b"
-    TELEGRAM_SESSION = "BQHjZYEAnIZGwaOzXIdkpN8pw4eT_rR7zKag16sq6ry9U0n3Fgo5H5EP1K5COi3Mu3OHXsO1iHtsEAo4pjjfcyv4Y1Es0JxijQ-po3SZYsEGMCMosi5S9tTQJwtQ9sz0bWVOO3zSJOhwTtY8LGCMk72gFsaIxmcf52vIea1USV31FJOcVmNPlHag4JqYl3gPK9Fz0rPrYsUkimXhMxbvsDijcVnX--jLrkhL6ZyhS1INiq9VEsswjsVpgzL-6pJGSAsHrYEsUAuLBF43iOMcHawtrB9g2UkJ37QOPmZeEf10lgnOaRMtsTbnn59u_kHqQScqjcXE5B8rGlIG09EahObay4xQWwAAAAH9EnfDAA"
+    def load_tg_creds():
+        api_id = os.environ.get("TELEGRAM_API_ID")
+        api_hash = os.environ.get("TELEGRAM_API_HASH")
+        session = os.environ.get("TELEGRAM_SESSION")
+        if not (api_id and api_hash and session):
+            agents_file = os.path.expanduser("~/.agents/AGENTS.md")
+            if os.path.exists(agents_file):
+                try:
+                    with open(agents_file, "r") as f:
+                        text = f.read()
+                    m_id = re.search(r"App API_ID.*?:\s*`?(\d+)`?", text)
+                    m_hash = re.search(r"App API_HASH.*?:\s*`?([a-f0-9]{32})`?", text)
+                    m_sess = re.search(r"Assistant STRING_SESSION:\s*`?([A-Za-z0-9_\-]+)`?", text)
+                    if m_id and not api_id: api_id = int(m_id.group(1))
+                    if m_hash and not api_hash: api_hash = m_hash.group(1)
+                    if m_sess and not session: session = m_sess.group(1)
+                except Exception:
+                    pass
+        return api_id or 30909654, api_hash or "d4b340a406c5c1ed1d7f26d44749602b", session or "BQHjZYEAnIZGwaOzXIdkpN8pw4eT_rR7zKag16sq6ry9U0n3Fgo5H5EP1K5COi3Mu3OHXsO1iHtsEAo4pjjfcyv4Y1Es0JxijQ-po3SZYsEGMCMosi5S9tTQJwtQ9sz0bWVOO3zSJOhwTtY8LGCMk72gFsaIxmcf52vIea1USV31FJOcVmNPlHag4JqYl3gPK9Fz0rPrYsUkimXhMxbvsDijcVnX--jLrkhL6ZyhS1INiq9VEsswjsVpgzL-6pJGSAsHrYEsUAuLBF43iOMcHawtrB9g2UkJ37QOPmZeEf10lgnOaRMtsTbnn59u_kHqQScqjcXE5B8rGlIG09EahObay4xQWwAAAAH9EnfDAA"
+
+    TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION = load_tg_creds()
 
     try:
-        from pyrogram import Client
         import asyncio
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        from pyrogram import Client
         import logging
         logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
@@ -722,21 +789,21 @@ def handle_telegram(url, out_name=None, target_dir=None):
             app = Client("d_py_tg_client", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, session_string=TELEGRAM_SESSION, in_memory=True)
             await app.start()
             try:
+                def progress_cb(current, total):
+                    if total > 0:
+                        percent = (current / total) * 100
+                        mb_done = current / (1024 * 1024)
+                        mb_total = total / (1024 * 1024)
+                        print(f"\rDownloading Telegram media... [{mb_done:.2f} MB / {mb_total:.2f} MB] {percent:.1f}%", end='', flush=True)
+                    else:
+                        mb_done = current / (1024 * 1024)
+                        print(f"\rDownloading Telegram media... [{mb_done:.2f} MB]", end='', flush=True)
+
                 msg = await app.get_messages(chat_id, msg_id) if msg_id else None
                 if msg and msg.media:
                     out_dir = target_dir or DEFAULT_DIR
                     os.makedirs(out_dir, exist_ok=True)
                     target_file = os.path.join(out_dir, out_name) if out_name else (out_dir + "/")
-                    
-                    def progress_cb(current, total):
-                        if total > 0:
-                            percent = (current / total) * 100
-                            mb_done = current / (1024 * 1024)
-                            mb_total = total / (1024 * 1024)
-                            print(f"\rDownloading Telegram media... [{mb_done:.2f} MB / {mb_total:.2f} MB] {percent:.1f}%", end='', flush=True)
-                        else:
-                            mb_done = current / (1024 * 1024)
-                            print(f"\rDownloading Telegram media... [{mb_done:.2f} MB]", end='', flush=True)
 
                     print(f"➜ Fetching Telegram media from {chat_id}/{msg_id} via Pyrogram...")
                     file_path = None
@@ -819,7 +886,8 @@ def handle_telegram(url, out_name=None, target_dir=None):
                 await app.stop()
             return None
 
-        res_path = asyncio.run(pyrogram_dl())
+        loop = asyncio.get_event_loop()
+        res_path = loop.run_until_complete(pyrogram_dl())
         if res_path:
             return res_path
     except Exception as e:
@@ -889,78 +957,153 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     meta = results[0]
     title = meta.get('title') or meta.get('name') or f"netmirror_{media_id}"
     year = meta.get('release_date', '').split(',')[-1].strip() if meta.get('release_date') else '2024'
-    embed_json = meta.get('embed_json', [])
-    
-    if not embed_json:
-        raise Exception(f"No stream items found in NetMirror response for {title}")
-
-    # If TV show with multiple episodes, pick episode
-    target_item = embed_json[0]
-    if len(embed_json) > 1 and sys.stdin.isatty():
-        print("\n" + "="*55)
-        print(f" 🎬 NetMirror: {title}")
-        print("="*55)
-        print(" Available Episodes:")
-        for idx, item in enumerate(embed_json, 1):
-            se = item.get('se', '1')
-            ep = item.get('ep', '1')
-            size = item.get('size', 'N/A')
-            print(f"   [{idx}] Season {se} Episode {ep} ({size})")
-        print("="*55)
-        try:
-            ep_choice = input(f"➜ Select episode [1-{len(embed_json)}] (Default: 1): ").strip()
-            if ep_choice.isdigit() and 1 <= int(ep_choice) <= len(embed_json):
-                target_item = embed_json[int(ep_choice) - 1]
-        except (KeyboardInterrupt, EOFError):
-            pass
-
-    na_b64 = base64.b64encode(we(title).encode('latin1')).decode('utf-8')
-    params = {
-        'url': target_item['url'],
-        'size': target_item.get('size', ''),
-        'se': str(target_item.get('se', 1)),
-        'ep': str(target_item.get('ep', 1)),
-        'name': target_item.get('name', 'watchdrivehub'),
-        'year': year,
-        'na': na_b64,
-        'tm_id': media_id,
-        'ts': str(ts),
-        'sig': sig,
-        'nid': '0',
-        'exten': '1',
-        'tv': '',
-        'token': ''
+    embed_json = meta.get('embed_json') or []
+    direct_stream_url = None
+    stream_headers = {
+        'User-Agent': HEADERS['User-Agent'],
+        'Referer': 'https://netmirror.plus/',
+        'Origin': 'https://netmirror.plus'
     }
 
-    query_str = urllib.parse.urlencode(params)
-    
-    # Try servers in order: dv.watch22.shop -> webvp.watch21.shop -> bet.watch22.shop
-    domains = ['https://dv.watch22.shop', 'https://webvp.watch21.shop', 'https://bet.watch22.shop']
-    player_html = ""
-    for dom in domains:
-        player_url = f"{dom}/play/{target_item.get('name', 'watchdrivehub')}.php?{query_str}"
-        try:
-            r = requests.get(player_url, headers=headers, timeout=10)
-            if r.status_code == 200 and 'art-video-player' in r.text:
-                player_html = r.text
-                break
-        except Exception:
-            pass
+    if not embed_json:
+        # Movie / Single title: Resolve stream via vidsync / NetMirror external server APIs
+        print(f"➜ Resolving direct stream for movie: {title}...")
+        
+        target_lang = None
+        title_lower = title.lower()
+        if '[hindi]' in title_lower or 'hindi' in title_lower:
+            target_lang = 'hi'
+        elif '[tamil]' in title_lower or 'tamil' in title_lower:
+            target_lang = 'ta'
+        elif '[telugu]' in title_lower or 'telugu' in title_lower:
+            target_lang = 'te'
+        elif '[bengali]' in title_lower or 'bengali' in title_lower:
+            target_lang = 'bn'
+        elif '[indonesian]' in title_lower or 'indonesian' in title_lower:
+            target_lang = 'id'
 
-    if not player_html:
-        raise Exception("Could not retrieve NetMirror player page from stream servers.")
+        tm_id = meta.get('tm_id') or media_id
+        if tm_id:
+            try:
+                vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
+                v_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': f'https://vidsync.pro/embed/{media_type}/{tm_id}',
+                    'Origin': 'https://vidsync.pro'
+                }
+                v_res = requests.get(vidsync_api, headers=v_headers, timeout=8)
+                if v_res.status_code == 200:
+                    v_data = v_res.json()
+                    sources = v_data.get('sources', [])
+                    if sources:
+                        matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
+                        if not matching:
+                            matching = sources
+                        
+                        quality_order = {'1080p': 4, '720p': 3, '480p': 2, '360p': 1, 'Auto': 0}
+                        best = sorted(matching, key=lambda s: quality_order.get(s.get('quality', 'Auto'), 0), reverse=True)[0]
+                        direct_stream_url = best.get('url') or best.get('directUrl') or best.get('permanent_m3u8_url') or best.get('rawUrl')
+                        stream_headers = best.get('headers') or {
+                            'Referer': 'https://api.hlowb.com/',
+                            'User-Agent': 'okhttp/4.9.3'
+                        }
+            except Exception:
+                pass
 
-    match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', player_html) or re.search(r'play_url\([\"\'\`](https?://[^\s\"\'\`]+)[\"\'\`]\)', player_html)
-    if not match:
-        match = re.search(r'https?://[^\s\"\'\`]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`]*', player_html)
+        if not direct_stream_url and tm_id:
+            try:
+                sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
+                ext_url = f'https://webvp.watch21.shop/play/external.php?tm_id={tm_id}&tm_type={media_type}&ts={ts}&sig={sig_tm}&exten=1'
+                r_ext = requests.get(ext_url, headers=headers, timeout=6)
+                if r_ext.status_code == 200:
+                    m = re.search(r'const servers\s*=\s*(\[\s*\{.*?\}\s*\]);', r_ext.text, re.DOTALL)
+                    if m:
+                        import json
+                        servers = json.loads(m.group(1))
+                        for s in servers:
+                            s_url = s.get('url', '')
+                            if 'watchcinemo.php' in s_url:
+                                r_c = requests.get(s_url, headers={'User-Agent': headers['User-Agent'], 'Referer': ext_url}, timeout=6)
+                                match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', r_c.text) or re.search(r'play_url\([\"\'\`](https?://[^\"\'\`\s]+)[\"\'\`]\)', r_c.text) or re.search(r'https?://[^\s\"\'\`<>]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`<>]*', r_c.text)
+                                if match:
+                                    direct_stream_url = match.group(1) if match.lastindex else match.group(0)
+                                    break
+            except Exception:
+                pass
 
-    if not match:
-        raise Exception("Could not parse direct stream URL from NetMirror player HTML.")
+        if not direct_stream_url:
+            raise Exception(f"No stream items found in NetMirror response for {title}")
 
-    direct_stream_url = match.group(1) if match.lastindex else match.group(0)
-    
-    clean_name = out_name or clean_filename(f"{title}_S{target_item.get('se',1)}E{target_item.get('ep',1)}", default_ext=".mp4")
-    print(f"➜ Bypassed NetMirror Stream: {title} (S{target_item.get('se',1)}E{target_item.get('ep',1)})")
+        clean_name = out_name or clean_filename(title, default_ext=".mp4")
+
+    else:
+        # TV show with multiple episodes
+        target_item = embed_json[0]
+        if len(embed_json) > 1 and sys.stdin.isatty():
+            print("\n" + "="*55)
+            print(f" 🎬 NetMirror: {title}")
+            print("="*55)
+            print(" Available Episodes:")
+            for idx, item in enumerate(embed_json, 1):
+                se = item.get('se', '1')
+                ep = item.get('ep', '1')
+                size = item.get('size', 'N/A')
+                print(f"   [{idx}] Season {se} Episode {ep} ({size})")
+            print("="*55)
+            try:
+                ep_choice = input(f"➜ Select episode [1-{len(embed_json)}] (Default: 1): ").strip()
+                if ep_choice.isdigit() and 1 <= int(ep_choice) <= len(embed_json):
+                    target_item = embed_json[int(ep_choice) - 1]
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+        na_b64 = base64.b64encode(we(title).encode('latin1')).decode('utf-8')
+        params = {
+            'url': target_item['url'],
+            'size': target_item.get('size', ''),
+            'se': str(target_item.get('se', 1)),
+            'ep': str(target_item.get('ep', 1)),
+            'name': target_item.get('name', 'watchdrivehub'),
+            'year': year,
+            'na': na_b64,
+            'tm_id': media_id,
+            'ts': str(ts),
+            'sig': sig,
+            'nid': '0',
+            'exten': '1',
+            'tv': '',
+            'token': ''
+        }
+
+        query_str = urllib.parse.urlencode(params)
+        
+        # Try servers in order: dv.watch22.shop -> webvp.watch21.shop -> bet.watch22.shop
+        domains = ['https://dv.watch22.shop', 'https://webvp.watch21.shop', 'https://bet.watch22.shop']
+        player_html = ""
+        for dom in domains:
+            player_url = f"{dom}/play/{target_item.get('name', 'watchdrivehub')}.php?{query_str}"
+            try:
+                r = requests.get(player_url, headers=headers, timeout=10)
+                if r.status_code == 200 and 'art-video-player' in r.text:
+                    player_html = r.text
+                    break
+            except Exception:
+                pass
+
+        if not player_html:
+            raise Exception("Could not retrieve NetMirror player page from stream servers.")
+
+        match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', player_html) or re.search(r'play_url\([\"\'\`](https?://[^\s\"\'\`]+)[\"\'\`]\)', player_html)
+        if not match:
+            match = re.search(r'https?://[^\s\"\'\`]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`]*', player_html)
+
+        if not match:
+            raise Exception("Could not parse direct stream URL from NetMirror player HTML.")
+
+        direct_stream_url = match.group(1) if match.lastindex else match.group(0)
+        clean_name = out_name or clean_filename(f"{title}_S{target_item.get('se',1)}E{target_item.get('ep',1)}", default_ext=".mp4")
+
+    print(f"➜ Bypassed NetMirror Stream: {title}")
     
     print("\n" + "="*65)
     print(" 🚀 DIRECT STREAM LINK FOR ADM (NO PRE-DOWNLOAD NEEDED):")
@@ -976,13 +1119,28 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     if direct_link_only:
         return direct_stream_url
 
-    stream_headers = {
-        'User-Agent': HEADERS['User-Agent'],
-        'Referer': 'https://mzfi.me/',
-        'Origin': 'https://netmirror.center'
-    }
-    
-    dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
+    # Direct download execution: support HLS m3u8 multi-threaded download via aria2c/yt-dlp
+    if '.m3u8' in direct_stream_url:
+        print("➜ Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
+        if not clean_name.lower().endswith('.mp4'):
+            clean_name = os.path.splitext(clean_name)[0] + '.mp4'
+        dest_path = get_dest_path(clean_name, target_dir)
+        cmd = [
+            'yt-dlp',
+            '--downloader', 'aria2c',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16',
+            '--no-part',
+            '--concurrent-fragments', '16',
+            '-o', dest_path,
+            direct_stream_url
+        ]
+        for hk, hv in stream_headers.items():
+            cmd.extend(['--add-header', f'{hk}:{hv}'])
+        subprocess.run(cmd)
+        sync_to_sdcard_if_needed(dest_path)
+        dest_file = dest_path
+    else:
+        dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
     
     # Launch video player so user can watch with sound while downloading / when ready
     try:
@@ -1174,6 +1332,41 @@ def search_netmirror(query):
         if cleaned_words and cleaned_words not in queries_to_try:
             queries_to_try.append(cleaned_words)
 
+        def parse_year(rel_date):
+            if not rel_date: return 0
+            try:
+                return int(rel_date.split(',')[-1].strip()[:4])
+            except Exception:
+                return 0
+
+        def rank_score(it, q_lower):
+            t_lower = it['title'].lower()
+            clean_t = re.sub(r'\[.*?\]', '', t_lower).strip()
+            has_brackets = bool(re.search(r'\[.*?\]', t_lower))
+            is_hindi = bool(re.search(r'\[hindi|\bhindi\b|\bdual\b|\bmulti[\s\-]audio\b', t_lower))
+            is_direct = (clean_t == q_lower)
+            starts_with_q = clean_t.startswith(q_lower)
+            
+            for lang in ['hindi', 'tamil', 'telugu', 'bengali', 'malayalam', 'english', 'indonesian']:
+                if lang in q_lower and lang in t_lower:
+                    return (0, -it['num_year'], len(t_lower))
+                    
+            if is_direct and not has_brackets:
+                return (1, -it['num_year'])
+            if is_direct and is_hindi:
+                return (2, -it['num_year'])
+            if starts_with_q and not has_brackets:
+                return (3, -it['num_year'])
+            if starts_with_q and is_hindi:
+                return (4, -it['num_year'])
+            if not has_brackets:
+                return (5, -it['num_year'])
+            if is_hindi:
+                return (6, -it['num_year'])
+            if 'english' in t_lower:
+                return (7, -it['num_year'])
+            return (8, -it['num_year'])
+
         def query_api(q):
             clean_q = urllib.parse.quote(q)
             for host in ['api2.imdb3.shop', 'api2.imdb4.shop']:
@@ -1185,11 +1378,12 @@ def search_netmirror(query):
                         results = data.get('results', [])
                         parsed = []
                         for item in results:
-                            title = html.unescape(item.get('title') or item.get('name') or 'Unknown Title')
+                            title = html.unescape(item.get('title') or item.get('name') or 'Unknown Title').strip()
                             media_id = item.get('id')
                             m_type = item.get('type') or item.get('media_type') or 'movie'
                             rel_date = item.get('release_date') or ''
                             year = rel_date.split(',')[-1].strip() if rel_date else ''
+                            num_year = parse_year(rel_date)
                             if media_id:
                                 nm_url = f"https://netmirror.center/{m_type}/{media_id}"
                                 parsed.append({
@@ -1197,11 +1391,12 @@ def search_netmirror(query):
                                     'type': m_type.upper() if m_type else 'MOVIE/SERIES',
                                     'id': media_id,
                                     'year': year,
+                                    'num_year': num_year,
                                     'url': nm_url,
                                     'source': 'NetMirror'
                                 })
                         if parsed:
-                            return parsed
+                            return sorted(parsed, key=lambda x: rank_score(x, norm_q.lower()))
                 except Exception:
                     continue
             return []
@@ -1268,116 +1463,110 @@ def prompt_action_mode_and_run(url):
         else:
             print("✖ Invalid selection. Please select choice 1 or 2.")
 
-def search_by_name(target_dir=None):
+def search_netmirror_and_prompt(query, target_dir=None):
+    print(f"\n➜ Searching NetMirror for: \"{query}\"...")
+    results = search_netmirror(query)
+    if not results:
+        print("⚠ No search results found on NetMirror. Searching YouTube instead...")
+        return search_youtube_and_prompt(query, target_dir=target_dir)
+
+    print("\n" + "="*65)
+    print(f" 🎬 NetMirror Search Results for: \"{query}\"")
+    print("="*65)
+    for idx, item in enumerate(results[:10], 1):
+        yr_str = f" ({item['year']})" if item.get('year') else ""
+        print(f"   [{idx}] {item['title']} [{item['type']}{yr_str}]")
+    print("   [Y] 📺 Search on YouTube instead")
+    print("="*65)
+
     while True:
-        print("\n" + "="*65)
-        print(" Select Search Platform:")
-        print("   [1] 🎬 NetMirror (Movies / Series / Web Shows)")
-        print("   [2] 📺 YouTube (Video / Music / Audio)")
-        print("="*65)
         try:
-            p_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
-            if not p_choice:
-                p_choice = '1'
+            sel = input(f"➜ Select result [1-{len(results[:10])}] (Default: 1, Y: YouTube): ").strip()
+            if not sel:
+                sel = '1'
         except (KeyboardInterrupt, EOFError):
             return
-
-        if p_choice == '1':
-            while True:
-                try:
-                    query = input("\n➜ Enter Movie / Series Name to Search NetMirror: ").strip()
-                except (KeyboardInterrupt, EOFError):
-                    return
-                if not query:
-                    print("✖ Search query cannot be empty.")
-                    continue
-                
-                print(f"\n➜ Searching NetMirror for: \"{query}\"...")
-                results = search_netmirror(query)
-                if not results:
-                    print("⚠ No search results found on NetMirror.")
-                    return
-                
-                print("\n" + "="*65)
-                print(f" 🎬 NetMirror Search Results for: \"{query}\"")
-                print("="*65)
-                for idx, item in enumerate(results[:10], 1):
-                    yr_str = f" ({item['year']})" if item['year'] else ""
-                    print(f"   [{idx}] {item['title']} [{item['type']}{yr_str}]")
-                print("="*65)
-
-                while True:
-                    try:
-                        sel = input(f"➜ Select result [1-{len(results[:10])}] (Default: 1): ").strip()
-                        if not sel:
-                            sel = '1'
-                    except (KeyboardInterrupt, EOFError):
-                        return
-                    if sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
-                        selected = results[int(sel) - 1]
-                        print(f"\n➜ Selected: {selected['title']}")
-                        prompt_action_mode_and_run(selected['url'])
-                        return
-                    else:
-                        print(f"✖ Invalid selection. Please select choice 1 to {len(results[:10])}.")
-            break
-
-        elif p_choice == '2':
-            while True:
-                try:
-                    query = input("\n➜ Enter Video / Song Name to Search YouTube: ").strip()
-                except (KeyboardInterrupt, EOFError):
-                    return
-                if not query:
-                    print("✖ Search query cannot be empty.")
-                    continue
-                
-                print(f"\n➜ Searching YouTube for: \"{query}\"...")
-                yt_entries = []
-                if HAS_YTDLP:
-                    try:
-                        ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            res = ydl.extract_info(f"ytsearch10:{query}", download=False)
-                            yt_entries = [e for e in res.get('entries', []) if e] if res else []
-                    except Exception:
-                        yt_entries = []
-                
-                if not yt_entries:
-                    print("⚠ No search results found on YouTube.")
-                    return
-
-                print("\n" + "="*65)
-                print(f" 🎵 YouTube Search Results for: \"{query}\"")
-                print("="*65)
-                for idx, entry in enumerate(yt_entries[:10], 1):
-                    title = entry.get('title', 'Unknown Title')
-                    uploader = entry.get('uploader') or entry.get('channel') or 'Unknown Uploader'
-                    duration = entry.get('duration')
-                    dur_str = f"{int(duration)//60}:{int(duration)%60:02d}" if isinstance(duration, (int, float)) else "N/A"
-                    print(f"   [{idx}] {title}")
-                    print(f"       Channel: {uploader} | Duration: {dur_str}")
-                print("="*65)
-
-                while True:
-                    try:
-                        sel = input(f"➜ Select result [1-{len(yt_entries[:10])}] (Default: 1): ").strip()
-                        if not sel:
-                            sel = '1'
-                    except (KeyboardInterrupt, EOFError):
-                        return
-                    if sel.isdigit() and 1 <= int(sel) <= len(yt_entries[:10]):
-                        selected_entry = yt_entries[int(sel) - 1]
-                        selected_url = selected_entry.get('url') or selected_entry.get('webpage_url') or f"https://www.youtube.com/watch?v={selected_entry.get('id')}"
-                        print(f"\n➜ Selected: {selected_entry.get('title')}")
-                        prompt_action_mode_and_run(selected_url)
-                        return
-                    else:
-                        print(f"✖ Invalid selection. Please select choice 1 to {len(yt_entries[:10])}.")
-            break
-
+        if sel.lower() in ('y', 'yt', 'youtube'):
+            return search_youtube_and_prompt(query, target_dir=target_dir)
+        elif sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
+            selected = results[int(sel) - 1]
+            print(f"\n➜ Selected: {selected['title']}")
+            prompt_action_mode_and_run(selected['url'])
+            return
         else:
-            print("✖ Invalid selection. Please select choice 1 or 2.")
+            print(f"✖ Invalid selection. Please select choice 1 to {len(results[:10])} or 'Y'.")
+
+def search_youtube_and_prompt(query, target_dir=None):
+    print(f"\n➜ Searching YouTube for: \"{query}\"...")
+    yt_entries = []
+    if HAS_YTDLP:
+        try:
+            ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(f"ytsearch10:{query}", download=False)
+                yt_entries = [e for e in res.get('entries', []) if e] if res else []
+        except Exception:
+            yt_entries = []
+
+    if not yt_entries:
+        print("⚠ No search results found on YouTube.")
+        return
+
+    print("\n" + "="*65)
+    print(f" 🎵 YouTube Search Results for: \"{query}\"")
+    print("="*65)
+    for idx, entry in enumerate(yt_entries[:10], 1):
+        title = entry.get('title', 'Unknown Title')
+        uploader = entry.get('uploader') or entry.get('channel') or 'Unknown Uploader'
+        duration = entry.get('duration')
+        dur_str = f"{int(duration)//60}:{int(duration)%60:02d}" if isinstance(duration, (int, float)) else "N/A"
+        print(f"   [{idx}] {title}")
+        print(f"       Channel: {uploader} | Duration: {dur_str}")
+    print("="*65)
+
+    while True:
+        try:
+            sel = input(f"➜ Select result [1-{len(yt_entries[:10])}] (Default: 1): ").strip()
+            if not sel:
+                sel = '1'
+        except (KeyboardInterrupt, EOFError):
+            return
+        if sel.isdigit() and 1 <= int(sel) <= len(yt_entries[:10]):
+            selected_entry = yt_entries[int(sel) - 1]
+            selected_url = selected_entry.get('url') or selected_entry.get('webpage_url') or f"https://www.youtube.com/watch?v={selected_entry.get('id')}"
+            print(f"\n➜ Selected: {selected_entry.get('title')}")
+            prompt_action_mode_and_run(selected_url)
+            return
+        else:
+            print(f"✖ Invalid selection. Please select choice 1 to {len(yt_entries[:10])}.")
+
+def search_by_name(target_dir=None):
+    print("\n" + "="*65)
+    print(" Select Search Platform:")
+    print("   [1] 🎬 NetMirror (Movies / Series / Web Shows)")
+    print("   [2] 📺 YouTube (Video / Music / Audio)")
+    print("="*65)
+    try:
+        p_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+        if not p_choice:
+            p_choice = '1'
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if p_choice == '1':
+        try:
+            query = input("\n➜ Enter Movie / Series Name to Search NetMirror: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if query:
+            search_netmirror_and_prompt(query, target_dir=target_dir)
+    elif p_choice == '2':
+        try:
+            query = input("\n➜ Enter Video / Song Name to Search YouTube: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if query:
+            search_youtube_and_prompt(query, target_dir=target_dir)
 
 def generate_adm_links_for_url(url):
     is_yt = any(v in url.lower() for v in ['youtube.com', 'youtu.be'])
@@ -1464,36 +1653,37 @@ def generate_adm_links_for_url(url):
                 print(f"✖ Error extracting stream link: {e}")
 
         if adm_links:
-            txt_path = "/sdcard/Download/adm_playlist_links.txt"
-            all_urls_str = "\n".join([stream for _, _, stream in adm_links])
-            with open(txt_path, "w") as f:
-                f.write(all_urls_str + "\n")
-            
-            start_local_http_server()
-            single_hosted_url = "http://localhost:8080/adm_playlist_links.txt"
-            my_ip = "127.0.0.1"
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("1.1.1.1", 80))
-                my_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                pass
-            lan_url = f"http://{my_ip}:8080/adm_playlist_links.txt"
-
-            print("="*65)
-            print(f" 📄 Saved {len(adm_links)} direct link(s) to: {txt_path}")
             if len(adm_links) > 1:
-                clipboard_target = single_hosted_url
+                txt_path = "/sdcard/Download/adm_playlist_links.txt"
+                all_urls_str = "\n".join([stream for _, _, stream in adm_links])
+                with open(txt_path, "w") as f:
+                    f.write(all_urls_str + "\n")
+                
+                start_local_http_server()
+                single_hosted_url = "http://localhost:8080/adm_playlist_links.txt"
+                my_ip = "127.0.0.1"
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("1.1.1.1", 80))
+                    my_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    pass
+                lan_url = f"http://{my_ip}:8080/adm_playlist_links.txt"
+
+                print("="*65)
+                print(f" 📄 Saved {len(adm_links)} direct link(s) to: {txt_path}")
                 print(f" 🚀 Single All-in-One Link for ADM: {single_hosted_url}")
                 print(f" 🌐 Wi-Fi LAN Download Link:       {lan_url}")
+                clipboard_target = single_hosted_url
             else:
                 clipboard_target = adm_links[0][2]
-                print(f" 🚀 Single Stream Link: {clipboard_target}")
+                print("="*65)
+                print(f" 🚀 Direct Stream Link for ADM / VLC: {clipboard_target}")
             
             try:
                 subprocess.run(["termux-clipboard-set"], input=clipboard_target.encode('utf-8'), capture_output=True, timeout=2)
-                print(" 📋 Single link copied to Android Clipboard!")
+                print(" 📋 Stream link copied to Android Clipboard!")
             except Exception:
                 pass
             print("="*65 + "\n")
@@ -1506,38 +1696,49 @@ def interactive_menu():
         print("\n" + "="*65)
         print("           🚀 UNIVERSAL DOWNLOADER CLI 🚀           ")
         print("="*65)
-        print("  [1] 🔗 Direct Link")
-        print("  [2] 🔍 Search by Name")
-        print("="*65)
-        
         try:
-            choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
-            if not choice:
-                choice = '1'
+            user_input = input("➜ Enter URL or Movie/Video Name (or 'q' to quit): ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             sys.exit(0)
+            
+        if not user_input:
+            continue
+        if user_input.lower() in ('q', 'quit', 'exit'):
+            print("Exiting...")
+            sys.exit(0)
 
-        if choice == '1':
-            while True:
-                try:
-                    url_input = input("\n➜ Enter URL / Playlist Link: ").strip()
-                except (KeyboardInterrupt, EOFError):
-                    return
-                if not url_input:
-                    print("✖ Link cannot be empty. Please enter a valid URL.")
-                    continue
-                url = "".join(url_input.split())
-                if not url.startswith(('http://', 'https://', 'ytsearch')):
-                    url = 'https://' + url
-                prompt_action_mode_and_run(url)
-                break
-            break
-        elif choice == '2':
+        # Backward compatibility for entering '1' or '2'
+        if user_input == '1':
+            try:
+                user_input = input("➜ Enter URL / Playlist Link: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if not user_input:
+                continue
+        elif user_input == '2':
             search_by_name()
             break
+
+        # Check if user_input is a URL
+        is_url = user_input.startswith(('http://', 'https://', 't.me/', 'telegram.me/', 'magnet:')) or (
+            any(ext in user_input.lower() for ext in ['.com', '.org', '.net', '.in', '.cc', '.pro', '.io', '.me', '.plus', '.gg', '.shop'])
+            and ' ' not in user_input
+        )
+
+        if is_url:
+            url = user_input if user_input.startswith(('http://', 'https://', 'magnet:')) else f"https://{user_input}"
+            prompt_action_mode_and_run(url)
+            break
         else:
-            print("✖ Invalid selection. Please select choice 1 or 2.")
+            # It's a search query!
+            if user_input.lower().startswith(('yt:', 'yt ', 'youtube:', 'youtube ')):
+                yt_query = re.sub(r'^(?:yt:|yt\s+|youtube:|youtube\s+)', '', user_input, flags=re.I).strip()
+                search_youtube_and_prompt(yt_query)
+                break
+            else:
+                search_netmirror_and_prompt(user_input)
+                break
 
 def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None):
     url_lower = url.lower()
@@ -1653,11 +1854,18 @@ def main():
             args = args[:idx] + args[idx + 2:]
             
     for raw_url in args:
-        url = "".join(raw_url.split())
-        if url.startswith('http://') or url.startswith('https://'):
+        url = "".join(raw_url.split()) if raw_url.startswith(('http://', 'https://')) else raw_url
+        if url.startswith('http://') or url.startswith('https://') or url.startswith('magnet:'):
             download(url, out_name=out_name, cookie=cookie, target_dir=target_dir, quality_arg=quality_arg)
+        elif len(args) == 1 and not url.startswith('-'):
+            search_netmirror_and_prompt(url, target_dir=target_dir)
+            break
+        elif not url.startswith('-'):
+            full_query = " ".join(args)
+            search_netmirror_and_prompt(full_query, target_dir=target_dir)
+            break
         else:
-            print(f"⚠ Skipping invalid URL: {url}")
+            print(f"⚠ Skipping invalid argument: {url}")
 
 if __name__ == '__main__':
     main()
