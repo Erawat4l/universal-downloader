@@ -18,6 +18,19 @@ import socket
 try:
     import urllib3.util.connection as urllib3_conn
     urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
+    _orig_create_connection = urllib3_conn.create_connection
+
+    def _ipv4_create_connection(address, *args, **kwargs):
+        host, port = address
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            if infos:
+                return _orig_create_connection((infos[0][4][0], port), *args, **kwargs)
+        except Exception:
+            pass
+        return _orig_create_connection(address, *args, **kwargs)
+
+    urllib3_conn.create_connection = _ipv4_create_connection
 except Exception:
     pass
 
@@ -186,6 +199,77 @@ def print_adm_link(file_path):
         print(" 📋 Short link copied to Android Clipboard!")
     except Exception:
         pass
+
+def launch_player(target_uri, player_choice="vlc"):
+    """Launch stream URL or video in VLC Player or native player."""
+    clean_env = os.environ.copy()
+    clean_env.pop('LD_LIBRARY_PATH', None)
+
+    # 1. Try launching via ADB into VLC
+    try:
+        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
+        if "device" in res.stdout and len(res.stdout.strip().splitlines()) > 1:
+            adb_cmd = [
+                "adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                "-d", target_uri, "-t", "video/*"
+            ]
+            if player_choice == "vlc":
+                adb_cmd.extend(["-p", "org.videolan.vlc"])
+            adb_res = subprocess.run(adb_cmd, capture_output=True, text=True, timeout=3)
+            if adb_res.returncode == 0:
+                print("🎬 Streaming opened in VLC Player!")
+                return True
+    except Exception:
+        pass
+
+    # 2. Try launching via local am start (Termux native)
+    try:
+        am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", target_uri, "-t", "video/*"]
+        if player_choice == "vlc":
+            am_cmd.extend(["-p", "org.videolan.vlc"])
+        res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
+        if res.returncode == 0:
+            print("🎬 Streaming opened in VLC Player!")
+            return True
+    except Exception:
+        pass
+
+    # 3. Fallback to termux-open
+    try:
+        subprocess.Popen(["termux-open", target_uri], env=clean_env)
+        print("🎬 Stream sent to default media player!")
+        return True
+    except Exception:
+        pass
+    return False
+
+def save_m3u8_stream_file(url, title, target_dir=None):
+    """Save the ~300KB .m3u8 stream playlist file to storage for instant VLC streaming."""
+    out_dir = target_dir or DEFAULT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    clean_name = clean_filename(title, default_ext=".m3u8")
+    if not clean_name.lower().endswith('.m3u8'):
+        clean_name = os.path.splitext(clean_name)[0] + '.m3u8'
+    file_path = os.path.join(out_dir, clean_name)
+    try:
+        r = requests.get(url, headers={'User-Agent': 'okhttp/4.9.3', 'Referer': 'https://api.hlowb.com/'}, timeout=6)
+        if r.status_code == 200 and '#EXTM3U' in r.text:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(r.text)
+            sync_to_sdcard_if_needed(file_path)
+            print(f"📄 Saved instant stream playlist ({len(r.text)//1024} KB) to: {file_path}")
+            return file_path
+    except Exception:
+        pass
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:-1,{title}\n{url}\n")
+        sync_to_sdcard_if_needed(file_path)
+        print(f"📄 Saved instant stream playlist to: {file_path}")
+        return file_path
+    except Exception:
+        pass
+    return None
 
 def clean_filename(title, default_ext=".pdf"):
     title = re.sub(r'[\\/*?:"<>|]', '', title)
@@ -1012,7 +1096,11 @@ def handle_telegram(url, out_name=None, target_dir=None):
 
     raise Exception("Could not download Telegram link media.")
 
-def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None):
+def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None):
+    if direct_link_only:
+        action_mode = 'direct_link_only'
+    if not action_mode:
+        action_mode = 'stream_and_download'
     print("➜ Detected NetMirror link...")
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
@@ -1283,41 +1371,54 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     except Exception:
         pass
 
-    if direct_link_only:
+    # Always save the ~300KB .m3u8 stream shortcut file for instant VLC streaming
+    m3u8_file = save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
+
+    if action_mode in ('direct_link_only', 'direct'):
+        return direct_stream_url
+
+    if action_mode in ('stream_and_download', 'stream', 'stream_only'):
+        launch_player(direct_stream_url, player_choice="vlc")
+
+    if action_mode in ('stream_only', 'stream'):
+        print("🍿 Streaming active in VLC Player! (No local video file will be downloaded)")
         return direct_stream_url
 
     # Direct download execution: support HLS m3u8 multi-threaded download via aria2c/yt-dlp
-    if '.m3u8' in direct_stream_url:
-        print("➜ Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
-        if not clean_name.lower().endswith('.mp4'):
-            clean_name = os.path.splitext(clean_name)[0] + '.mp4'
-        dest_path = get_dest_path(clean_name, target_dir)
-        cmd = [
-            'yt-dlp',
-            '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16 --min-split-size=1M --summary-interval=0 --console-log-level=warn',
-            '--no-part',
-            '--concurrent-fragments', '16',
-            '--newline',
-            '-o', dest_path,
-            direct_stream_url
-        ]
-        for hk, hv in stream_headers.items():
-            cmd.extend(['--add-header', f'{hk}:{hv}'])
-        run_command_with_clean_progress(cmd)
-        sync_to_sdcard_if_needed(dest_path)
-        dest_file = dest_path
-    else:
-        dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
-    
-    # Launch video player so user can watch with sound while downloading / when ready
     try:
-        if dest_file and os.path.exists(dest_file):
-            print("📱 Launching video in native media player...")
-            subprocess.Popen(["termux-open", dest_file])
+        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=2)
     except Exception:
         pass
-        
+
+    try:
+        if '.m3u8' in direct_stream_url:
+            print("➜ Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
+            if not clean_name.lower().endswith('.mp4'):
+                clean_name = os.path.splitext(clean_name)[0] + '.mp4'
+            dest_path = get_dest_path(clean_name, target_dir)
+            cmd = [
+                'yt-dlp',
+                '--downloader', 'aria2c',
+                '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16 --min-split-size=1M --summary-interval=0 --console-log-level=warn',
+                '--no-part',
+                '--concurrent-fragments', '16',
+                '--newline',
+                '-o', dest_path,
+                direct_stream_url
+            ]
+            for hk, hv in stream_headers.items():
+                cmd.extend(['--add-header', f'{hk}:{hv}'])
+            run_command_with_clean_progress(cmd)
+            sync_to_sdcard_if_needed(dest_path)
+            dest_file = dest_path
+        else:
+            dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
+    finally:
+        try:
+            subprocess.run(["termux-wake-unlock"], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
     return dest_file
 
 def handle_generic(url, out_name=None, custom_headers=None, target_dir=None):
@@ -1601,16 +1702,48 @@ def search_netmirror(query):
         pass
     return []
 
+def handle_video_stream_only(url):
+    """Extract direct stream URL using yt-dlp and launch in VLC immediately without saving."""
+    if not HAS_YTDLP:
+        print("⚠ yt-dlp is required for streaming.")
+        return False
+    print("➜ Extracting direct stream URL for instant playback...")
+    try:
+        ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'format': 'bestvideo+bestaudio/best'})
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get('url')
+            if not stream_url and 'formats' in info:
+                for f in reversed(info['formats']):
+                    if f.get('url'):
+                        stream_url = f.get('url')
+                        break
+            if stream_url:
+                title = info.get('title', 'Video Stream')
+                print(f"🎬 Video: {title}")
+                launch_player(stream_url, player_choice="vlc")
+                return True
+    except Exception as e:
+        print(f"⚠ Could not launch stream player: {e}")
+    return False
+
+def handle_video_stream_and_download(url):
+    """Launch stream in VLC immediately, then start downloading in terminal."""
+    handle_video_stream_only(url)
+    return download(url)
+
 def prompt_action_mode_and_run(url):
     is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
     while True:
         print("\n" + "="*65)
-        print(" Select Download Action / Mode:")
-        print("   [1] ⬇ Start Direct Download in Terminal (Multi-threaded aria2c 16x)")
-        print("   [2] 🔗 Generate Direct Links (No Pre-Download)")
+        print(" Select Action / Mode:")
+        print("   [1] 🎬 Stream in VLC & Download Video (Instant Play + Save)")
+        print("   [2] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
+        print("   [3] 🍿 Stream in VLC Only (Instant Play, No Storage Used)")
+        print("   [4] 🔗 Generate Direct Links & Save .m3u8 Playlist (for ADM)")
         print("="*65)
         try:
-            mode_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+            mode_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
             if not mode_choice:
                 mode_choice = '1'
         except (KeyboardInterrupt, EOFError):
@@ -1618,18 +1751,30 @@ def prompt_action_mode_and_run(url):
 
         if mode_choice == '1':
             if is_netmirror:
-                handle_netmirror(url, direct_link_only=False)
+                handle_netmirror(url, action_mode='stream_and_download')
             else:
-                download(url)
+                handle_video_stream_and_download(url)
             break
         elif mode_choice == '2':
             if is_netmirror:
-                handle_netmirror(url, direct_link_only=True)
+                handle_netmirror(url, action_mode='download_only')
+            else:
+                download(url)
+            break
+        elif mode_choice == '3':
+            if is_netmirror:
+                handle_netmirror(url, action_mode='stream_only')
+            else:
+                handle_video_stream_only(url)
+            break
+        elif mode_choice == '4':
+            if is_netmirror:
+                handle_netmirror(url, action_mode='direct_link_only')
             else:
                 generate_adm_links_for_url(url)
             break
         else:
-            print("✖ Invalid selection. Please select choice 1 or 2.")
+            print("✖ Invalid selection. Please select choice 1 to 4.")
 
 def search_netmirror_and_prompt(query, target_dir=None):
     print(f"\n➜ Searching NetMirror for: \"{query}\"...")
