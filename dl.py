@@ -1040,8 +1040,8 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://mzfi.me/',
-        'Origin': 'https://netmirror.center'
+        'Referer': 'https://netmirror.plus/',
+        'Origin': 'https://netmirror.plus'
     }
 
     # Query NetMirror API
@@ -1084,83 +1084,91 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
         tm_id = meta.get('tm_id') or media_id
         if tm_id:
-            try:
-                vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
-                v_headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Referer': f'https://vidsync.pro/embed/{media_type}/{tm_id}',
-                    'Origin': 'https://vidsync.pro'
-                }
-                v_res = requests.get(vidsync_api, headers=v_headers, timeout=8)
-                if v_res.status_code == 200:
-                    v_data = v_res.json()
-                    sources = v_data.get('sources', [])
-                    if sources:
-                        matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
-                        if not matching:
-                            matching = sources
-                        
-                        quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
-                        quality_labels = {
-                            '1080p': '1080p (Full HD)',
-                            '720p': '720p (HD)',
-                            '480p': '480p (SD)',
-                            '360p': '360p (Low)',
-                            'Auto': 'Auto / Best Available'
-                        }
-                        
-                        qualities_dict = {}
-                        for s in matching:
-                            q = s.get('quality', 'Auto')
-                            if q not in qualities_dict:
-                                qualities_dict[q] = s
-                            else:
-                                curr = qualities_dict[q]
-                                if not curr.get('directUrl') and s.get('directUrl'):
-                                    qualities_dict[q] = s
-
-                        sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
-                        
-                        selected_source = None
-                        if quality_arg:
-                            q_arg_clean = str(quality_arg).lower().strip()
-                            for sq in sorted_qualities:
-                                if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
-                                    selected_source = qualities_dict[sq]
-                                    break
-                                    
-                        if not selected_source and len(sorted_qualities) > 1:
-                            print("\n" + "="*55)
-                            print(f" 🎬 Movie: {title}")
-                            print("="*55)
-                            print(" Select Video Quality:")
-                            for idx, q_key in enumerate(sorted_qualities, 1):
-                                print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
-                            print("="*55)
-                            try:
-                                q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
-                                if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
-                                    selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
-                            except (KeyboardInterrupt, EOFError):
-                                pass
-
-                        if not selected_source and sorted_qualities:
-                            selected_source = qualities_dict[sorted_qualities[0]]
-
-                        if selected_source:
-                            direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
-                            stream_headers = selected_source.get('headers') or {
-                                'Referer': 'https://api.hlowb.com/',
-                                'User-Agent': 'okhttp/4.9.3'
+            for attempt in range(1, 4):
+                try:
+                    vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
+                    v_headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Referer': 'https://vidsync.pro/',
+                        'Origin': 'https://vidsync.pro'
+                    }
+                    v_res = requests.get(vidsync_api, headers=v_headers, timeout=15)
+                    if v_res.status_code == 200:
+                        v_data = v_res.json()
+                        sources = v_data.get('sources', [])
+                        if sources:
+                            matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
+                            if not matching:
+                                matching = sources
+                            
+                            quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
+                            quality_labels = {
+                                '1080p': '1080p (Full HD)',
+                                '720p': '720p (HD)',
+                                '480p': '480p (SD)',
+                                '360p': '360p (Low)',
+                                'Auto': 'Auto / Best Available'
                             }
-            except Exception:
-                pass
+                            
+                            qualities_dict = {}
+                            for s in matching:
+                                q = s.get('quality', 'Auto')
+                                if q not in qualities_dict:
+                                    qualities_dict[q] = s
+                                else:
+                                    curr = qualities_dict[q]
+                                    if not curr.get('directUrl') and s.get('directUrl'):
+                                        qualities_dict[q] = s
+
+                            sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
+                            
+                            selected_source = None
+                            if quality_arg:
+                                q_arg_clean = str(quality_arg).lower().strip()
+                                for sq in sorted_qualities:
+                                    if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
+                                        selected_source = qualities_dict[sq]
+                                        break
+                                        
+                            if not selected_source and len(sorted_qualities) > 1:
+                                print("\n" + "="*55)
+                                print(f" 🎬 Movie: {title}")
+                                print("="*55)
+                                print(" Select Video Quality:")
+                                for idx, q_key in enumerate(sorted_qualities, 1):
+                                    print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
+                                print("="*55)
+                                try:
+                                    q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
+                                    if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
+                                        selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
+                                except (KeyboardInterrupt, EOFError):
+                                    pass
+
+                            if not selected_source and sorted_qualities:
+                                selected_source = qualities_dict[sorted_qualities[0]]
+
+                            if selected_source:
+                                direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
+                                stream_headers = selected_source.get('headers') or {
+                                    'Referer': 'https://api.hlowb.com/',
+                                    'User-Agent': 'okhttp/4.9.3'
+                                }
+                                break
+                except Exception:
+                    if attempt < 3:
+                        time.sleep(1)
 
         if not direct_stream_url and tm_id:
             try:
                 sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
+                ext_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': 'https://netmirror.plus/',
+                    'Origin': 'https://netmirror.plus'
+                }
                 ext_url = f'https://webvp.watch21.shop/play/external.php?tm_id={tm_id}&tm_type={media_type}&ts={ts}&sig={sig_tm}&exten=1'
-                r_ext = requests.get(ext_url, headers=headers, timeout=6)
+                r_ext = requests.get(ext_url, headers=ext_headers, timeout=10)
                 if r_ext.status_code == 200:
                     m = re.search(r'const servers\s*=\s*(\[\s*\{.*?\}\s*\]);', r_ext.text, re.DOTALL)
                     if m:
@@ -1168,8 +1176,21 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                         servers = json.loads(m.group(1))
                         for s in servers:
                             s_url = s.get('url', '')
-                            if 'watchcinemo.php' in s_url:
-                                r_c = requests.get(s_url, headers={'User-Agent': headers['User-Agent'], 'Referer': ext_url}, timeout=6)
+                            if 'vidsync.pro/embed' in s_url:
+                                try:
+                                    r_vs = requests.get(f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}", headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://vidsync.pro/'}, timeout=15)
+                                    if r_vs.status_code == 200:
+                                        s_data = r_vs.json().get('sources', [])
+                                        if s_data:
+                                            s_matching = [src for src in s_data if src.get('audioLanguage') == target_lang] if target_lang else []
+                                            best_s = (s_matching or s_data)[0]
+                                            direct_stream_url = best_s.get('url') or best_s.get('directUrl') or best_s.get('permanent_m3u8_url')
+                                            stream_headers = best_s.get('headers') or {'Referer': 'https://api.hlowb.com/', 'User-Agent': 'okhttp/4.9.3'}
+                                            break
+                                except Exception:
+                                    pass
+                            elif 'watchcinemo.php' in s_url:
+                                r_c = requests.get(s_url, headers={'User-Agent': ext_headers['User-Agent'], 'Referer': ext_url}, timeout=8)
                                 match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', r_c.text) or re.search(r'play_url\([\"\'\`](https?://[^\"\'\`\s]+)[\"\'\`]\)', r_c.text) or re.search(r'https?://[^\s\"\'\`<>]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`<>]*', r_c.text)
                                 if match:
                                     direct_stream_url = match.group(1) if match.lastindex else match.group(0)
