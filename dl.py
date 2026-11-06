@@ -236,6 +236,89 @@ def wait_for_network():
     print(" ➜ Resuming download...")
     print("="*60, flush=True)
 
+def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--"):
+    """Render a clean, single-line in-place progress bar guaranteed not to wrap or spam."""
+    try:
+        cols = shutil.get_terminal_size((70, 20)).columns
+    except Exception:
+        cols = 70
+    try:
+        pct = max(0.0, min(100.0, float(percent)))
+    except Exception:
+        pct = 0.0
+    info = f" {pct:5.1f}% | {total_str} | {speed_str} | ETA {eta_str}"
+    bar_width = max(5, min(20, cols - len(info) - 4))
+    filled = int(bar_width * (pct / 100.0))
+    bar = "█" * filled + "░" * (bar_width - filled)
+    line = f"[{bar}]{info}"
+    if len(line) >= cols:
+        line = line[:cols - 1]
+    sys.stdout.write(f"\r\033[K{line}")
+    sys.stdout.flush()
+
+def _process_progress_line(line):
+    line = line.strip()
+    if not line:
+        return
+    m = re.search(r'\[download\]\s+([\d\.]+)%\s+of\s+~?\s*([\d\.]+\s*[A-Za-z]+)\s+at\s+([\d\.]+\s*[A-Za-z]+/s)\s+ETA\s+([\d:]+)', line)
+    if m:
+        try:
+            pct = float(m.group(1))
+            tot = m.group(2).replace(' ', '')
+            spd = m.group(3).replace(' ', '')
+            eta = m.group(4)
+            render_download_progress(pct, tot, spd, eta)
+            return
+        except Exception:
+            pass
+
+    m_pct = re.search(r'\[download\]\s+([\d\.]+)%', line)
+    if m_pct:
+        try:
+            pct = float(m_pct.group(1))
+            render_download_progress(pct)
+            return
+        except Exception:
+            pass
+
+    if line.startswith('[download] Downloading fragment') or ('frag' in line and line.startswith('[download]')):
+        return
+
+    sys.stdout.write(f"\r\033[K{line}\n")
+    sys.stdout.flush()
+
+def run_command_with_clean_progress(cmd):
+    """Run subprocess while processing \r and \n into clean single-line progress updates."""
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        buf = []
+        while True:
+            ch = p.stdout.read(1)
+            if not ch:
+                if buf:
+                    _process_progress_line("".join(buf))
+                break
+            if ch in ('\r', '\n'):
+                if buf:
+                    _process_progress_line("".join(buf))
+                    buf = []
+            else:
+                buf.append(ch)
+        p.wait()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return p.returncode
+    except Exception as e:
+        print(f"✖ Process execution error: {e}")
+        return 1
+
 def download_file_stream(url, filename, custom_headers=None, target_dir=None):
     headers = {**HEADERS, **(custom_headers or {})}
     print(f"➜ Fetching: {url}")
@@ -278,19 +361,34 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None):
                     downloaded = 0
 
                 print(f"➜ Saving to: {dest_path}")
+                last_time = time.time()
+                last_downloaded = downloaded
                 with open(dest_path, mode) as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            if total_bytes > 0:
-                                percent = (downloaded / total_bytes) * 100
-                                mb_done = downloaded / (1024 * 1024)
-                                mb_total = total_bytes / (1024 * 1024)
-                                print(f"\rDownloading... [{mb_done:.2f} MB / {mb_total:.2f} MB] {percent:.1f}%", end='', flush=True)
-                            else:
-                                mb_done = downloaded / (1024 * 1024)
-                                print(f"\rDownloading... [{mb_done:.2f} MB]", end='', flush=True)
+                            now = time.time()
+                            if now - last_time >= 0.2:
+                                delta_time = now - last_time
+                                delta_bytes = downloaded - last_downloaded
+                                speed = (delta_bytes / delta_time) if delta_time > 0 else 0
+                                speed_mb = speed / (1024 * 1024)
+                                speed_str = f"{speed_mb:.2f}MB/s"
+                                if total_bytes > 0:
+                                    percent = (downloaded / total_bytes) * 100
+                                    mb_done = downloaded / (1024 * 1024)
+                                    mb_total = total_bytes / (1024 * 1024)
+                                    rem_bytes = max(0, total_bytes - downloaded)
+                                    eta_sec = int(rem_bytes / speed) if speed > 0 else 0
+                                    eta_m, eta_s = divmod(eta_sec, 60)
+                                    eta_str = f"{eta_m:02d}:{eta_s:02d}"
+                                    render_download_progress(percent, f"{mb_done:.1f}/{mb_total:.1f}MB", speed_str, eta_str)
+                                else:
+                                    mb_done = downloaded / (1024 * 1024)
+                                    render_download_progress(100.0, f"{mb_done:.1f}MB", speed_str, "--")
+                                last_time = now
+                                last_downloaded = downloaded
             break
         except (requests.exceptions.RequestException, socket.error) as e:
             if not check_network():
@@ -299,7 +397,9 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None):
                 print(f"\n⚠ Network hiccup: {e}. Retrying in 3s...", flush=True)
                 time.sleep(3)
 
-    print("\n✔ Download complete!")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    print("✔ Download complete!")
     sync_to_sdcard_if_needed(dest_path)
     return dest_path
 
@@ -794,10 +894,10 @@ def handle_telegram(url, out_name=None, target_dir=None):
                         percent = (current / total) * 100
                         mb_done = current / (1024 * 1024)
                         mb_total = total / (1024 * 1024)
-                        print(f"\rDownloading Telegram media... [{mb_done:.2f} MB / {mb_total:.2f} MB] {percent:.1f}%", end='', flush=True)
+                        render_download_progress(percent, f"{mb_done:.1f}/{mb_total:.1f}MB")
                     else:
                         mb_done = current / (1024 * 1024)
-                        print(f"\rDownloading Telegram media... [{mb_done:.2f} MB]", end='', flush=True)
+                        render_download_progress(100.0, f"{mb_done:.1f}MB")
 
                 msg = await app.get_messages(chat_id, msg_id) if msg_id else None
                 if msg and msg.media:
@@ -912,7 +1012,7 @@ def handle_telegram(url, out_name=None, target_dir=None):
 
     raise Exception("Could not download Telegram link media.")
 
-def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False):
+def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None):
     print("➜ Detected NetMirror link...")
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
@@ -1000,13 +1100,59 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                         if not matching:
                             matching = sources
                         
-                        quality_order = {'1080p': 4, '720p': 3, '480p': 2, '360p': 1, 'Auto': 0}
-                        best = sorted(matching, key=lambda s: quality_order.get(s.get('quality', 'Auto'), 0), reverse=True)[0]
-                        direct_stream_url = best.get('url') or best.get('directUrl') or best.get('permanent_m3u8_url') or best.get('rawUrl')
-                        stream_headers = best.get('headers') or {
-                            'Referer': 'https://api.hlowb.com/',
-                            'User-Agent': 'okhttp/4.9.3'
+                        quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
+                        quality_labels = {
+                            '1080p': '1080p (Full HD)',
+                            '720p': '720p (HD)',
+                            '480p': '480p (SD)',
+                            '360p': '360p (Low)',
+                            'Auto': 'Auto / Best Available'
                         }
+                        
+                        qualities_dict = {}
+                        for s in matching:
+                            q = s.get('quality', 'Auto')
+                            if q not in qualities_dict:
+                                qualities_dict[q] = s
+                            else:
+                                curr = qualities_dict[q]
+                                if not curr.get('directUrl') and s.get('directUrl'):
+                                    qualities_dict[q] = s
+
+                        sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
+                        
+                        selected_source = None
+                        if quality_arg:
+                            q_arg_clean = str(quality_arg).lower().strip()
+                            for sq in sorted_qualities:
+                                if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
+                                    selected_source = qualities_dict[sq]
+                                    break
+                                    
+                        if not selected_source and len(sorted_qualities) > 1:
+                            print("\n" + "="*55)
+                            print(f" 🎬 Movie: {title}")
+                            print("="*55)
+                            print(" Select Video Quality:")
+                            for idx, q_key in enumerate(sorted_qualities, 1):
+                                print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
+                            print("="*55)
+                            try:
+                                q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
+                                if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
+                                    selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
+                            except (KeyboardInterrupt, EOFError):
+                                pass
+
+                        if not selected_source and sorted_qualities:
+                            selected_source = qualities_dict[sorted_qualities[0]]
+
+                        if selected_source:
+                            direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
+                            stream_headers = selected_source.get('headers') or {
+                                'Referer': 'https://api.hlowb.com/',
+                                'User-Agent': 'okhttp/4.9.3'
+                            }
             except Exception:
                 pass
 
@@ -1128,15 +1274,16 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         cmd = [
             'yt-dlp',
             '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16 --min-split-size=1M --summary-interval=0 --console-log-level=warn',
             '--no-part',
             '--concurrent-fragments', '16',
+            '--newline',
             '-o', dest_path,
             direct_stream_url
         ]
         for hk, hv in stream_headers.items():
             cmd.extend(['--add-header', f'{hk}:{hv}'])
-        subprocess.run(cmd)
+        run_command_with_clean_progress(cmd)
         sync_to_sdcard_if_needed(dest_path)
         dest_file = dest_path
     else:
@@ -1760,7 +1907,7 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None)
 
         if any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
             PROCESS_MONITOR.set_status("Bypassing NetMirror Stream...")
-            return handle_netmirror(url, out_name=out_name, target_dir=target_dir)
+            return handle_netmirror(url, out_name=out_name, target_dir=target_dir, quality_arg=quality_arg)
         elif any(tg_domain in url_lower for tg_domain in ['t.me/', 'telegram.me/', 'telegram.dog/']):
             PROCESS_MONITOR.set_status("Downloading Telegram Media...")
             return handle_telegram(url, out_name=out_name, target_dir=target_dir)
