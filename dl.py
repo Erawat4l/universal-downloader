@@ -1344,30 +1344,47 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             wb_query = urllib.parse.urlencode(wb_params)
             
             candidate_streams = []
+            qualities_dict = {}
             for dom in ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']:
                 try:
                     wb_url = f"{dom}/play/watchbox.php?{wb_query}"
                     wb_r = requests.get(wb_url, headers=headers, timeout=4)
                     if wb_r.status_code == 200 and len(wb_r.text) > 200:
-                        # Extract art.tvVideoUrl
+                        # 1. Extract from dl-item (contains resolution + filesize, e.g. "1080P 2GB")
+                        for m_dl in re.finditer(r'<div class=[\"\']dl-item[\"\']>([^<]+)<[^>]+onclick=[\"\']myFunction_dl\([\"\']([^\"\']+)[\"\']', wb_r.text):
+                            lbl = m_dl.group(1).strip()
+                            u = m_dl.group(2).strip()
+                            m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
+                            q_key = m_q.group(1).lower() if m_q else lbl.lower()
+                            if q_key not in qualities_dict:
+                                qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
+                            if u not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((u, dom))
+
+                        # 2. Extract selector items in quality_new
+                        for m_sel in re.finditer(r'html\s*:\s*[\"\']([^\"\']*(?:1080|720|480|360|4k)[^\"\']*)[\"\'].*?url\s*:\s*[\"\'](https?://[^\"\'\`\s]+)[\"\']', wb_r.text, re.I | re.DOTALL):
+                            lbl = m_sel.group(1).strip()
+                            u = m_sel.group(2).strip()
+                            m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
+                            q_key = m_q.group(1).lower() if m_q else lbl.lower()
+                            if q_key not in qualities_dict:
+                                qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
+                            if u not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((u, dom))
+
+                        # 3. Extract art.tvVideoUrl
                         for m_tv in re.finditer(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
                             raw_val = m_tv.group(1)
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
                             if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((dec_url, dom))
 
-                        # Extract TvUrl
+                        # 4. Extract TvUrl
                         for m_tvurl in re.finditer(r'TvUrl\s*:\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
                             raw_val = m_tvurl.group(1)
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
                             if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((dec_url, dom))
-                        
-                        # Extract selector items in quality_new
-                        for m_q in re.finditer(r'url\s*:\s*[\"\'](https?://[^\"\'\`\s]+)[\"\']', wb_r.text):
-                            q_u = m_q.group(1)
-                            if any(ext in q_u for ext in ['.mp4', '.m3u8', 'tran-audio', 'resource']) and q_u not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((q_u, dom))
                 except Exception:
                     pass
 
@@ -1376,25 +1393,72 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             else:
                 print("✖ (no direct stream nodes found)")
 
-            # Step 4: Validate candidate streams
+            # Step 4: Validate candidate streams and prompt quality
             if candidate_streams:
                 sys.stdout.write("  [4/4] 🔐 Validating media stream health... ")
                 sys.stdout.flush()
-                for c_url, c_dom in candidate_streams:
-                    chk_headers = get_stream_headers_for_url(c_url, {'Referer': f"{c_dom}/"})
+
+                valid_qualities = {}
+                q_order = {'4k': 6, '1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'auto': 1}
+                for q_k, q_info in qualities_dict.items():
+                    chk_h = get_stream_headers_for_url(q_info['url'], {'Referer': f"{q_info['dom']}/"})
                     try:
-                        chk = requests.head(c_url, headers=chk_headers, timeout=3.5)
+                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5)
                         if chk.status_code in (200, 206, 302, 301):
-                            direct_stream_url = c_url
-                            stream_headers = chk_headers
-                            print(f"✔ Verified (status {chk.status_code})")
-                            break
+                            valid_qualities[q_k] = q_info
                     except Exception:
                         pass
-                if not direct_stream_url and candidate_streams:
-                    direct_stream_url = candidate_streams[0][0]
-                    stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{candidate_streams[0][1]}/"})
-                    print("✔ Decrypted stream ready")
+
+                if valid_qualities:
+                    print("✔ Verified (status 200)")
+                    sorted_q = sorted(valid_qualities.keys(), key=lambda q: q_order.get(q, 0), reverse=True)
+                    chosen_q_key = None
+                    if quality_arg:
+                        for k in sorted_q:
+                            if quality_arg.lower() in k:
+                                chosen_q_key = k
+                                break
+                    if not chosen_q_key:
+                        if len(sorted_q) > 1 and sys.stdin.isatty():
+                            print("\n" + "="*65)
+                            print(f" Select Video Quality for: {clean_title}")
+                            print("="*65)
+                            for q_idx, q_k in enumerate(sorted_q, 1):
+                                q_obj = valid_qualities[q_k]
+                                badge = "💎" if q_k in ('4k', '1080p') else ("📺" if q_k == '720p' else "📱")
+                                rec = "  [Recommended]" if q_idx == 1 else ""
+                                print(f"   [{q_idx}] {badge} {q_obj['label']}{rec}")
+                            print("="*65)
+                            try:
+                                q_sel = input(f"➜ Select quality [1-{len(sorted_q)}] (Default: 1): ").strip()
+                                if not q_sel or not q_sel.isdigit() or not (1 <= int(q_sel) <= len(sorted_q)):
+                                    q_sel = '1'
+                            except (KeyboardInterrupt, EOFError):
+                                return None
+                            chosen_q_key = sorted_q[int(q_sel) - 1]
+                        else:
+                            chosen_q_key = sorted_q[0]
+
+                    chosen_info = valid_qualities[chosen_q_key]
+                    direct_stream_url = chosen_info['url']
+                    stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{chosen_info['dom']}/"})
+                    print(f"➜ Selected Quality: {chosen_info['label']}")
+                else:
+                    for c_url, c_dom in candidate_streams:
+                        chk_headers = get_stream_headers_for_url(c_url, {'Referer': f"{c_dom}/"})
+                        try:
+                            chk = requests.head(c_url, headers=chk_headers, timeout=3.5)
+                            if chk.status_code in (200, 206, 302, 301):
+                                direct_stream_url = c_url
+                                stream_headers = chk_headers
+                                print(f"✔ Verified (status {chk.status_code})")
+                                break
+                        except Exception:
+                            pass
+                    if not direct_stream_url and candidate_streams:
+                        direct_stream_url = candidate_streams[0][0]
+                        stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{candidate_streams[0][1]}/"})
+                        print("✔ Decrypted stream ready")
 
         # Step 3b: Fallback to external.php
         if not direct_stream_url and tm_id:
@@ -1923,32 +1987,167 @@ def handle_video_stream_and_download(url):
     handle_video_stream_only(url)
     return download(url)
 
+def get_ott_providers_for_title(title, m_type, year):
+    """Fetch OTT platforms / networks hosting this title via TMDB API."""
+    clean_q = re.sub(r'\[.*?\]', '', title).strip()
+    api_key = 'c8dea14dc917687ac631a52620e4f7ad'
+    try:
+        sr = requests.get(f'https://api.themoviedb.org/3/search/{m_type}?query={urllib.parse.quote(clean_q)}&api_key={api_key}', timeout=2).json()
+        hits = sr.get('results', [])
+        matched_id = None
+        for h in hits:
+            h_year = (h.get('release_date') or h.get('first_air_date') or '')[:4]
+            if not year or h_year == str(year):
+                matched_id = h['id']
+                break
+        if not matched_id and hits:
+            matched_id = hits[0]['id']
+        if matched_id:
+            ott_list = []
+            if m_type == 'tv':
+                try:
+                    s_r = requests.get(f'https://api.themoviedb.org/3/tv/{matched_id}?api_key={api_key}', timeout=2).json()
+                    for n in s_r.get('networks', []):
+                        ott_list.append(n['name'])
+                except Exception:
+                    pass
+            try:
+                r_p = requests.get(f'https://api.themoviedb.org/3/{m_type}/{matched_id}/watch/providers?api_key={api_key}', timeout=2).json()
+                for c in ['IN', 'US']:
+                    for p in r_p.get('results', {}).get(c, {}).get('flatrate', []):
+                        pname = p['provider_name']
+                        if 'hotstar' in pname.lower(): pname = 'JioHotstar'
+                        elif 'disney' in pname.lower(): pname = 'Disney+'
+                        elif 'netflix' in pname.lower(): pname = 'Netflix'
+                        elif 'prime' in pname.lower(): pname = 'Prime Video'
+                        elif 'apple' in pname.lower(): pname = 'Apple TV+'
+                        elif 'zee' in pname.lower(): pname = 'Zee5'
+                        elif 'sony' in pname.lower(): pname = 'SonyLIV'
+                        elif 'peacock' in pname.lower(): pname = 'Peacock'
+                        elif 'paramount' in pname.lower(): pname = 'Paramount+'
+                        elif 'max' in pname.lower() or 'hbo' in pname.lower(): pname = 'Max'
+                        if pname not in ott_list:
+                            ott_list.append(pname)
+            except Exception:
+                pass
+            return ott_list[:2]
+    except Exception:
+        pass
+    return []
+
+def group_and_deduplicate_results(results):
+    """Group duplicate results by title + type + year, extract audios, and attach OTT platforms."""
+    groups = {}
+    for it in results:
+        t = it.get('title') or it.get('name') or ''
+        clean_t = re.sub(r'\[.*?\]', '', t).strip()
+        clean_t = re.sub(r'\s+', ' ', clean_t)
+        m_type = (it.get('media_type') or it.get('type') or 'movie').lower()
+        m_id = it.get('id')
+        yr = it.get('num_year', 0)
+        if not yr and it.get('year'):
+            try:
+                yr = int(str(it['year']).split(',')[-1].strip()[:4])
+            except Exception:
+                yr = 0
+                
+        # Detect audio
+        t_lower = t.lower()
+        if 'hindi' in t_lower: aud = 'Hindi'
+        elif 'tamil' in t_lower: aud = 'Tamil'
+        elif 'telugu' in t_lower: aud = 'Telugu'
+        elif 'bengali' in t_lower: aud = 'Bengali'
+        elif 'malayalam' in t_lower: aud = 'Malayalam'
+        elif 'kannada' in t_lower: aud = 'Kannada'
+        elif 'japanese' in t_lower: aud = 'Japanese'
+        elif 'korean' in t_lower: aud = 'Korean'
+        else: aud = 'English'
+
+        key = (clean_t.lower(), m_type, yr)
+        if key not in groups:
+            groups[key] = {
+                'title': clean_t,
+                'type': m_type.upper(),
+                'year': yr,
+                'audios': {},
+                'items': []
+            }
+        groups[key]['audios'][aud] = {
+            'id': m_id,
+            'title': t,
+            'url': it.get('url') or f"https://netmirror.center/{m_type}/{m_id}"
+        }
+        groups[key]['items'].append(it)
+
+    # Fetch OTT providers in parallel
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        f_map = {ex.submit(get_ott_providers_for_title, g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
+        for f in concurrent.futures.as_completed(f_map):
+            k = f_map[f]
+            groups[k]['otts'] = f.result() or []
+
+    # Sort descending by year
+    sorted_groups = sorted(groups.values(), key=lambda g: (-g['year'], g['title']))
+    return sorted_groups
+
 def prompt_results_list(results, query, target_dir=None):
+    sorted_groups = group_and_deduplicate_results(results)
+    if not sorted_groups:
+        print("⚠ No matching results found on NetMirror. Searching YouTube instead...")
+        return search_youtube_and_prompt(query, target_dir=target_dir)
+
     print("\n" + "="*65)
     print(f" 🎬 NetMirror Search Results for: \"{query}\"")
     print("="*65)
-    for idx, item in enumerate(results[:10], 1):
-        yr_str = f" ({item['year']})" if item.get('year') else ""
-        print(f"   [{idx}] {item['title']} [{item['type']}{yr_str}]")
+    for idx, g in enumerate(sorted_groups[:10], 1):
+        yr_str = f" ({g['year']})" if g['year'] else ""
+        aud_list = list(g['audios'].keys())
+        aud_str = f" • Audio: [{', '.join(aud_list)}]"
+        ott_str = f" • [{' / '.join(g['otts'])}]" if g['otts'] else ""
+        print(f"   [{idx}] {g['title']} [{g['type']}{yr_str}]{ott_str}{aud_str}")
     print("   [Y] 📺 Search on YouTube instead")
     print("="*65)
 
     while True:
         try:
-            sel = input(f"➜ Select result [1-{len(results[:10])}] (Default: 1, Y: YouTube): ").strip()
+            sel = input(f"➜ Select result [1-{len(sorted_groups[:10])}] (Default: 1, Y: YouTube): ").strip()
             if not sel:
                 sel = '1'
         except (KeyboardInterrupt, EOFError):
             return
         if sel.lower() in ('y', 'yt', 'youtube'):
             return search_youtube_and_prompt(query, target_dir=target_dir)
-        elif sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
-            selected = results[int(sel) - 1]
-            print(f"\n➜ Selected: {selected['title']}")
-            prompt_action_mode_and_run(selected['url'], query_context=query, all_results=results, target_dir=target_dir)
+        elif sel.isdigit() and 1 <= int(sel) <= len(sorted_groups[:10]):
+            selected_group = sorted_groups[int(sel) - 1]
+            audios = selected_group['audios']
+            chosen_url = None
+            if len(audios) > 1:
+                print("\n" + "="*65)
+                print(f" Select Audio Track for: {selected_group['title']} ({selected_group['year']})")
+                print("="*65)
+                audio_keys = list(audios.keys())
+                for a_idx, lang in enumerate(audio_keys, 1):
+                    flag = '🇮🇳' if lang == 'Hindi' else ('🌐' if lang == 'English' else '🎵')
+                    print(f"   [{a_idx}] {flag} {lang}")
+                print("="*65)
+                try:
+                    a_sel = input(f"➜ Select audio [1-{len(audio_keys)}] (Default: 1): ").strip()
+                    if not a_sel or not a_sel.isdigit() or not (1 <= int(a_sel) <= len(audio_keys)):
+                        a_sel = '1'
+                except (KeyboardInterrupt, EOFError):
+                    return
+                chosen_lang = audio_keys[int(a_sel) - 1]
+                chosen_url = audios[chosen_lang]['url']
+                print(f"➜ Selected Audio: {chosen_lang}")
+            else:
+                chosen_url = list(audios.values())[0]['url']
+                
+            print(f"\n➜ Selected: {selected_group['title']}")
+            prompt_action_mode_and_run(chosen_url, query_context=query, all_results=sorted_groups, target_dir=target_dir)
             return
         else:
-            print(f"✖ Invalid selection. Please select choice 1 to {len(results[:10])} or 'Y'.")
+            print(f"✖ Invalid selection. Please select choice 1 to {len(sorted_groups[:10])} or 'Y'.")
 
 def prompt_action_mode_and_run(url, query_context=None, all_results=None, target_dir=None):
     is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
