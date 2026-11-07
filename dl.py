@@ -2392,10 +2392,35 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
 
 def search_netmirror_and_prompt(query, target_dir=None):
     print(f"\n➜ Searching NetMirror for: \"{query}\"...")
-    results = search_netmirror(query)
+    try:
+        results = search_netmirror(query)
+    except KeyboardInterrupt:
+        print("\n⚠ Search cancelled.")
+        return
     if not results:
-        print("⚠ No search results found on NetMirror. Searching YouTube instead...")
-        return search_youtube_and_prompt(query, target_dir=target_dir)
+        print(f"\n⚠ No search results found on NetMirror for: \"{query}\"")
+        print("="*60)
+        print(" Select an option:")
+        print(f"   [1] 📺 Search on YouTube for \"{query}\"")
+        print("   [2] 🔄 Try a different search term")
+        print("   [3] ↩ Return to main menu")
+        print("="*60)
+        try:
+            choice = input("➜ Select choice [1-3] (Default: 2): ").strip()
+            if not choice:
+                choice = '2'
+        except (KeyboardInterrupt, EOFError):
+            return
+        if choice == '1':
+            return search_youtube_and_prompt(query, target_dir=target_dir)
+        elif choice == '2':
+            try:
+                new_q = input("\n➜ Enter movie or video name: ").strip()
+                if new_q and new_q.lower() not in ('q', 'quit', 'exit'):
+                    return search_netmirror_and_prompt(new_q, target_dir=target_dir)
+            except (KeyboardInterrupt, EOFError):
+                return
+        return
     return prompt_results_list(results, query, target_dir=target_dir)
 
 def search_youtube_and_prompt(query, target_dir=None):
@@ -2403,10 +2428,13 @@ def search_youtube_and_prompt(query, target_dir=None):
     yt_entries = []
     if HAS_YTDLP:
         try:
-            ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
+            ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist', 'socket_timeout': 6})
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 res = ydl.extract_info(f"ytsearch10:{query}", download=False)
                 yt_entries = [e for e in res.get('entries', []) if e] if res else []
+        except KeyboardInterrupt:
+            print("\n⚠ YouTube search cancelled.")
+            return
         except Exception:
             yt_entries = []
 
@@ -2770,4 +2798,11 @@ def main():
             print(f"⚠ Skipping invalid argument: {url}")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Exited.")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
