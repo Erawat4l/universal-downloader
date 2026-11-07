@@ -1378,6 +1378,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         lang_label = f"[{target_lang}]" if target_lang else "default"
         print(f"  [1/4] 🔍 Querying movie metadata & audio tracks ({lang_label})... ✔")
 
+        candidate_streams = []
+        qualities_dict = {}
+
         # Step 2: Primary Gateway (vidsync.pro) with 3.5s timeout
         if tm_id:
             sys.stdout.write("  [2/4] 🌐 Connecting to primary stream gateway (vidsync.pro)... ")
@@ -1394,71 +1397,29 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     v_data = v_res.json()
                     sources = v_data.get('sources', [])
                     if sources:
-                        print("✔ Stream sources found!")
                         matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
                         if not matching:
                             matching = sources
-                        
-                        quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
-                        quality_labels = {
-                            '1080p': '1080p (Full HD)',
-                            '720p': '720p (HD)',
-                            '480p': '480p (SD)',
-                            '360p': '360p (Low)',
-                            'Auto': 'Auto / Best Available'
-                        }
-                        
-                        qualities_dict = {}
                         for s in matching:
-                            q = s.get('quality', 'Auto')
-                            if q not in qualities_dict:
-                                qualities_dict[q] = s
-                            else:
-                                curr = qualities_dict[q]
-                                if not curr.get('directUrl') and s.get('directUrl'):
-                                    qualities_dict[q] = s
-
-                        sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
-                        
-                        selected_source = None
-                        if quality_arg:
-                            q_arg_clean = str(quality_arg).lower().strip()
-                            for sq in sorted_qualities:
-                                if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
-                                    selected_source = qualities_dict[sq]
-                                    break
-                                    
-                        if not selected_source and len(sorted_qualities) > 1 and sys.stdin.isatty():
-                            print("\n" + "="*55)
-                            print(f" 🎬 Movie: {clean_title}")
-                            print("="*55)
-                            print(" Select Video Quality:")
-                            for idx, q_key in enumerate(sorted_qualities, 1):
-                                print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
-                            print("="*55)
-                            try:
-                                q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
-                                if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
-                                    selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
-                            except (KeyboardInterrupt, EOFError):
-                                pass
-
-                        if not selected_source and sorted_qualities:
-                            selected_source = qualities_dict[sorted_qualities[0]]
-
-                        if selected_source:
-                            direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
-                            stream_headers = selected_source.get('headers') or {
-                                'Referer': 'https://api.hlowb.com/',
-                                'User-Agent': 'okhttp/4.9.3'
-                            }
+                            q_raw = s.get('quality', 'Auto')
+                            m_q = re.search(r'(4k|1080p|720p|480p|360p)', q_raw, re.I)
+                            q_k = m_q.group(1).lower() if m_q else q_raw.lower()
+                            u = s.get('url') or s.get('directUrl') or s.get('permanent_m3u8_url') or s.get('rawUrl')
+                            if u:
+                                lbl = f"{q_k.upper()} (HD)" if q_k == '720p' else (f"{q_k.upper()} (SD)" if q_k == '480p' else f"{q_k.upper()} (Full HD)" if q_k == '1080p' else q_k.upper())
+                                qualities_dict[q_k] = {'label': lbl, 'url': u, 'dom': 'https://vidsync.pro', 'headers': s.get('headers')}
+                                if u not in [c[0] for c in candidate_streams]:
+                                    candidate_streams.append((u, 'https://vidsync.pro'))
+                        print(f"✔ Found {len(matching)} source(s)")
+                    else:
+                        print("✖ (no stream sources)")
                 else:
                     print(f"✖ (status {v_res.status_code})")
             except Exception:
                 print("✖ (offline/timed out)")
 
         # Step 3: Multi-Server CDN manifests (watchbox.php across bet/limit/webvp)
-        if not direct_stream_url and tm_id:
+        if tm_id:
             sys.stdout.write("  [3/4] ⚡ Querying multi-server CDN manifests (watchbox)... ")
             sys.stdout.flush()
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
@@ -1470,8 +1431,6 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             }
             wb_query = urllib.parse.urlencode(wb_params)
             
-            candidate_streams = []
-            qualities_dict = {}
             for dom in ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']:
                 try:
                     wb_url = f"{dom}/play/watchbox.php?{wb_query}"
@@ -1483,7 +1442,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             u = m_dl.group(2).strip()
                             m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
                             q_key = m_q.group(1).lower() if m_q else lbl.lower()
-                            if q_key not in qualities_dict:
+                            if q_key not in qualities_dict or '.mp4' in u.lower():
                                 qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
                             if u not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((u, dom))
@@ -1494,7 +1453,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             u = m_sel.group(2).strip()
                             m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
                             q_key = m_q.group(1).lower() if m_q else lbl.lower()
-                            if q_key not in qualities_dict:
+                            if q_key not in qualities_dict or '.mp4' in u.lower():
                                 qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
                             if u not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((u, dom))
@@ -1512,6 +1471,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
                             if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((dec_url, dom))
+                        break
                 except Exception:
                     pass
 
@@ -1767,9 +1727,11 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             cmd = [
                 'yt-dlp',
                 '--downloader', 'aria2c',
-                '--downloader-args', 'aria2c:-x 16 -s 16 -k 1M -j 16 --min-split-size=1M --summary-interval=0 --console-log-level=warn',
+                '--downloader-args', 'aria2c:-x 5 -s 5 -k 1M -j 5 --min-split-size=1M --summary-interval=0 --console-log-level=warn',
                 '--no-part',
-                '--concurrent-fragments', '16',
+                '--concurrent-fragments', '5',
+                '--fragment-retries', '10',
+                '--retries', '10',
                 '--newline',
                 '-o', dest_path,
                 direct_stream_url
