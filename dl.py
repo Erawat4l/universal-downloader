@@ -490,8 +490,12 @@ def wait_for_network():
     print(" ➜ Resuming download...")
     print("="*60, flush=True)
 
+PROGRESS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+PROGRESS_SPINNER_INDEX = 0
+
 def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--"):
-    """Render a clean, single-line in-place progress bar guaranteed not to wrap or spam."""
+    """Render a sleek, animated single-line progress bar guaranteed not to wrap or spam."""
+    global PROGRESS_SPINNER_INDEX
     try:
         cols = shutil.get_terminal_size((70, 20)).columns
     except Exception:
@@ -500,32 +504,71 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
         pct = max(0.0, min(100.0, float(percent)))
     except Exception:
         pct = 0.0
-    info = f" {pct:5.1f}% | {total_str} | {speed_str} | ETA {eta_str}"
-    bar_width = max(5, min(20, cols - len(info) - 4))
-    filled = int(bar_width * (pct / 100.0))
-    bar = "█" * filled + "░" * (bar_width - filled)
-    line = f"[{bar}]{info}"
-    if len(line) >= cols:
-        line = line[:cols - 1]
+
+    spin = PROGRESS_SPINNER_FRAMES[PROGRESS_SPINNER_INDEX % len(PROGRESS_SPINNER_FRAMES)]
+    PROGRESS_SPINNER_INDEX += 1
+
+    spd_clean = speed_str if ('s' in speed_str.lower() or speed_str.lower() in ('--', 'done', 'complete')) else f"{speed_str}/s"
+    eta_clean = f"ETA {eta_str}" if not eta_str.lower().startswith('eta') else eta_str
+
+    # Info text without ANSI for calculating terminal width
+    info_plain = f" {pct:5.1f}% | {total_str} | {spd_clean} | {eta_clean}"
+    overhead = len(info_plain) + 6
+    bar_width = max(5, min(24, cols - overhead))
+
+    # Fractional smooth block computation
+    full_blocks = int(bar_width * (pct / 100.0))
+    fraction = (bar_width * (pct / 100.0)) - full_blocks
+    frac_blocks = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
+    frac_char = frac_blocks[int(fraction * 8)] if full_blocks < bar_width else ''
+    empty_blocks = max(0, bar_width - full_blocks - (1 if frac_char else 0))
+
+    bar_colored = f"\033[38;5;45m{'█' * full_blocks}{frac_char}\033[38;5;238m{'░' * empty_blocks}\033[0m"
+    line = f"\033[1;36m{spin}\033[0m [{bar_colored}] \033[1;97m{pct:5.1f}%\033[0m | \033[38;5;153m{total_str}\033[0m | \033[38;5;220m⚡ {spd_clean}\033[0m | \033[38;5;141m⏳ {eta_clean}\033[0m"
+
     sys.stdout.write(f"\r\033[K{line}")
     sys.stdout.flush()
+
+ARIA_PROGRESS_REGEX = re.compile(
+    r'\[#[0-9a-fA-F]+\s+([\d\.]+[A-Za-z]+)/([\d\.]+[A-Za-z]+)\((\d+)%\)\s*(?:CN:\d+\s*)?DL:([\d\.]+[A-Za-z]+)?(?:\s*ETA:([^\s\]]+))?\]'
+)
+YTDLP_PROGRESS_REGEX = re.compile(
+    r'\[download\]\s+([\d\.]+)%\s+of\s+~?\s*([\d\.]+\s*[A-Za-z]+)\s+at\s+([\d\.]+\s*[A-Za-z]+/s)\s+ETA\s+([\d:]+)'
+)
 
 def _process_progress_line(line):
     line = line.strip()
     if not line:
         return
-    m = re.search(r'\[download\]\s+([\d\.]+)%\s+of\s+~?\s*([\d\.]+\s*[A-Za-z]+)\s+at\s+([\d\.]+\s*[A-Za-z]+/s)\s+ETA\s+([\d:]+)', line)
-    if m:
+
+    # 1. Parse multi-threaded aria2c progress line
+    m_aria = ARIA_PROGRESS_REGEX.search(line)
+    if m_aria:
         try:
-            pct = float(m.group(1))
-            tot = m.group(2).replace(' ', '')
-            spd = m.group(3).replace(' ', '')
-            eta = m.group(4)
-            render_download_progress(pct, tot, spd, eta)
+            downloaded = m_aria.group(1)
+            total = m_aria.group(2)
+            pct = float(m_aria.group(3))
+            spd = m_aria.group(4) or "--"
+            eta = m_aria.group(5) or "--"
+            render_download_progress(pct, total_str=f"{downloaded}/{total}", speed_str=spd, eta_str=eta)
             return
         except Exception:
             pass
 
+    # 2. Parse yt-dlp progress line
+    m_yt = YTDLP_PROGRESS_REGEX.search(line)
+    if m_yt:
+        try:
+            pct = float(m_yt.group(1))
+            tot = m_yt.group(2).replace(' ', '')
+            spd = m_yt.group(3).replace(' ', '')
+            eta = m_yt.group(4)
+            render_download_progress(pct, total_str=tot, speed_str=spd, eta_str=eta)
+            return
+        except Exception:
+            pass
+
+    # 3. Simple percentage fallback
     m_pct = re.search(r'\[download\]\s+([\d\.]+)%', line)
     if m_pct:
         try:
@@ -535,7 +578,11 @@ def _process_progress_line(line):
         except Exception:
             pass
 
-    if line.startswith('[download] Downloading fragment') or ('frag' in line and line.startswith('[download]')):
+    # 4. Filter out aria2c / yt-dlp summary and separator lines to eliminate scrolling spam
+    if line.startswith(('===', '---', '***', 'FILE:', 'Download Results:', '[FixupM3u8]')) or \
+       line.startswith('[download] Downloading fragment') or ('frag' in line and line.startswith('[download]')) or \
+       'Download Progress Summary' in line or \
+       re.match(r'^\([A-Z]+\):download', line):
         return
 
     sys.stdout.write(f"\r\033[K{line}\n")
@@ -567,6 +614,8 @@ def run_command_with_clean_progress(cmd):
             else:
                 buf.append(ch)
         p.wait()
+        if p.returncode == 0:
+            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s")
         sys.stdout.write("\n")
         sys.stdout.flush()
         return p.returncode
