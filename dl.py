@@ -243,6 +243,26 @@ def launch_player(target_uri, player_choice="vlc"):
         pass
     return False
 
+def get_stream_headers_for_url(url, base_headers=None):
+    """Normalize required headers for stream hosts (e.g. mzfi.me referer for hakunaymatata)."""
+    headers = {
+        'User-Agent': HEADERS.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    }
+    if base_headers:
+        headers.update(base_headers)
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = (parsed.hostname or '').lower()
+        if 'hakunaymatata.com' in hostname:
+            if hostname != 'bcdnt.hakunaymatata.com':
+                headers['Referer'] = 'https://mzfi.me/'
+                headers['Origin'] = 'https://mzfi.me'
+        elif 'Referer' not in headers:
+            headers['Referer'] = 'https://netmirror.plus/'
+    except Exception:
+        pass
+    return headers
+
 def save_m3u8_stream_file(url, title, target_dir=None):
     """Save the ~300KB .m3u8 stream playlist file to storage for instant VLC streaming."""
     out_dir = target_dir or DEFAULT_DIR
@@ -251,19 +271,33 @@ def save_m3u8_stream_file(url, title, target_dir=None):
     if not clean_name.lower().endswith('.m3u8'):
         clean_name = os.path.splitext(clean_name)[0] + '.m3u8'
     file_path = os.path.join(out_dir, clean_name)
+    headers = get_stream_headers_for_url(url)
+    ref = headers.get('Referer', '')
+    ua = headers.get('User-Agent', '')
+
+    if '.m3u8' in url.lower():
+        try:
+            r = requests.get(url, headers=headers, stream=True, timeout=5)
+            if r.status_code == 200:
+                chunk = r.raw.read(1024, decode_content=True)
+                if b'#EXTM3U' in chunk:
+                    full_content = chunk + r.raw.read()
+                    with open(file_path, 'wb') as f:
+                        f.write(full_content)
+                    sync_to_sdcard_if_needed(file_path)
+                    print(f"📄 Saved instant stream playlist ({len(full_content)//1024} KB) to: {file_path}")
+                    return file_path
+        except Exception:
+            pass
     try:
-        r = requests.get(url, headers={'User-Agent': 'okhttp/4.9.3', 'Referer': 'https://api.hlowb.com/'}, timeout=6)
-        if r.status_code == 200 and '#EXTM3U' in r.text:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(r.text)
-            sync_to_sdcard_if_needed(file_path)
-            print(f"📄 Saved instant stream playlist ({len(r.text)//1024} KB) to: {file_path}")
-            return file_path
-    except Exception:
-        pass
-    try:
+        content = f"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:-1,{title}\n"
+        if ref:
+            content += f"#EXTVLCOPT:http-referrer={ref}\n"
+        if ua:
+            content += f"#EXTVLCOPT:http-user-agent={ua}\n"
+        content += f"{url}\n"
         with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(f"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:-1,{title}\n{url}\n")
+            f.write(content)
         sync_to_sdcard_if_needed(file_path)
         print(f"📄 Saved instant stream playlist to: {file_path}")
         return file_path
@@ -276,16 +310,21 @@ def decrypt_netmirror_tv_url(encrypted_val):
     try:
         from Cryptodome.Cipher import AES
         clean_enc = encrypted_val.replace('&encrypt=true', '').strip()
-        key = hashlib.sha256(b'NET_TV_SECRET_KEY').digest()
         raw = base64.b64decode(clean_enc)
         if len(raw) < 28:
             return None
         iv = raw[:12]
         tag = raw[12:28]
         ciphertext = raw[28:]
-        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-        decrypted = cipher.decrypt_and_verify(ciphertext, tag)
-        return decrypted.decode('utf-8')
+        for secret in [b'net###@@sss', b'NET_TV_SECRET_KEY']:
+            try:
+                key = hashlib.sha256(secret).digest()
+                cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+                decrypted = cipher.decrypt_and_verify(ciphertext, tag)
+                return decrypted.decode('utf-8')
+            except Exception:
+                continue
+        return None
     except Exception:
         return None
 
@@ -422,7 +461,7 @@ def run_command_with_clean_progress(cmd):
         return 1
 
 def download_file_stream(url, filename, custom_headers=None, target_dir=None):
-    headers = {**HEADERS, **(custom_headers or {})}
+    headers = get_stream_headers_for_url(url, {**HEADERS, **(custom_headers or {})})
     print(f"➜ Fetching: {url}")
     
     dest_path = get_dest_path(filename, target_dir)
@@ -1316,6 +1355,13 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
                             if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((dec_url, dom))
+
+                        # Extract TvUrl
+                        for m_tvurl in re.finditer(r'TvUrl\s*:\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
+                            raw_val = m_tvurl.group(1)
+                            dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
+                            if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((dec_url, dom))
                         
                         # Extract selector items in quality_new
                         for m_q in re.finditer(r'url\s*:\s*[\"\'](https?://[^\"\'\`\s]+)[\"\']', wb_r.text):
@@ -1335,18 +1381,19 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 sys.stdout.write("  [4/4] 🔐 Validating media stream health... ")
                 sys.stdout.flush()
                 for c_url, c_dom in candidate_streams:
+                    chk_headers = get_stream_headers_for_url(c_url, {'Referer': f"{c_dom}/"})
                     try:
-                        chk = requests.head(c_url, headers={'User-Agent': HEADERS['User-Agent'], 'Referer': f"{c_dom}/"}, timeout=2.5)
+                        chk = requests.head(c_url, headers=chk_headers, timeout=3.5)
                         if chk.status_code in (200, 206, 302, 301):
                             direct_stream_url = c_url
-                            stream_headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': f"{c_dom}/"}
+                            stream_headers = chk_headers
                             print(f"✔ Verified (status {chk.status_code})")
                             break
                     except Exception:
                         pass
                 if not direct_stream_url and candidate_streams:
                     direct_stream_url = candidate_streams[0][0]
-                    stream_headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': f"{candidate_streams[0][1]}/"}
+                    stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{candidate_streams[0][1]}/"})
                     print("✔ Decrypted stream ready")
 
         # Step 3b: Fallback to external.php
@@ -1472,10 +1519,14 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
     print(f"➜ Bypassed NetMirror Stream: {title}")
     
+    stream_headers = get_stream_headers_for_url(direct_stream_url, stream_headers)
+
     print("\n" + "="*65)
-    print(" 🚀 DIRECT STREAM LINK FOR ADM (NO PRE-DOWNLOAD NEEDED):")
+    print(" 🚀 DIRECT STREAM LINK FOR ADM / 1DM (NO PRE-DOWNLOAD NEEDED):")
     print("="*65)
     print(f" 🔗 Copy & Paste into ADM App: {direct_stream_url}")
+    if stream_headers.get('Referer'):
+        print(f" 🌐 Referer Header (if needed): {stream_headers['Referer']}")
     print("="*65 + "\n")
     try:
         subprocess.run(["termux-clipboard-set"], input=direct_stream_url.encode('utf-8'), capture_output=True, timeout=2)
@@ -1483,26 +1534,27 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     except Exception:
         pass
 
-    # Always save the ~300KB .m3u8 stream shortcut file for instant VLC streaming
+    # Always save the ~300KB .m3u8 stream shortcut file with headers
     m3u8_file = save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
 
     if action_mode in ('direct_link_only', 'direct'):
         return direct_stream_url
 
-    if action_mode in ('stream_and_download', 'stream', 'stream_only'):
+    if action_mode in ('stream_only', 'stream', 'stream_and_download'):
         launch_player(direct_stream_url, player_choice="vlc")
 
     if action_mode in ('stream_only', 'stream'):
         print("🍿 Streaming active in VLC Player! (No local video file will be downloaded)")
         return direct_stream_url
 
-    # Direct download execution: support HLS m3u8 multi-threaded download via aria2c/yt-dlp
+    # Direct download execution: support HLS m3u8 and MP4 multi-threaded download via aria2c
     try:
         subprocess.run(["termux-wake-lock"], capture_output=True, timeout=2)
     except Exception:
         pass
 
     try:
+        dest_path = get_dest_path(clean_name, target_dir)
         if '.m3u8' in direct_stream_url:
             print("➜ Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
             if not clean_name.lower().endswith('.mp4'):
@@ -1523,6 +1575,33 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             run_command_with_clean_progress(cmd)
             sync_to_sdcard_if_needed(dest_path)
             dest_file = dest_path
+        elif shutil.which('aria2c'):
+            print(f"➜ Downloading via multi-threaded aria2c (16x): {clean_name}...")
+            out_dir = os.path.dirname(dest_path) or DEFAULT_DIR
+            out_file = os.path.basename(dest_path)
+            cmd = [
+                'aria2c',
+                '-x', '16',
+                '-s', '16',
+                '-j', '16',
+                '-k', '1M',
+                '--min-split-size=1M',
+                '--summary-interval=1',
+                '--console-log-level=warn',
+                '--allow-overwrite=true',
+                '--auto-file-renaming=false',
+                '-d', out_dir,
+                '-o', out_file
+            ]
+            for hk, hv in stream_headers.items():
+                cmd.append(f'--header={hk}: {hv}')
+            cmd.append(direct_stream_url)
+            ret = run_command_with_clean_progress(cmd)
+            if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                sync_to_sdcard_if_needed(dest_path)
+                dest_file = dest_path
+            else:
+                dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
         else:
             dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
     finally:
@@ -1876,10 +1955,10 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
     while True:
         print("\n" + "="*65)
         print(" Select Action / Mode:")
-        print("   [1] 🎬 Stream in VLC & Download Video (Instant Play + Save)")
-        print("   [2] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
-        print("   [3] 🍿 Stream in VLC Only (Instant Play, No Storage Used)")
-        print("   [4] 🔗 Generate Direct Links & Save .m3u8 Playlist (for ADM)")
+        print("   [1] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
+        print("   [2] 🔗 Copy Direct Stream Link (No Pre-Download, for ADM / 1DM)")
+        print("   [3] 🎬 Stream in VLC Player (Instant Play, No Storage Used)")
+        print("   [4] 🍿 Stream in VLC & Download Video (Instant Play + Save)")
         print("="*65)
         try:
             mode_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
@@ -1892,14 +1971,14 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
         try:
             if mode_choice == '1':
                 if is_netmirror:
-                    res = handle_netmirror(url, action_mode='stream_and_download', target_dir=target_dir)
-                else:
-                    res = handle_video_stream_and_download(url)
-            elif mode_choice == '2':
-                if is_netmirror:
                     res = handle_netmirror(url, action_mode='download_only', target_dir=target_dir)
                 else:
                     res = download(url, target_dir=target_dir)
+            elif mode_choice == '2':
+                if is_netmirror:
+                    res = handle_netmirror(url, action_mode='direct_link_only', target_dir=target_dir)
+                else:
+                    res = generate_adm_links_for_url(url)
             elif mode_choice == '3':
                 if is_netmirror:
                     res = handle_netmirror(url, action_mode='stream_only', target_dir=target_dir)
@@ -1907,9 +1986,9 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
                     res = handle_video_stream_only(url)
             elif mode_choice == '4':
                 if is_netmirror:
-                    res = handle_netmirror(url, action_mode='direct_link_only', target_dir=target_dir)
+                    res = handle_netmirror(url, action_mode='stream_and_download', target_dir=target_dir)
                 else:
-                    res = generate_adm_links_for_url(url)
+                    res = handle_video_stream_and_download(url)
             else:
                 print("✖ Invalid selection. Please select choice 1 to 4.")
                 continue
