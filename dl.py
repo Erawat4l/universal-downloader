@@ -15,6 +15,9 @@ import requests
 import html
 from bs4 import BeautifulSoup
 import socket
+import http.server
+import socketserver
+import threading
 try:
     import urllib3.util.connection as urllib3_conn
     urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
@@ -200,49 +203,6 @@ def print_adm_link(file_path):
     except Exception:
         pass
 
-def launch_player(target_uri, player_choice="vlc"):
-    """Launch stream URL or video in VLC Player or native player."""
-    clean_env = os.environ.copy()
-    clean_env.pop('LD_LIBRARY_PATH', None)
-
-    # 1. Try launching via ADB into VLC
-    try:
-        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
-        if "device" in res.stdout and len(res.stdout.strip().splitlines()) > 1:
-            adb_cmd = [
-                "adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
-                "-d", target_uri, "-t", "video/*"
-            ]
-            if player_choice == "vlc":
-                adb_cmd.extend(["-p", "org.videolan.vlc"])
-            adb_res = subprocess.run(adb_cmd, capture_output=True, text=True, timeout=3)
-            if adb_res.returncode == 0:
-                print("🎬 Streaming opened in VLC Player!")
-                return True
-    except Exception:
-        pass
-
-    # 2. Try launching via local am start (Termux native)
-    try:
-        am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", target_uri, "-t", "video/*"]
-        if player_choice == "vlc":
-            am_cmd.extend(["-p", "org.videolan.vlc"])
-        res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
-        if res.returncode == 0:
-            print("🎬 Streaming opened in VLC Player!")
-            return True
-    except Exception:
-        pass
-
-    # 3. Fallback to termux-open
-    try:
-        subprocess.Popen(["termux-open", target_uri], env=clean_env)
-        print("🎬 Stream sent to default media player!")
-        return True
-    except Exception:
-        pass
-    return False
-
 def get_stream_headers_for_url(url, base_headers=None):
     """Normalize required headers for stream hosts (e.g. mzfi.me referer for hakunaymatata)."""
     headers = {
@@ -262,6 +222,159 @@ def get_stream_headers_for_url(url, base_headers=None):
     except Exception:
         pass
     return headers
+
+LOCAL_STREAM_PROXY = None
+LOCAL_PROXY_URL = None
+LOCAL_PROXY_PORT = 8765
+
+class ThreadedStreamProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+class StreamProxyRequestHandler(http.server.BaseHTTPRequestHandler):
+    target_stream_url = None
+    stream_headers = {}
+
+    def log_message(self, format, *args):
+        # Keep terminal completely clean
+        pass
+
+    def do_HEAD(self):
+        self.relay_request(head_only=True)
+
+    def do_GET(self):
+        self.relay_request(head_only=False)
+
+    def relay_request(self, head_only=False):
+        req_target = self.__class__.target_stream_url
+        if not req_target:
+            self.send_error(404, "No active stream")
+            return
+
+        parsed_path = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_path.query)
+        if 'url' in query:
+            req_target = query['url'][0]
+        elif parsed_path.path not in ('/', '/stream', '/stream.mp4', '/stream.m3u8'):
+            req_target = urllib.parse.urljoin(self.__class__.target_stream_url, self.path)
+
+        req_headers = dict(self.__class__.stream_headers)
+        range_header = self.headers.get('Range')
+        if range_header:
+            req_headers['Range'] = range_header
+
+        try:
+            resp = requests.get(
+                req_target,
+                headers=req_headers,
+                stream=True,
+                timeout=15,
+                allow_redirects=True
+            )
+            self.send_response(resp.status_code)
+            for k in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'Last-Modified', 'ETag'):
+                if k in resp.headers:
+                    self.send_header(k, resp.headers[k])
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            if not head_only:
+                for chunk in resp.iter_content(chunk_size=131072):
+                    if chunk:
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, socket.error):
+            pass
+        except Exception:
+            pass
+
+def start_local_stream_proxy(target_url, custom_headers=None, port=8765):
+    """Start or update local streaming proxy to inject required stream headers for VLC playback."""
+    global LOCAL_STREAM_PROXY, LOCAL_PROXY_URL, LOCAL_PROXY_PORT
+
+    headers = get_stream_headers_for_url(target_url, custom_headers)
+    StreamProxyRequestHandler.target_stream_url = target_url
+    StreamProxyRequestHandler.stream_headers = headers
+
+    ext = ".m3u8" if ".m3u8" in target_url.lower() else ".mp4"
+
+    if LOCAL_STREAM_PROXY is not None:
+        LOCAL_PROXY_URL = f"http://127.0.0.1:{LOCAL_PROXY_PORT}/stream{ext}"
+        return LOCAL_PROXY_URL
+
+    for p in [port, 8766, 8767, 8768]:
+        try:
+            server = ThreadedStreamProxyServer(('0.0.0.0', p), StreamProxyRequestHandler)
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            LOCAL_STREAM_PROXY = server
+            LOCAL_PROXY_PORT = p
+            LOCAL_PROXY_URL = f"http://127.0.0.1:{p}/stream{ext}"
+            return LOCAL_PROXY_URL
+        except OSError:
+            continue
+
+    return target_url
+
+def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=None):
+    """Launch stream URL or video in VLC Player with local header proxying."""
+    clean_env = os.environ.copy()
+    clean_env.pop('LD_LIBRARY_PATH', None)
+
+    play_uri = target_uri
+    if target_uri.startswith(('http://', 'https://')):
+        # Proxy through local HTTP proxy to inject required stream headers (e.g. mzfi.me referer)
+        play_uri = start_local_stream_proxy(target_uri, custom_headers=custom_headers)
+
+    import shlex
+
+    # 1. Try launching via ADB into VLC
+    try:
+        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
+        if "device" in res.stdout and len(res.stdout.strip().splitlines()) > 1:
+            quoted_uri = shlex.quote(play_uri)
+            adb_cmd = f"am start -a android.intent.action.VIEW -d {quoted_uri} -t video/*"
+            if player_choice == "vlc":
+                adb_cmd += " -p org.videolan.vlc"
+            adb_res = subprocess.run(["adb", "shell", adb_cmd], capture_output=True, text=True, timeout=3)
+            if adb_res.returncode == 0:
+                print("🎬 Streaming opened in VLC Player!")
+                return True
+    except Exception:
+        pass
+
+    # 2. Try launching via local am start (Termux native)
+    try:
+        am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_uri, "-t", "video/*"]
+        if player_choice == "vlc":
+            am_cmd.extend(["-p", "org.videolan.vlc"])
+        res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
+        if res.returncode == 0:
+            print("🎬 Streaming opened in VLC Player!")
+            return True
+    except Exception:
+        pass
+
+    # 3. Fallback to generic media player intent (never open web browser)
+    try:
+        am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_uri, "-t", "video/*"]
+        res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
+        if res.returncode == 0:
+            print("🎬 Streaming opened in default video player!")
+            return True
+    except Exception:
+        pass
+
+    # 4. Fallback for local downloaded files ONLY
+    if os.path.exists(target_uri):
+        try:
+            subprocess.Popen(["termux-open", target_uri], env=clean_env)
+            print("🎬 File opened in default media player!")
+            return True
+        except Exception:
+            pass
+
+    print(f"⚠ Could not launch media player automatically. Stream link: {play_uri}")
+    return False
 
 def save_m3u8_stream_file(url, title, target_dir=None):
     """Save the ~300KB .m3u8 stream playlist file to storage for instant VLC streaming."""
@@ -430,6 +543,7 @@ def _process_progress_line(line):
 
 def run_command_with_clean_progress(cmd):
     """Run subprocess while processing \r and \n into clean single-line progress updates."""
+    p = None
     try:
         p = subprocess.Popen(
             cmd,
@@ -456,6 +570,19 @@ def run_command_with_clean_progress(cmd):
         sys.stdout.write("\n")
         sys.stdout.flush()
         return p.returncode
+    except KeyboardInterrupt:
+        if p:
+            try:
+                p.terminate()
+                p.wait(timeout=1.5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        sys.stdout.write("\n⚠ Download interrupted by user.\n")
+        sys.stdout.flush()
+        return -1
     except Exception as e:
         print(f"✖ Process execution error: {e}")
         return 1
@@ -1605,10 +1732,23 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         return direct_stream_url
 
     if action_mode in ('stream_only', 'stream', 'stream_and_download'):
-        launch_player(direct_stream_url, player_choice="vlc")
+        launch_player(direct_stream_url, player_choice="vlc", custom_headers=stream_headers, title=clean_title)
 
     if action_mode in ('stream_only', 'stream'):
-        print("🍿 Streaming active in VLC Player! (No local video file will be downloaded)")
+        print("\n" + "="*65)
+        print(" 🍿 STREAMING ACTIVE IN VLC PLAYER")
+        print("="*65)
+        print(f" 🎬 Media: {clean_title}")
+        print(f" 🌐 Stream Proxy: {LOCAL_PROXY_URL or direct_stream_url}")
+        print(" ⚡ Full seek/scrub bar support enabled")
+        print("="*65)
+        print(" ➜ VLC is currently playing the stream directly on your tablet.")
+        print(" ➜ Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
+        try:
+            input()
+        except (KeyboardInterrupt, EOFError):
+            pass
+        print("\n✔ Streaming session ended.")
         return direct_stream_url
 
     # Direct download execution: support HLS m3u8 and MP4 multi-threaded download via aria2c
@@ -1636,9 +1776,15 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             ]
             for hk, hv in stream_headers.items():
                 cmd.extend(['--add-header', f'{hk}:{hv}'])
-            run_command_with_clean_progress(cmd)
-            sync_to_sdcard_if_needed(dest_path)
-            dest_file = dest_path
+            ret = run_command_with_clean_progress(cmd)
+            if ret == -1:
+                print("⚠ Download cancelled.")
+                return None
+            if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                sync_to_sdcard_if_needed(dest_path)
+                dest_file = dest_path
+            else:
+                dest_file = None
         elif shutil.which('aria2c'):
             print(f"➜ Downloading via multi-threaded aria2c (16x): {clean_name}...")
             out_dir = os.path.dirname(dest_path) or DEFAULT_DIR
@@ -1661,6 +1807,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 cmd.append(f'--header={hk}: {hv}')
             cmd.append(direct_stream_url)
             ret = run_command_with_clean_progress(cmd)
+            if ret == -1:
+                print("⚠ Download cancelled.")
+                return None
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 sync_to_sdcard_if_needed(dest_path)
                 dest_file = dest_path
@@ -1976,7 +2125,17 @@ def handle_video_stream_only(url):
             if stream_url:
                 title = info.get('title', 'Video Stream')
                 print(f"🎬 Video: {title}")
-                launch_player(stream_url, player_choice="vlc")
+                launch_player(stream_url, player_choice="vlc", custom_headers=info.get('http_headers'), title=title)
+                print("\n" + "="*65)
+                print(" 🍿 STREAMING ACTIVE IN VLC PLAYER")
+                print("="*65)
+                print(f" 🎬 Media: {title}")
+                print(" ➜ Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
+                try:
+                    input()
+                except (KeyboardInterrupt, EOFError):
+                    pass
+                print("\n✔ Streaming session ended.")
                 return True
     except Exception as e:
         print(f"⚠ Could not launch stream player: {e}")
