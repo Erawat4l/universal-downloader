@@ -271,6 +271,24 @@ def save_m3u8_stream_file(url, title, target_dir=None):
         pass
     return None
 
+def decrypt_netmirror_tv_url(encrypted_val):
+    """Decrypt AES-GCM encrypted media URL from NetMirror watchbox."""
+    try:
+        from Cryptodome.Cipher import AES
+        clean_enc = encrypted_val.replace('&encrypt=true', '').strip()
+        key = hashlib.sha256(b'NET_TV_SECRET_KEY').digest()
+        raw = base64.b64decode(clean_enc)
+        if len(raw) < 28:
+            return None
+        iv = raw[:12]
+        tag = raw[12:28]
+        ciphertext = raw[28:]
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        decrypted = cipher.decrypt_and_verify(ciphertext, tag)
+        return decrypted.decode('utf-8')
+    except Exception:
+        return None
+
 def clean_filename(title, default_ext=".pdf"):
     title = re.sub(r'[\\/*?:"<>|]', '', title)
     title = re.sub(r'\s+', '_', title).strip('_')
@@ -1105,13 +1123,20 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
     
-    media_type = 'tv'
+    media_type = 'movie'
     media_id = None
-    if len(parts) >= 2:
-        media_type = parts[0]
-        media_id = parts[1]
-    elif len(parts) == 1 and parts[0].isdigit():
-        media_id = parts[0]
+    
+    for p in reversed(parts):
+        nums = re.findall(r'\d+', p)
+        if nums:
+            media_id = nums[-1]
+            break
+
+    lower_parts = [p.lower() for p in parts]
+    if 'tv' in lower_parts or 'series' in lower_parts or 's' in lower_parts:
+        media_type = 'tv'
+    elif 'movie' in lower_parts or 'm' in lower_parts:
+        media_type = 'movie'
         
     if not media_id:
         raise Exception("Could not parse NetMirror media ID from URL.")
@@ -1132,13 +1157,21 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         'Origin': 'https://netmirror.plus'
     }
 
-    # Query NetMirror API
-    api_url = f'https://api2.imdb3.shop/api/{media_type}/{media_id}'
-    res = requests.get(api_url, headers=headers, timeout=15)
-    res.raise_for_status()
-    data = res.json()
-    
-    results = data.get('results', [])
+    # Query NetMirror API with auto-fallback between movie and tv
+    results = []
+    types_to_try = [media_type, 'tv' if media_type == 'movie' else 'movie']
+    for m_type in types_to_try:
+        try:
+            api_url = f'https://api2.imdb3.shop/api/{m_type}/{media_id}'
+            res = requests.get(api_url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                results = data.get('results', [])
+                if results:
+                    media_type = m_type
+                    break
+        except Exception:
+            continue
     if not results:
         raise Exception(f"No metadata found on NetMirror for ID {media_id}")
         
@@ -1153,9 +1186,11 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         'Origin': 'https://netmirror.plus'
     }
 
+    clean_title = (meta.get('title') or meta.get('name') or title).strip()
+
     if not embed_json:
-        # Movie / Single title: Resolve stream via vidsync / NetMirror external server APIs
-        print(f"➜ Resolving direct stream for movie: {title}...")
+        # Movie / Single title: Resolve stream via vidsync / NetMirror external & watchbox server APIs
+        print(f"\n➜ Resolving direct stream for movie: {clean_title}")
         
         target_lang = None
         title_lower = title.lower()
@@ -1171,82 +1206,150 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             target_lang = 'id'
 
         tm_id = meta.get('tm_id') or media_id
+        subjectid = meta.get('subjectid') or media_id
+        dp = meta.get('dp') or ''
+
+        lang_label = f"[{target_lang}]" if target_lang else "default"
+        print(f"  [1/4] 🔍 Querying movie metadata & audio tracks ({lang_label})... ✔")
+
+        # Step 2: Primary Gateway (vidsync.pro) with 3.5s timeout
         if tm_id:
-            for attempt in range(1, 4):
-                try:
-                    vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
-                    v_headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Referer': 'https://vidsync.pro/',
-                        'Origin': 'https://vidsync.pro'
-                    }
-                    v_res = requests.get(vidsync_api, headers=v_headers, timeout=15)
-                    if v_res.status_code == 200:
-                        v_data = v_res.json()
-                        sources = v_data.get('sources', [])
-                        if sources:
-                            matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
-                            if not matching:
-                                matching = sources
-                            
-                            quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
-                            quality_labels = {
-                                '1080p': '1080p (Full HD)',
-                                '720p': '720p (HD)',
-                                '480p': '480p (SD)',
-                                '360p': '360p (Low)',
-                                'Auto': 'Auto / Best Available'
-                            }
-                            
-                            qualities_dict = {}
-                            for s in matching:
-                                q = s.get('quality', 'Auto')
-                                if q not in qualities_dict:
+            sys.stdout.write("  [2/4] 🌐 Connecting to primary stream gateway (vidsync.pro)... ")
+            sys.stdout.flush()
+            try:
+                vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
+                v_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': 'https://vidsync.pro/',
+                    'Origin': 'https://vidsync.pro'
+                }
+                v_res = requests.get(vidsync_api, headers=v_headers, timeout=3.5)
+                if v_res.status_code == 200:
+                    v_data = v_res.json()
+                    sources = v_data.get('sources', [])
+                    if sources:
+                        print("✔ Stream sources found!")
+                        matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
+                        if not matching:
+                            matching = sources
+                        
+                        quality_order = {'1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'Auto': 1}
+                        quality_labels = {
+                            '1080p': '1080p (Full HD)',
+                            '720p': '720p (HD)',
+                            '480p': '480p (SD)',
+                            '360p': '360p (Low)',
+                            'Auto': 'Auto / Best Available'
+                        }
+                        
+                        qualities_dict = {}
+                        for s in matching:
+                            q = s.get('quality', 'Auto')
+                            if q not in qualities_dict:
+                                qualities_dict[q] = s
+                            else:
+                                curr = qualities_dict[q]
+                                if not curr.get('directUrl') and s.get('directUrl'):
                                     qualities_dict[q] = s
-                                else:
-                                    curr = qualities_dict[q]
-                                    if not curr.get('directUrl') and s.get('directUrl'):
-                                        qualities_dict[q] = s
 
-                            sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
-                            
-                            selected_source = None
-                            if quality_arg:
-                                q_arg_clean = str(quality_arg).lower().strip()
-                                for sq in sorted_qualities:
-                                    if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
-                                        selected_source = qualities_dict[sq]
-                                        break
-                                        
-                            if not selected_source and len(sorted_qualities) > 1:
-                                print("\n" + "="*55)
-                                print(f" 🎬 Movie: {title}")
-                                print("="*55)
-                                print(" Select Video Quality:")
-                                for idx, q_key in enumerate(sorted_qualities, 1):
-                                    print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
-                                print("="*55)
-                                try:
-                                    q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
-                                    if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
-                                        selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
-                                except (KeyboardInterrupt, EOFError):
-                                    pass
+                        sorted_qualities = sorted(qualities_dict.keys(), key=lambda q: quality_order.get(q, 0), reverse=True)
+                        
+                        selected_source = None
+                        if quality_arg:
+                            q_arg_clean = str(quality_arg).lower().strip()
+                            for sq in sorted_qualities:
+                                if q_arg_clean in sq.lower() or sq.lower().startswith(q_arg_clean):
+                                    selected_source = qualities_dict[sq]
+                                    break
+                                    
+                        if not selected_source and len(sorted_qualities) > 1 and sys.stdin.isatty():
+                            print("\n" + "="*55)
+                            print(f" 🎬 Movie: {clean_title}")
+                            print("="*55)
+                            print(" Select Video Quality:")
+                            for idx, q_key in enumerate(sorted_qualities, 1):
+                                print(f"   [{idx}] {quality_labels.get(q_key, q_key)}")
+                            print("="*55)
+                            try:
+                                q_choice = input(f"➜ Select choice [1-{len(sorted_qualities)}] (Default: 1): ").strip()
+                                if q_choice.isdigit() and 1 <= int(q_choice) <= len(sorted_qualities):
+                                    selected_source = qualities_dict[sorted_qualities[int(q_choice) - 1]]
+                            except (KeyboardInterrupt, EOFError):
+                                pass
 
-                            if not selected_source and sorted_qualities:
-                                selected_source = qualities_dict[sorted_qualities[0]]
+                        if not selected_source and sorted_qualities:
+                            selected_source = qualities_dict[sorted_qualities[0]]
 
-                            if selected_source:
-                                direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
-                                stream_headers = selected_source.get('headers') or {
-                                    'Referer': 'https://api.hlowb.com/',
-                                    'User-Agent': 'okhttp/4.9.3'
-                                }
-                                break
+                        if selected_source:
+                            direct_stream_url = selected_source.get('url') or selected_source.get('directUrl') or selected_source.get('permanent_m3u8_url') or selected_source.get('rawUrl')
+                            stream_headers = selected_source.get('headers') or {
+                                'Referer': 'https://api.hlowb.com/',
+                                'User-Agent': 'okhttp/4.9.3'
+                            }
+                else:
+                    print(f"✖ (status {v_res.status_code})")
+            except Exception:
+                print("✖ (offline/timed out)")
+
+        # Step 3: Multi-Server CDN manifests (watchbox.php across bet/limit/webvp)
+        if not direct_stream_url and tm_id:
+            sys.stdout.write("  [3/4] ⚡ Querying multi-server CDN manifests (watchbox)... ")
+            sys.stdout.flush()
+            na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
+            sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
+            wb_params = {
+                'id': subjectid, 'se': '0', 'ep': '0', 'dp': dp, 'na': na_b64, 'year': year,
+                'tm_id': tm_id, 'ts': str(ts), 'sig': sig_tm, 'nid': media_id, 'exten': '1',
+                'tv': '', 'token': '', 'warp': 'false', '_': str(int(time.time() * 1000))
+            }
+            wb_query = urllib.parse.urlencode(wb_params)
+            
+            candidate_streams = []
+            for dom in ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']:
+                try:
+                    wb_url = f"{dom}/play/watchbox.php?{wb_query}"
+                    wb_r = requests.get(wb_url, headers=headers, timeout=4)
+                    if wb_r.status_code == 200 and len(wb_r.text) > 200:
+                        # Extract art.tvVideoUrl
+                        for m_tv in re.finditer(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
+                            raw_val = m_tv.group(1)
+                            dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
+                            if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((dec_url, dom))
+                        
+                        # Extract selector items in quality_new
+                        for m_q in re.finditer(r'url\s*:\s*[\"\'](https?://[^\"\'\`\s]+)[\"\']', wb_r.text):
+                            q_u = m_q.group(1)
+                            if any(ext in q_u for ext in ['.mp4', '.m3u8', 'tran-audio', 'resource']) and q_u not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((q_u, dom))
                 except Exception:
-                    if attempt < 3:
-                        time.sleep(1)
+                    pass
 
+            if candidate_streams:
+                print(f"✔ Found {len(candidate_streams)} stream candidate(s)")
+            else:
+                print("✖ (no direct stream nodes found)")
+
+            # Step 4: Validate candidate streams
+            if candidate_streams:
+                sys.stdout.write("  [4/4] 🔐 Validating media stream health... ")
+                sys.stdout.flush()
+                for c_url, c_dom in candidate_streams:
+                    try:
+                        chk = requests.head(c_url, headers={'User-Agent': HEADERS['User-Agent'], 'Referer': f"{c_dom}/"}, timeout=2.5)
+                        if chk.status_code in (200, 206, 302, 301):
+                            direct_stream_url = c_url
+                            stream_headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': f"{c_dom}/"}
+                            print(f"✔ Verified (status {chk.status_code})")
+                            break
+                    except Exception:
+                        pass
+                if not direct_stream_url and candidate_streams:
+                    direct_stream_url = candidate_streams[0][0]
+                    stream_headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': f"{candidate_streams[0][1]}/"}
+                    print("✔ Decrypted stream ready")
+
+        # Step 3b: Fallback to external.php
         if not direct_stream_url and tm_id:
             try:
                 sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -1255,8 +1358,8 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     'Referer': 'https://netmirror.plus/',
                     'Origin': 'https://netmirror.plus'
                 }
-                ext_url = f'https://webvp.watch21.shop/play/external.php?tm_id={tm_id}&tm_type={media_type}&ts={ts}&sig={sig_tm}&exten=1'
-                r_ext = requests.get(ext_url, headers=ext_headers, timeout=10)
+                ext_url = f'https://webvp.watch21.shop/play/external.php?tm_id={tm_id}&nid={media_id}&tm_type={media_type}&ts={ts}&sig={sig_tm}&exten=1'
+                r_ext = requests.get(ext_url, headers=ext_headers, timeout=5)
                 if r_ext.status_code == 200:
                     m = re.search(r'const servers\s*=\s*(\[\s*\{.*?\}\s*\]);', r_ext.text, re.DOTALL)
                     if m:
@@ -1264,32 +1367,29 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                         servers = json.loads(m.group(1))
                         for s in servers:
                             s_url = s.get('url', '')
-                            if 'vidsync.pro/embed' in s_url:
-                                try:
-                                    r_vs = requests.get(f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}", headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://vidsync.pro/'}, timeout=15)
-                                    if r_vs.status_code == 200:
-                                        s_data = r_vs.json().get('sources', [])
-                                        if s_data:
-                                            s_matching = [src for src in s_data if src.get('audioLanguage') == target_lang] if target_lang else []
-                                            best_s = (s_matching or s_data)[0]
-                                            direct_stream_url = best_s.get('url') or best_s.get('directUrl') or best_s.get('permanent_m3u8_url')
-                                            stream_headers = best_s.get('headers') or {'Referer': 'https://api.hlowb.com/', 'User-Agent': 'okhttp/4.9.3'}
-                                            break
-                                except Exception:
-                                    pass
-                            elif 'watchcinemo.php' in s_url:
-                                r_c = requests.get(s_url, headers={'User-Agent': ext_headers['User-Agent'], 'Referer': ext_url}, timeout=8)
-                                match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', r_c.text) or re.search(r'play_url\([\"\'\`](https?://[^\"\'\`\s]+)[\"\'\`]\)', r_c.text) or re.search(r'https?://[^\s\"\'\`<>]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`<>]*', r_c.text)
+                            if 'watchcinemo.php' in s_url:
+                                r_c = requests.get(s_url, headers={'User-Agent': ext_headers['User-Agent'], 'Referer': ext_url}, timeout=5)
+                                m_art = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', r_c.text)
+                                if m_art:
+                                    val = m_art.group(1)
+                                    direct_stream_url = decrypt_netmirror_tv_url(val) if 'encrypt=true' in val else val
+                                    if direct_stream_url:
+                                        break
+                                match = re.search(r'https?://[^\s\"\'\`<>]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`<>]*', r_c.text)
                                 if match:
-                                    direct_stream_url = match.group(1) if match.lastindex else match.group(0)
+                                    direct_stream_url = match.group(0)
                                     break
             except Exception:
                 pass
 
         if not direct_stream_url:
-            raise Exception(f"No stream items found in NetMirror response for {title}")
+            print("\n" + "="*65)
+            print(f" ⚠ No active streaming servers found on NetMirror for: {clean_title}")
+            print("   (NetMirror CDN nodes are currently rate-limiting or offline)")
+            print("="*65)
+            return None
 
-        clean_name = out_name or clean_filename(title, default_ext=".mp4")
+        clean_name = out_name or clean_filename(clean_title, default_ext=".mp4")
 
     else:
         # TV show with multiple episodes
@@ -1349,13 +1449,25 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             raise Exception("Could not retrieve NetMirror player page from stream servers.")
 
         match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', player_html) or re.search(r'play_url\([\"\'\`](https?://[^\s\"\'\`]+)[\"\'\`]\)', player_html)
-        if not match:
+        if match:
+            candidate = match.group(1) if match.lastindex else match.group(0)
+            if 'encrypt=true' in candidate:
+                dec_cand = decrypt_netmirror_tv_url(candidate)
+                if dec_cand:
+                    direct_stream_url = dec_cand
+            else:
+                direct_stream_url = candidate
+        if not direct_stream_url:
             match = re.search(r'https?://[^\s\"\'\`]+\.(?:r2\.dev|mp4|m3u8)[^\s\"\'\`]*', player_html)
+            if match:
+                direct_stream_url = match.group(0)
 
-        if not match:
-            raise Exception("Could not parse direct stream URL from NetMirror player HTML.")
+        if not direct_stream_url:
+            print("\n" + "="*65)
+            print(f" ⚠ No active streaming servers could be retrieved for: {title}")
+            print("="*65)
+            return None
 
-        direct_stream_url = match.group(1) if match.lastindex else match.group(0)
         clean_name = out_name or clean_filename(f"{title}_S{target_item.get('se',1)}E{target_item.get('ep',1)}", default_ext=".mp4")
 
     print(f"➜ Bypassed NetMirror Stream: {title}")
@@ -1732,57 +1844,7 @@ def handle_video_stream_and_download(url):
     handle_video_stream_only(url)
     return download(url)
 
-def prompt_action_mode_and_run(url):
-    is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
-    while True:
-        print("\n" + "="*65)
-        print(" Select Action / Mode:")
-        print("   [1] 🎬 Stream in VLC & Download Video (Instant Play + Save)")
-        print("   [2] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
-        print("   [3] 🍿 Stream in VLC Only (Instant Play, No Storage Used)")
-        print("   [4] 🔗 Generate Direct Links & Save .m3u8 Playlist (for ADM)")
-        print("="*65)
-        try:
-            mode_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
-            if not mode_choice:
-                mode_choice = '1'
-        except (KeyboardInterrupt, EOFError):
-            return
-
-        if mode_choice == '1':
-            if is_netmirror:
-                handle_netmirror(url, action_mode='stream_and_download')
-            else:
-                handle_video_stream_and_download(url)
-            break
-        elif mode_choice == '2':
-            if is_netmirror:
-                handle_netmirror(url, action_mode='download_only')
-            else:
-                download(url)
-            break
-        elif mode_choice == '3':
-            if is_netmirror:
-                handle_netmirror(url, action_mode='stream_only')
-            else:
-                handle_video_stream_only(url)
-            break
-        elif mode_choice == '4':
-            if is_netmirror:
-                handle_netmirror(url, action_mode='direct_link_only')
-            else:
-                generate_adm_links_for_url(url)
-            break
-        else:
-            print("✖ Invalid selection. Please select choice 1 to 4.")
-
-def search_netmirror_and_prompt(query, target_dir=None):
-    print(f"\n➜ Searching NetMirror for: \"{query}\"...")
-    results = search_netmirror(query)
-    if not results:
-        print("⚠ No search results found on NetMirror. Searching YouTube instead...")
-        return search_youtube_and_prompt(query, target_dir=target_dir)
-
+def prompt_results_list(results, query, target_dir=None):
     print("\n" + "="*65)
     print(f" 🎬 NetMirror Search Results for: \"{query}\"")
     print("="*65)
@@ -1804,10 +1866,89 @@ def search_netmirror_and_prompt(query, target_dir=None):
         elif sel.isdigit() and 1 <= int(sel) <= len(results[:10]):
             selected = results[int(sel) - 1]
             print(f"\n➜ Selected: {selected['title']}")
-            prompt_action_mode_and_run(selected['url'])
+            prompt_action_mode_and_run(selected['url'], query_context=query, all_results=results, target_dir=target_dir)
             return
         else:
             print(f"✖ Invalid selection. Please select choice 1 to {len(results[:10])} or 'Y'.")
+
+def prompt_action_mode_and_run(url, query_context=None, all_results=None, target_dir=None):
+    is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
+    while True:
+        print("\n" + "="*65)
+        print(" Select Action / Mode:")
+        print("   [1] 🎬 Stream in VLC & Download Video (Instant Play + Save)")
+        print("   [2] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
+        print("   [3] 🍿 Stream in VLC Only (Instant Play, No Storage Used)")
+        print("   [4] 🔗 Generate Direct Links & Save .m3u8 Playlist (for ADM)")
+        print("="*65)
+        try:
+            mode_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
+            if not mode_choice:
+                mode_choice = '1'
+        except (KeyboardInterrupt, EOFError):
+            return
+
+        res = None
+        try:
+            if mode_choice == '1':
+                if is_netmirror:
+                    res = handle_netmirror(url, action_mode='stream_and_download', target_dir=target_dir)
+                else:
+                    res = handle_video_stream_and_download(url)
+            elif mode_choice == '2':
+                if is_netmirror:
+                    res = handle_netmirror(url, action_mode='download_only', target_dir=target_dir)
+                else:
+                    res = download(url, target_dir=target_dir)
+            elif mode_choice == '3':
+                if is_netmirror:
+                    res = handle_netmirror(url, action_mode='stream_only', target_dir=target_dir)
+                else:
+                    res = handle_video_stream_only(url)
+            elif mode_choice == '4':
+                if is_netmirror:
+                    res = handle_netmirror(url, action_mode='direct_link_only', target_dir=target_dir)
+                else:
+                    res = generate_adm_links_for_url(url)
+            else:
+                print("✖ Invalid selection. Please select choice 1 to 4.")
+                continue
+        except Exception as e:
+            print(f"⚠ Stream processing encountered an issue: {e}")
+            res = None
+
+        if not res and is_netmirror:
+            print("\n" + "="*65)
+            print(" Select an alternative option:")
+            search_title = query_context or "this title"
+            print(f"   [1] 📺 Search on YouTube for \"{search_title}\" (Instant Stream & Download)")
+            if all_results and len(all_results) > 1:
+                print("   [2] 🔄 Choose another result from NetMirror search list")
+                print("   [3] ↩ Return to main menu")
+            else:
+                print("   [2] ↩ Return to main menu")
+            print("="*65)
+            try:
+                alt = input("➜ Select choice (Default: 1): ").strip()
+                if not alt:
+                    alt = '1'
+            except (KeyboardInterrupt, EOFError):
+                return
+            if alt == '1':
+                return search_youtube_and_prompt(search_title, target_dir=target_dir)
+            elif alt == '2' and all_results and len(all_results) > 1:
+                return prompt_results_list(all_results, query_context, target_dir=target_dir)
+            else:
+                return
+        break
+
+def search_netmirror_and_prompt(query, target_dir=None):
+    print(f"\n➜ Searching NetMirror for: \"{query}\"...")
+    results = search_netmirror(query)
+    if not results:
+        print("⚠ No search results found on NetMirror. Searching YouTube instead...")
+        return search_youtube_and_prompt(query, target_dir=target_dir)
+    return prompt_results_list(results, query, target_dir=target_dir)
 
 def search_youtube_and_prompt(query, target_dir=None):
     print(f"\n➜ Searching YouTube for: \"{query}\"...")
