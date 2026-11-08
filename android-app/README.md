@@ -44,6 +44,8 @@ tt send 2 <apk-path>
 
 A failed `tt` transfer does not hide or delete the local APK.
 
+For a complete on-device Termux setup, see the repository-level [`TERMUX.md`](../TERMUX.md).
+
 Requirements:
 
 - Android Studio with JDK 17.

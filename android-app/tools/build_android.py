@@ -176,6 +176,9 @@ def find_sdk() -> Path | None:
 
 
 def find_sdkmanager(sdk: Path) -> Path | None:
+    system_sdkmanager = shutil.which("sdkmanager")
+    if system_sdkmanager:
+        return Path(system_sdkmanager)
     names = ["sdkmanager.bat", "sdkmanager"]
     candidates = [sdk / "cmdline-tools" / "latest" / "bin", sdk / "cmdline-tools" / "bin", sdk / "tools" / "bin"]
     for folder in candidates:
@@ -279,6 +282,11 @@ def build_version() -> tuple[str, str]:
     return local_name, version_code
 
 
+def running_in_termux() -> bool:
+    prefix = os.environ.get("PREFIX", "")
+    return os.name != "nt" and "/com.termux/" in prefix
+
+
 def configure_sdk_for_gradle(sdk: Path) -> None:
     """Make the SDK explicit for both Gradle and Android Studio."""
     sdk_path = sdk.resolve()
@@ -288,6 +296,13 @@ def configure_sdk_for_gradle(sdk: Path) -> None:
     local_properties = APP_ROOT / "local.properties"
     local_properties.write_text(f"sdk.dir={sdk_path.as_posix()}\n", encoding="utf-8")
     say(f"Gradle SDK path configured: {sdk_path}")
+
+    if running_in_termux():
+        aapt2 = shutil.which("aapt2")
+        if not aapt2:
+            raise BuildError("Termux requires the ARM64 aapt2 package. Run: pkg install aapt2")
+        os.environ["ARC_AAPT2_OVERRIDE"] = aapt2
+        say(f"Termux aapt2 override: {aapt2}")
 
 
 def sync_python_engine() -> None:
@@ -357,10 +372,21 @@ def main() -> int:
     wrapper = ensure_wrapper()
     version_name, version_code = build_version()
 
+    gradle_arguments = [
+        "--no-daemon",
+        "assembleDebug",
+        f"-PVERSION_NAME={version_name}",
+        f"-PVERSION_CODE={version_code}",
+        f"-PSOURCE_COMMIT={source_revision()}",
+    ]
+    aapt2_override = os.environ.get("ARC_AAPT2_OVERRIDE")
+    if aapt2_override:
+        gradle_arguments.append(f"-Pandroid.aapt2FromMavenOverride={aapt2_override}")
+
     if os.name == "nt":
-        command = ["cmd", "/d", "/c", str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}", f"-PSOURCE_COMMIT={source_revision()}"]
+        command = ["cmd", "/d", "/c", str(wrapper), *gradle_arguments]
     else:
-        command = [str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}", f"-PSOURCE_COMMIT={source_revision()}"]
+        command = [str(wrapper), *gradle_arguments]
     run(command)
 
     artifact = APP_ROOT / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"

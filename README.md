@@ -91,6 +91,8 @@ build.bat
 
 `build.bat` synchronizes `dl.py` into the Android Python source set and creates a local debug APK at `android-app/app/build/outputs/apk/debug/app-debug.apk`. It does not publish or modify signing keys.
 
+For an on-device build from Termux, follow [`TERMUX.md`](TERMUX.md).
+
 ## 📄 License
 
 Licensed under the MIT License.
