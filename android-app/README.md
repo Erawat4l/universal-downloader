@@ -47,7 +47,7 @@ A failed `tt` transfer does not hide or delete the local APK.
 Requirements:
 
 - Android Studio with JDK 17.
-- Python 3.11 on the build machine (Chaquopy uses it to package the engine).
+- Python 3.12 on the build machine (Chaquopy uses it to package the engine).
 - Android SDK 35.
 - Internet access during the first build so Gradle and the Python wheels can be resolved.
 - An Android device/emulator with Android 8.0 or newer.

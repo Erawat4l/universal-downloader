@@ -73,14 +73,14 @@ def install_with_winget(package_id: str, label: str) -> bool:
 
 
 def ensure_build_python() -> None:
-    """Chaquopy 17.2 is configured for Python 3.11."""
+    """Chaquopy 17.2 is configured for Python 3.12."""
     candidates: list[list[str]] = []
-    if sys.version_info[:2] == (3, 11):
+    if sys.version_info[:2] == (3, 12):
         candidates.append([sys.executable])
     if os.name == "nt":
-        candidates.extend([["py", "-3.11"], ["python3.11"], ["python"]])
+        candidates.extend([["py", "-3.12"], ["python3.12"], ["python"]])
     else:
-        candidates.extend([["python3.11"], ["python3"], ["python"]])
+        candidates.extend([["python3.12"], ["python3"], ["python"]])
 
     for candidate in candidates:
         try:
@@ -93,13 +93,13 @@ def ensure_build_python() -> None:
         except (OSError, subprocess.SubprocessError):
             continue
         version = f"{result.stdout} {result.stderr}".strip()
-        if re.search(r"Python 3\\.11(?:\\.|$)", version):
-            say(f"Python 3.11 found for Chaquopy: {' '.join(candidate)}")
+        if re.search(r"Python 3\.12(?:\.|$)", version):
+            say(f"Python 3.12 found for Chaquopy: {' '.join(candidate)}")
             return
 
     raise BuildError(
-        "Python 3.11 is required to package the embedded downloader engine. "
-        "Install Python 3.11 and run this same command again."
+        "Python 3.12 is required to package the embedded downloader engine. "
+        "Install Python 3.12 and run this same command again."
     )
 
 
@@ -325,6 +325,8 @@ def number_and_send_artifact(artifact: Path) -> Path:
             cwd=APP_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             say("tt transfer completed.")
