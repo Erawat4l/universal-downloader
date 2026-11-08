@@ -80,14 +80,16 @@ python3 dl.py "https://example.com/video.mp4" -o "custom_name.mp4" -d "/path/to/
 
 ## 📱 Android app
 
-The native Android project is in `android-app/`. From a full checkout of the app branch, update and build with:
+The native Android project is in `android-app/`. The APK is standalone: it bundles the real `dl.py` engine and its Python dependencies, so the installed app does not require Termux, a shell, or a companion service.
+
+From a full checkout of the app branch, update and build with:
 
 ```bat
 git pull --ff-only origin arena/87a00d95-universal-downloader
 build.bat
 ```
 
-`build.bat` delegates to the shared Python builder, which creates a local debug APK at `android-app/app/build/outputs/apk/debug/app-debug.apk`. It does not publish or modify signing keys.
+`build.bat` synchronizes `dl.py` into the Android Python source set and creates a local debug APK at `android-app/app/build/outputs/apk/debug/app-debug.apk`. It does not publish or modify signing keys.
 
 ## 📄 License
 

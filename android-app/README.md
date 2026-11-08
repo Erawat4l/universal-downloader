@@ -18,7 +18,7 @@ From the project folder, run one command. It finds or installs the supported Jav
 build.bat
 ```
 
-The `.bat` file is only a thin Python launcher. Termux/fish can use the same builder with:
+The `.bat` file is only a thin Python launcher. A shell can use the same builder with:
 
 ```sh
 ./build-android.sh
@@ -47,22 +47,30 @@ A failed `tt` transfer does not hide or delete the local APK.
 Requirements:
 
 - Android Studio with JDK 17.
+- Python 3.11 on the build machine (Chaquopy uses it to package the engine).
 - Android SDK 35.
+- Internet access during the first build so Gradle and the Python wheels can be resolved.
 - An Android device/emulator with Android 8.0 or newer.
 
-## CLI connection
+## Standalone downloader engine
 
-The app does not seed demo search results, fake files, fake progress, or fake stream URLs. Search, resolve, copy-link, and download requests are sent to the real `dl.py` JSON bridge.
+The app does not seed demo search results, fake files, fake progress, or fake stream URLs. The repository's real `dl.py` engine is bundled into the APK with Chaquopy, together with its Python dependencies (`requests`, BeautifulSoup, yt-dlp, and Pyrogram).
 
-The UI mirrors the actual CLI capabilities: direct files, supported video platforms, Telegram, educational PDFs, NetMirror, quality selection, audio-only formats, direct links, VLC streaming, retries, resume, and progress.
+Search, resolve, stream, and download requests execute inside the app process. No Termux installation, shell, `RUN_COMMAND` permission, or companion service is required. The builder synchronizes the repository root `dl.py` into `app/src/main/python/dl.py` before Gradle packages the APK.
 
-When Termux is installed, the Download action sends the URL and selected quality to:
+The UI mirrors the engine capabilities: direct files, supported video platforms, Telegram, educational PDFs, NetMirror, quality selection, audio-only formats, direct links, retries, resume, and real download output. If a dependency, network request, extractor, or Telegram credential is unavailable, Arc reports the actual error instead of showing fallback data.
 
-```text
-~/universal-downloader/dl.py
-```
+Downloads are written to the app's private Downloads directory. This avoids Termux and scoped-storage workarounds; the returned file path is shown in Activity and Library so it can be opened or shared by a later file action.
 
-The path is defined in `TermuxBridge.kt` and can be changed if the CLI is stored elsewhere. A future packaged engine can replace that bridge without changing the UI.
+### Telegram setup
+
+Open **Settings → Telegram → Setup**. Public channel posts may work through the web fallback. Private channels and reliable media downloads require:
+
+- Telegram API ID.
+- Telegram API hash.
+- A Pyrogram string session.
+
+These values are stored in the app's private preferences and sent only to the bundled engine for a Telegram download. No credentials are embedded in the repository.
 
 ## GitHub updates
 

@@ -102,6 +102,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 private val ArcBlack = Color(0xFF050505)
@@ -126,6 +127,7 @@ private data class SearchHit(
     val year: String,
     val providers: String,
     val audio: List<AudioChoice>,
+    val url: String = "",
 )
 private data class MediaTarget(
     val title: String,
@@ -141,6 +143,11 @@ private data class DownloadJob(
     val detail: String,
     val status: String,
     val path: String = "",
+)
+private data class EngineResult(
+    val jobId: String,
+    val type: String,
+    val response: JSONObject,
 )
 
 class MainActivity : ComponentActivity() {
@@ -178,6 +185,11 @@ private fun ArcApp() {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val clipboard = LocalClipboardManager.current
+    val preferences = remember { context.getSharedPreferences("arc_settings", Context.MODE_PRIVATE) }
+    val downloadDirectory = remember {
+        context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)?.absolutePath
+            ?: context.filesDir.resolve("downloads").absolutePath
+    }
 
     var tabName by rememberSaveable { mutableStateOf(AppTab.HOME.name) }
     var overlay by rememberSaveable { mutableStateOf("") }
@@ -193,10 +205,15 @@ private fun ArcApp() {
     }
     var hits by remember { mutableStateOf(emptyList<SearchHit>()) }
     var jobs by remember { mutableStateOf(emptyList<DownloadJob>()) }
-    var pending by remember { mutableStateOf(emptyMap<String, String>()) }
     var update by remember { mutableStateOf(UpdateInfo()) }
     var notifications by rememberSaveable { mutableStateOf(true) }
     var clipboardHelper by rememberSaveable { mutableStateOf(true) }
+    var telegramApiId by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_id", "").orEmpty()) }
+    var telegramApiHash by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_hash", "").orEmpty()) }
+    var telegramSession by rememberSaveable { mutableStateOf(preferences.getString("telegram_session", "").orEmpty()) }
+    var showTelegramSetup by rememberSaveable { mutableStateOf(false) }
+    var infoTitle by rememberSaveable { mutableStateOf("") }
+    var infoBody by rememberSaveable { mutableStateOf("") }
 
     val tab = AppTab.entries.firstOrNull { it.name == tabName } ?: AppTab.HOME
 
@@ -204,13 +221,86 @@ private fun ArcApp() {
         scope.launch { snackbar.showSnackbar(text) }
     }
 
-    fun submit(payload: JSONObject, type: String): String? {
-        val jobId = TermuxBridge.startJsonJob(context, payload)
-        if (jobId == null) {
-            message("Termux is not available. Install Termux and the CLI first.")
-            return null
+    fun showInfo(title: String, body: String) {
+        infoTitle = title
+        infoBody = body
+    }
+
+    fun handleEngineResult(result: EngineResult) {
+        val response = result.response
+        if (!response.optBoolean("ok", false)) {
+            val error = response.optString("error", "The embedded downloader failed.")
+            message(error)
+            if (result.type == "resolve") resolveLoading = false
+            if (result.type == "search") searchLoading = false
+            if (result.type == "download") jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
+            return
         }
-        pending = pending + (jobId to type)
+        val data = response.optJSONObject("result")
+        when (result.type) {
+            "search" -> {
+                val resultList = mutableListOf<SearchHit>()
+                val array = data?.optJSONArray("results")
+                if (array != null) {
+                    for (index in 0 until array.length()) {
+                        val item = array.optJSONObject(index) ?: continue
+                        val audios = mutableListOf<AudioChoice>()
+                        val audioArray = item.optJSONArray("audios")
+                        if (audioArray != null) {
+                            for (audioIndex in 0 until audioArray.length()) {
+                                val audio = audioArray.optJSONObject(audioIndex) ?: continue
+                                audios += AudioChoice(audio.optString("language", "Default"), audio.optString("url"))
+                            }
+                        }
+                        resultList += SearchHit(
+                            title = item.optString("title", "Untitled"),
+                            source = item.optString("source", "NetMirror"),
+                            type = item.optString("type", "MEDIA"),
+                            year = item.optString("year", ""),
+                            providers = item.optJSONArray("providers")?.let { providers ->
+                                (0 until providers.length()).joinToString(" · ") { providerIndex -> providers.optString(providerIndex) }
+                            } ?: "",
+                            audio = audios,
+                            url = item.optString("url", ""),
+                        )
+                    }
+                }
+                hits = resultList
+                searchLoading = false
+            }
+            "resolve" -> {
+                val url = data?.optString("url").orEmpty()
+                resolvedUrl = url
+                target = target.copy(
+                    title = data?.optString("title").takeUnless { it.isNullOrBlank() } ?: target.title,
+                    source = data?.optString("source").takeUnless { it.isNullOrBlank() } ?: target.source,
+                    detail = "${selectedQuality}${if (audioOnly) " · Audio" else " · Video"}",
+                )
+                resolveLoading = false
+                overlay = "analysis"
+            }
+            "download" -> {
+                val path = data?.optString("path").orEmpty()
+                jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path) else it }
+                message("Download complete.")
+            }
+        }
+    }
+
+    fun submit(payload: JSONObject, type: String): String {
+        val jobId = java.util.UUID.randomUUID().toString()
+        scope.launch {
+            val response = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { EmbeddedEngine.execute(context, payload) }
+                    .getOrElse { error ->
+                        JSONObject().apply {
+                            put("ok", false)
+                            put("error", error.message ?: "The embedded Python engine could not start.")
+                        }
+                    }
+            }
+            handleEngineResult(EngineResult(jobId, type, response))
+        }
         return jobId
     }
 
@@ -234,37 +324,41 @@ private fun ArcApp() {
             submit(JSONObject().apply {
                 put("action", "resolve")
                 put("url", clean)
-                put("quality", selectedQuality)
+                put("quality", if (audioOnly) "audio" else selectedQuality)
             }, "resolve")
         } else {
-            query = clean
+            val youtubeSearch = clean.startsWith("yt:", ignoreCase = true) ||
+                clean.startsWith("youtube:", ignoreCase = true)
+            val searchQuery = clean.replace(Regex("^(yt|youtube):\\s*", RegexOption.IGNORE_CASE), "").trim()
+            query = searchQuery
             hits = emptyList()
             searchLoading = true
             overlay = "search"
             submit(JSONObject().apply {
                 put("action", "search")
-                put("query", clean)
-                put("platform", "netmirror")
+                put("query", searchQuery)
+                put("platform", if (youtubeSearch) "youtube" else "netmirror")
             }, "search")
         }
     }
 
     fun selectSearchResult(hit: SearchHit, audio: AudioChoice) {
-        input = audio.url
+        val selectedUrl = audio.url.ifBlank { hit.url }
+        input = selectedUrl
         query = hit.title
         target = MediaTarget(
             title = hit.title,
             source = hit.source,
             detail = "${hit.type}${if (hit.year.isNotBlank()) " · ${hit.year}" else ""} · ${audio.language}",
             size = "Size varies",
-            description = "Real result from the CLI.",
+            description = "Real result from the embedded downloader.",
         )
         resolveLoading = true
         overlay = "analysis"
         submit(JSONObject().apply {
             put("action", "resolve")
-            put("url", audio.url)
-            put("quality", selectedQuality)
+            put("url", selectedUrl)
+            put("quality", if (audioOnly) "audio" else selectedQuality)
         }, "resolve")
     }
 
@@ -277,13 +371,19 @@ private fun ArcApp() {
             put("action", "download")
             put("url", input)
             put("quality", if (audioOnly) "audio" else selectedQuality)
-        }, "download") ?: return
+            put("target_dir", downloadDirectory)
+            put("telegram", JSONObject().apply {
+                put("api_id", telegramApiId)
+                put("api_hash", telegramApiHash)
+                put("session", telegramSession)
+            })
+        }, "download")
         jobs = listOf(
-            DownloadJob(jobId, target.title.ifBlank { input }, target.source.ifBlank { "CLI" }, selectedQuality, "Running in Termux"),
+            DownloadJob(jobId, target.title.ifBlank { input }, target.source.ifBlank { "Embedded engine" }, selectedQuality, "Running in Arc"),
         ) + jobs
         overlay = ""
         tabName = AppTab.ACTIVITY.name
-        message("Sent to Termux. dl.py is running.")
+        message("The bundled downloader is running in Arc.")
     }
 
     fun stream() {
@@ -312,76 +412,8 @@ private fun ArcApp() {
         if (value.isBlank()) message("Clipboard is empty.") else input = value
     }
 
-    fun handleTermuxResult(result: TermuxResult) {
-        val type = pending[result.jobId] ?: return
-        pending = pending - result.jobId
-        val jsonLine = result.stdout.lineSequence().lastOrNull { it.trim().startsWith("{") }
-        val response = runCatching { JSONObject(jsonLine ?: "") }.getOrNull()
-        if (response == null) {
-            message("The CLI returned no readable result.")
-            if (type == "resolve") resolveLoading = false
-            if (type == "search") searchLoading = false
-            return
-        }
-        if (!response.optBoolean("ok", false)) {
-            val error = response.optString("error", "The CLI request failed.")
-            message(error)
-            if (type == "resolve") resolveLoading = false
-            if (type == "search") searchLoading = false
-            if (type == "download") jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
-            return
-        }
-        val data = response.optJSONObject("result")
-        when (type) {
-            "search" -> {
-                val resultList = mutableListOf<SearchHit>()
-                val array = data?.optJSONArray("results")
-                if (array != null) {
-                    for (index in 0 until array.length()) {
-                        val item = array.optJSONObject(index) ?: continue
-                        val audios = mutableListOf<AudioChoice>()
-                        val audioArray = item.optJSONArray("audios")
-                        if (audioArray != null) {
-                            for (audioIndex in 0 until audioArray.length()) {
-                                val audio = audioArray.optJSONObject(audioIndex) ?: continue
-                                audios += AudioChoice(audio.optString("language", "Default"), audio.optString("url"))
-                            }
-                        }
-                        resultList += SearchHit(
-                            title = item.optString("title", "Untitled"),
-                            source = item.optString("source", "NetMirror"),
-                            type = item.optString("type", "MEDIA"),
-                            year = item.optString("year", ""),
-                            providers = item.optJSONArray("providers")?.let { providers -> (0 until providers.length()).joinToString(" · ") { index -> providers.optString(index) } } ?: "",
-                            audio = audios,
-                        )
-                    }
-                }
-                hits = resultList
-                searchLoading = false
-            }
-            "resolve" -> {
-                val url = data?.optString("url").orEmpty()
-                resolvedUrl = url
-                target = target.copy(
-                    title = data?.optString("title").takeUnless { it.isNullOrBlank() } ?: target.title,
-                    source = data?.optString("source").takeUnless { it.isNullOrBlank() } ?: target.source,
-                    detail = "${selectedQuality}${if (audioOnly) " · Audio" else " · Video"}",
-                )
-                resolveLoading = false
-                overlay = "analysis"
-            }
-            "download" -> {
-                val path = data?.optString("path").orEmpty()
-                jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path) else it }
-                message("Download complete.")
-            }
-        }
-    }
-
     LaunchedEffect(Unit) {
         update = GitHubUpdateChecker.check()
-        TermuxBridge.results.collect { handleTermuxResult(it) }
     }
 
     val navigate: (AppTab) -> Unit = { next -> tabName = next.name; overlay = "" }
@@ -423,7 +455,7 @@ private fun ArcApp() {
                     onAnalyze = { analyze() },
                     onPaste = ::paste,
                     onQuickSearch = { input = ""; message("Enter a search in the field.") },
-                    onTelegram = { input = "https://t.me/" },
+                    onTelegram = { tabName = AppTab.SETTINGS.name; overlay = ""; showTelegramSetup = true },
                     onLibrary = { navigate(AppTab.LIBRARY) },
                     jobs = jobs,
                 )
@@ -441,10 +473,40 @@ private fun ArcApp() {
                         if (url.isNotBlank()) context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                         else message("No signed APK release is available.")
                     },
-                    onMessage = ::message,
+                    onInfo = ::showInfo,
+                    onTelegramSetup = { showTelegramSetup = true },
                 )
             }
         }
+    }
+
+    if (infoTitle.isNotBlank()) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { infoTitle = ""; infoBody = "" },
+            title = { Text(infoTitle) },
+            text = { Text(infoBody) },
+            confirmButton = { TextButton(onClick = { infoTitle = ""; infoBody = "" }) { Text("Close") } },
+        )
+    }
+    if (showTelegramSetup) {
+        TelegramSetupDialog(
+            apiId = telegramApiId,
+            apiHash = telegramApiHash,
+            session = telegramSession,
+            onApiId = { telegramApiId = it },
+            onApiHash = { telegramApiHash = it },
+            onSession = { telegramSession = it },
+            onDismiss = { showTelegramSetup = false },
+            onSave = {
+                preferences.edit()
+                    .putString("telegram_api_id", telegramApiId.trim())
+                    .putString("telegram_api_hash", telegramApiHash.trim())
+                    .putString("telegram_session", telegramSession.trim())
+                    .apply()
+                showTelegramSetup = false
+                message("Telegram setup saved on this device.")
+            },
+        )
     }
 }
 
@@ -469,10 +531,10 @@ private fun HomeScreen(
                 BrandMark()
                 Column {
                     Text("Arc", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                    Text("Engine: dl.py", color = ArcMuted, fontSize = 11.sp)
+                    Text("Bundled engine: dl.py", color = ArcMuted, fontSize = 11.sp)
                 }
                 Spacer(Modifier.weight(1f))
-                StatusPill("Termux Bridge")
+                StatusPill("Embedded engine")
             }
         }
         item {
@@ -557,8 +619,16 @@ private fun SearchScreen(
                         }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                        hit.audio.forEach { audio ->
-                            FilterChip(selected = false, onClick = { onSelect(hit, audio) }, label = { Text(audio.language) })
+                        if (hit.audio.isEmpty()) {
+                            FilterChip(
+                                selected = false,
+                                onClick = { onSelect(hit, AudioChoice("Video", hit.url)) },
+                                label = { Text("Use result") },
+                            )
+                        } else {
+                            hit.audio.forEach { audio ->
+                                FilterChip(selected = false, onClick = { onSelect(hit, audio) }, label = { Text(audio.language) })
+                            }
                         }
                     }
                 }
@@ -668,7 +738,7 @@ private fun ActivityScreen(jobs: List<DownloadJob>) {
                         Text(job.status, color = ArcMuted, fontSize = 10.sp)
                     }
                     if (job.path.isNotBlank()) Text(job.path, color = ArcSubtle, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    if (job.status == "Running in Termux") Text("Open Termux to watch the CLI progress.", color = ArcMuted, fontSize = 11.sp)
+                    if (job.status == "Running in Arc") Text("The bundled Python engine is running on this device.", color = ArcMuted, fontSize = 11.sp)
                 }
             }
         }
@@ -698,30 +768,105 @@ private fun SettingsScreen(
     onClipboard: (Boolean) -> Unit,
     onCheckUpdates: () -> Unit,
     onOpenRelease: () -> Unit,
-    onMessage: (String) -> Unit,
+    onInfo: (String, String) -> Unit,
+    onTelegramSetup: () -> Unit,
 ) {
     LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item {
             Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(5.dp))
-            Text("Real engine. Simple controls.", color = ArcMuted, fontSize = 13.sp)
+            Text("Standalone engine. Simple controls.", color = ArcMuted, fontSize = 13.sp)
         }
         item { GitHubCard(update, onCheckUpdates, onOpenRelease) }
         item {
             SettingsGroup("Engine")
-            SettingRow("Termux Bridge", "Runs the repository's dl.py", Icons.Outlined.Send, control = { TextButton(onClick = { onMessage("Termux must be installed with the CLI at ~/universal-downloader/dl.py.") }) { Text("Info") } })
+            SettingRow(
+                "Embedded Python Engine",
+                "Runs dl.py inside this app; Termux is not required",
+                Icons.Outlined.Settings,
+                control = { TextButton(onClick = { onInfo("Embedded engine", "Arc bundles the repository downloader and its Python dependencies in the APK. Search, resolve, stream, and download run on the device without Termux.") }) { Text("Info") } },
+            )
             SettingsGroup("Downloads")
-            SettingRow("Save Location", "Controlled by dl.py", Icons.Outlined.Folder, control = { TextButton(onClick = { onMessage("The CLI controls the download folder.") }) { Text("Info") } })
-            SettingRow("Default Quality", "Ask each time", Icons.Outlined.Tune, control = { TextButton(onClick = { onMessage("Quality is selected before each request.") }) { Text("Edit") } })
+            SettingRow(
+                "Save Location",
+                "Arc app Downloads folder",
+                Icons.Outlined.Folder,
+                control = { TextButton(onClick = { onInfo("Save location", "Downloads are written to Arc's private Downloads folder so Android can protect them without a terminal companion app. Use Share or a file manager to move them elsewhere.") }) { Text("Info") } },
+            )
+            SettingRow("Default Quality", "Ask each time", Icons.Outlined.Tune, control = { TextButton(onClick = { onInfo("Quality", "Choose the quality on the review screen before each request.") }) { Text("Info") } })
             SettingRow("Clipboard Helper", "Suggest pasted links", Icons.Outlined.ContentPaste, control = { Switch(checked = clipboardHelper, onCheckedChange = onClipboard) })
+            SettingsGroup("Telegram")
+            SettingRow(
+                "Telegram Download",
+                "Configure API ID, API hash, and session",
+                Icons.Outlined.Send,
+                control = { TextButton(onClick = onTelegramSetup) { Text("Setup") } },
+            )
             SettingsGroup("Notifications")
             SettingRow("Download Notifications", "Android notifications", Icons.Outlined.NotificationsNone, control = { Switch(checked = notifications, onCheckedChange = onNotifications) })
             SettingsGroup("Accounts And Privacy")
-            SettingRow("Cookies And Authentication", "Passed to the CLI when configured", Icons.Outlined.Security, control = { TextButton(onClick = { onMessage("Credentials remain in Termux environment variables.") }) { Text("Info") } })
-            SettingRow("About Arc", "Universal Downloader frontend", Icons.Outlined.Info, control = { Text("0.1.0", color = ArcMuted, fontSize = 12.sp) })
+            SettingRow("Cookies And Authentication", "Passed to the embedded engine when configured", Icons.Outlined.Security, control = { TextButton(onClick = { onInfo("Cookies and authentication", "Arc keeps this configuration in its private app storage and passes it only to the bundled downloader for the current request.") }) { Text("Info") } })
+            SettingRow("About Arc", "Universal Downloader frontend", Icons.Outlined.Info, control = { TextButton(onClick = { onInfo("About Arc", "Arc is the standalone Android app for Universal Downloader. The downloader engine is bundled in this APK; no Termux installation is needed.") }) { Text("Info") } })
         }
         item { Text("Download only content you can save.", color = ArcSubtle, fontSize = 11.sp) }
     }
+}
+
+
+@Composable
+private fun TelegramSetupDialog(
+    apiId: String,
+    apiHash: String,
+    session: String,
+    onApiId: (String) -> Unit,
+    onApiHash: (String) -> Unit,
+    onSession: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set up Telegram downloads") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                Text(
+                    "For public Telegram links, Arc can use the web fallback. API credentials enable private channels and reliable media downloads. Create them at my.telegram.org, then paste a Pyrogram string session.",
+                    color = ArcMuted,
+                    fontSize = 12.sp,
+                )
+                OutlinedTextField(
+                    value = apiId,
+                    onValueChange = onApiId,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("API ID") },
+                )
+                OutlinedTextField(
+                    value = apiHash,
+                    onValueChange = onApiHash,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("API hash") },
+                )
+                OutlinedTextField(
+                    value = session,
+                    onValueChange = onSession,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = false,
+                    maxLines = 3,
+                    label = { Text("Pyrogram string session") },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                )
+                Text(
+                    "The session is stored only in this app's private storage. Never share it with anyone.",
+                    color = ArcSubtle,
+                    fontSize = 10.sp,
+                )
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = { Button(onClick = onSave) { Text("Save") } },
+    )
 }
 
 @Composable

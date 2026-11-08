@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.chaquo.python")
 }
 
 val sourceCommit = providers.gradleProperty("SOURCE_COMMIT").orElse("dev").get()
@@ -19,6 +20,9 @@ android {
 
         // CI can replace this value at build time with the commit used to build the APK.
         buildConfigField("String", "SOURCE_COMMIT", "\"$sourceCommit\"")
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -47,6 +51,18 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+        pip {
+            install("requests")
+            install("beautifulsoup4")
+            install("yt-dlp")
+            install("pyrogram==2.0.106")
+        }
     }
 }
 

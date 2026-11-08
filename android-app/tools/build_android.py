@@ -2,7 +2,7 @@
 """Self-healing, repeatable debug builder for the Arc Android app.
 
 The .bat/.sh files intentionally only locate Python. All build decisions live here
-so Windows and Termux use the same workflow.
+so Windows and Unix-like shells use the same workflow.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ import zipfile
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = APP_ROOT.parent
+PYTHON_ENGINE_SOURCE = REPOSITORY_ROOT / "dl.py"
+PYTHON_ENGINE_DEST = APP_ROOT / "app" / "src" / "main" / "python" / "dl.py"
 TOOLS_DIR = APP_ROOT / ".tools"
 GRADLE_VERSION = "8.9"
 ANDROID_API = "35"
@@ -69,7 +72,39 @@ def install_with_winget(package_id: str, label: str) -> bool:
     return True
 
 
+def ensure_build_python() -> None:
+    """Chaquopy 17.2 is configured for Python 3.11."""
+    candidates: list[list[str]] = []
+    if sys.version_info[:2] == (3, 11):
+        candidates.append([sys.executable])
+    if os.name == "nt":
+        candidates.extend([["py", "-3.11"], ["python3.11"], ["python"]])
+    else:
+        candidates.extend([["python3.11"], ["python3"], ["python"]])
+
+    for candidate in candidates:
+        try:
+            result = subprocess.run(
+                [*candidate, "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        version = f"{result.stdout} {result.stderr}".strip()
+        if re.search(r"Python 3\\.11(?:\\.|$)", version):
+            say(f"Python 3.11 found for Chaquopy: {' '.join(candidate)}")
+            return
+
+    raise BuildError(
+        "Python 3.11 is required to package the embedded downloader engine. "
+        "Install Python 3.11 and run this same command again."
+    )
+
+
 def java_home_candidates() -> list[Path]:
+
     candidates: list[Path] = []
     for key in ("JAVA_HOME", "JDK_HOME"):
         if os.environ.get(key):
@@ -255,6 +290,18 @@ def configure_sdk_for_gradle(sdk: Path) -> None:
     say(f"Gradle SDK path configured: {sdk_path}")
 
 
+def sync_python_engine() -> None:
+    """Package the same downloader engine used by the repository into the APK."""
+    if not PYTHON_ENGINE_SOURCE.exists():
+        raise BuildError(f"Bundled Python engine source is missing: {PYTHON_ENGINE_SOURCE}")
+    PYTHON_ENGINE_DEST.parent.mkdir(parents=True, exist_ok=True)
+    if not PYTHON_ENGINE_DEST.exists() or PYTHON_ENGINE_DEST.read_bytes() != PYTHON_ENGINE_SOURCE.read_bytes():
+        shutil.copy2(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)
+        say(f"Bundled Python engine synced from {PYTHON_ENGINE_SOURCE}")
+    else:
+        say("Bundled Python engine is up to date.")
+
+
 def number_and_send_artifact(artifact: Path) -> Path:
     output_dir = artifact.parent
     numbers = []
@@ -296,6 +343,7 @@ def main() -> int:
     if os.environ.get("ARC_PUBLISH", "").lower() in {"1", "true", "yes"}:
         raise BuildError("This script only creates local debug APKs. Publishing is intentionally refused.")
 
+    ensure_build_python()
     java, java_home = find_java()
     os.environ["JAVA_HOME"] = str(java_home)
     os.environ["PATH"] = str(Path(java).parent) + os.pathsep + os.environ.get("PATH", "")
@@ -303,6 +351,7 @@ def main() -> int:
 
     sdk = ensure_android_sdk()
     configure_sdk_for_gradle(sdk)
+    sync_python_engine()
     wrapper = ensure_wrapper()
     version_name, version_code = build_version()
 

@@ -2,7 +2,7 @@
 """
 Universal Downloader CLI (d.py / dl)
 Supports YouTube/Video quality selector CLI (yt-dlp), Direct Files, Link Bypassing (MediaFire, Terabox, etc.), SelfStudys, StudiesToday, Studocu.
-Auto-syncs downloads to /sdcard/Download via ADB when storage permissions are restricted in Termux.
+Can sync downloads to /sdcard/Download via ADB when Android storage permissions require it.
 """
 
 import sys
@@ -200,11 +200,6 @@ def print_adm_link(file_path):
     print(f" 🔗 Copy & Paste into ADM App: {local_url}")
     print(f" 🌐 Wi-Fi LAN Download Link:  {lan_url}")
     print("="*65 + "\n")
-    try:
-        subprocess.run(["termux-clipboard-set"], input=local_url.encode('utf-8'), capture_output=True)
-        print(" 📋 Short link copied to Android Clipboard!")
-    except Exception:
-        pass
 
 def get_stream_headers_for_url(url, base_headers=None):
     """Normalize required headers for stream hosts (e.g. mzfi.me referer for hakunaymatata)."""
@@ -345,7 +340,7 @@ def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=No
     except Exception:
         pass
 
-    # 2. Try launching via local am start (Termux native)
+    # 2. Try launching via the local Android intent command when available
     try:
         am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_uri, "-t", "video/*"]
         if player_choice == "vlc":
@@ -367,15 +362,7 @@ def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=No
     except Exception:
         pass
 
-    # 4. Fallback for local downloaded files ONLY
-    if os.path.exists(target_uri):
-        try:
-            subprocess.Popen(["termux-open", target_uri], env=clean_env)
-            print("🎬 File opened in default media player!")
-            return True
-        except Exception:
-            pass
-
+    # The Android UI owns media intents when this engine is embedded in the APK.
     print(f"⚠ Could not launch media player automatically. Stream link: {play_uri}")
     return False
 
@@ -878,8 +865,8 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'logger': NetworkAwareLogger(),
     }
 
-    node_bin = shutil.which('node') or '/data/data/com.termux/files/usr/bin/node'
-    if os.path.exists(node_bin):
+    node_bin = shutil.which('node')
+    if node_bin and os.path.exists(node_bin):
         speed_opts['js_runtimes'] = {'node': {'path': node_bin}}
 
     if shutil.which('aria2c'):
@@ -904,6 +891,27 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
     if custom_opts:
         opts.update(custom_opts)
     return opts
+
+
+def download_hls_with_python(url, dest_path, headers=None):
+    """Download an HLS stream without requiring an external yt-dlp executable."""
+    if not HAS_YTDLP:
+        return 1
+    try:
+        options = get_ytdlp_opts({
+            "format": "best",
+            "outtmpl": dest_path,
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": headers or {},
+        })
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+        return 0 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0 else 1
+    except Exception as error:
+        print(f"✖ In-process HLS download failed: {error}")
+        return 1
+
 
 def prompt_video_quality(url, quality_arg=None, cookie=None):
     """Interactively or via argument select video quality / format CLI."""
@@ -1021,7 +1029,7 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     print("➜ Selection invalid or default picked. Downloading Best Available quality.")
     return format_map['1'][0], False
 
-def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None):
+def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False):
     if not HAS_YTDLP:
         print("⚠ yt-dlp is not installed. Falling back to generic download...")
         return False
@@ -1030,7 +1038,17 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
         format_spec, is_audio_only = prompt_video_quality(url, quality_arg=quality_arg, cookie=cookie)
     except Exception as e:
         print(f"✖ Error extracting video metadata: {e}")
-        return True
+        return False
+
+    if standalone:
+        # Android packages the Python engine but not external ffmpeg. Prefer a
+        # progressive stream so the download remains fully in-process.
+        if is_audio_only:
+            format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+        elif "+" in format_spec:
+            height_match = re.search(r"height<=(\d+)", format_spec)
+            height = height_match.group(1) if height_match else "best"
+            format_spec = f"best[height<={height}]/best" if height != "best" else "best[ext=mp4]/best"
     
     out_dir = target_dir or DEFAULT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -1043,13 +1061,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
         'no_warnings': True,
     }, cookie=cookie)
     
-    if is_audio_only:
+    if is_audio_only and not standalone:
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }]
-    else:
+    elif not standalone:
         ydl_opts['merge_output_format'] = 'mp4'
         if shutil.which("aria2c"):
             ydl_opts['external_downloader'] = 'aria2c'
@@ -1064,7 +1082,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
                     raise Exception("yt-dlp could not extract video info. Content may be members-only or private.")
                 filename = ydl.prepare_filename(info)
                 base, ext = os.path.splitext(filename)
-                if is_audio_only:
+                if is_audio_only and not standalone:
                     mp3_file = base + ".mp3"
                     if not os.path.exists(mp3_file) and os.path.exists(filename):
                         try:
@@ -1076,7 +1094,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
                         filename = mp3_file
                 sync_to_sdcard_if_needed(filename)
                 print_adm_link(filename)
-            return True
+            return filename
         except Exception as e:
             err_str = str(e)
             print(f"\n✖ Download error encountered: {err_str}")
@@ -1110,8 +1128,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None)
                 time.sleep(3)
             else:
                 print("✖ Download failed after retries.")
-                return True
-    return True
+                return False
+    return False
 
 def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
     print("➜ Detected Studocu link...")
@@ -1148,7 +1166,7 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
             return None
         raise e
 
-def handle_telegram(url, out_name=None, target_dir=None):
+def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
     print("➜ Detected Telegram link...")
     parsed = urllib.parse.urlparse(url)
     path_parts = [p for p in parsed.path.split('/') if p]
@@ -1174,28 +1192,18 @@ def handle_telegram(url, out_name=None, target_dir=None):
                 msg_id = int(path_parts[1])
 
     def load_tg_creds():
-        api_id = os.environ.get("TELEGRAM_API_ID")
-        api_hash = os.environ.get("TELEGRAM_API_HASH")
-        session = os.environ.get("TELEGRAM_SESSION")
-        if not (api_id and api_hash and session):
-            agents_file = os.path.expanduser("~/.agents/AGENTS.md")
-            if os.path.exists(agents_file):
-                try:
-                    with open(agents_file, "r") as f:
-                        text = f.read()
-                    m_id = re.search(r"App API_ID.*?:\s*`?(\d+)`?", text)
-                    m_hash = re.search(r"App API_HASH.*?:\s*`?([a-f0-9]{32})`?", text)
-                    m_sess = re.search(r"Assistant STRING_SESSION:\s*`?([A-Za-z0-9_\-]+)`?", text)
-                    if m_id and not api_id: api_id = int(m_id.group(1))
-                    if m_hash and not api_hash: api_hash = m_hash.group(1)
-                    if m_sess and not session: session = m_sess.group(1)
-                except Exception:
-                    pass
-        return api_id or 30909654, api_hash or "d4b340a406c5c1ed1d7f26d44749602b", session or "BQHjZYEAnIZGwaOzXIdkpN8pw4eT_rR7zKag16sq6ry9U0n3Fgo5H5EP1K5COi3Mu3OHXsO1iHtsEAo4pjjfcyv4Y1Es0JxijQ-po3SZYsEGMCMosi5S9tTQJwtQ9sz0bWVOO3zSJOhwTtY8LGCMk72gFsaIxmcf52vIea1USV31FJOcVmNPlHag4JqYl3gPK9Fz0rPrYsUkimXhMxbvsDijcVnX--jLrkhL6ZyhS1INiq9VEsswjsVpgzL-6pJGSAsHrYEsUAuLBF43iOMcHawtrB9g2UkJ37QOPmZeEf10lgnOaRMtsTbnn59u_kHqQScqjcXE5B8rGlIG09EahObay4xQWwAAAAH9EnfDAA"
+        provided = telegram_config if isinstance(telegram_config, dict) else {}
+        api_id = str(provided.get("api_id") or os.environ.get("TELEGRAM_API_ID") or "").strip()
+        api_hash = str(provided.get("api_hash") or os.environ.get("TELEGRAM_API_HASH") or "").strip()
+        session = str(provided.get("session") or os.environ.get("TELEGRAM_SESSION") or "").strip()
+        return api_id, api_hash, session
 
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION = load_tg_creds()
+    telegram_credentials_available = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_SESSION)
 
     try:
+        if not telegram_credentials_available:
+            raise RuntimeError("Telegram API credentials are not configured")
         import asyncio
         try:
             asyncio.get_event_loop()
@@ -1731,12 +1739,6 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     if stream_headers.get('Referer'):
         print(f" 🌐 Referer Header (if needed): {stream_headers['Referer']}")
     print("="*65 + "\n")
-    try:
-        subprocess.run(["termux-clipboard-set"], input=direct_stream_url.encode('utf-8'), capture_output=True, timeout=2)
-        print("📋 Direct stream link copied to Android Clipboard!")
-    except Exception:
-        pass
-
     # Always save the ~300KB .m3u8 stream shortcut file with headers
     m3u8_file = save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
 
@@ -1763,12 +1765,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         print("\n✔ Streaming session ended.")
         return direct_stream_url
 
-    # Direct download execution: support HLS m3u8 and MP4 multi-threaded download via aria2c
-    try:
-        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=2)
-    except Exception:
-        pass
-
+    # Direct download execution: support HLS m3u8 and MP4 multi-threaded download via aria2c.
     try:
         dest_path = get_dest_path(clean_name, target_dir)
         if '.m3u8' in direct_stream_url:
@@ -1790,7 +1787,10 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             ]
             for hk, hv in stream_headers.items():
                 cmd.extend(['--add-header', f'{hk}:{hv}'])
-            ret = run_command_with_clean_progress(cmd)
+            if shutil.which('yt-dlp'):
+                ret = run_command_with_clean_progress(cmd)
+            else:
+                ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers)
             if ret == -1:
                 print("⚠ Download cancelled.")
                 return None
@@ -1832,10 +1832,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         else:
             dest_file = download_file_stream(direct_stream_url, clean_name, custom_headers=stream_headers, target_dir=target_dir)
     finally:
-        try:
-            subprocess.run(["termux-wake-unlock"], capture_output=True, timeout=2)
-        except Exception:
-            pass
+        pass
 
     return dest_file
 
@@ -2614,11 +2611,6 @@ def generate_adm_links_for_url(url):
                 print("="*65)
                 print(f" 🚀 Direct Stream Link for ADM / VLC: {clipboard_target}")
             
-            try:
-                subprocess.run(["termux-clipboard-set"], input=clipboard_target.encode('utf-8'), capture_output=True, timeout=2)
-                print(" 📋 Stream link copied to Android Clipboard!")
-            except Exception:
-                pass
             print("="*65 + "\n")
             
     except Exception as e:
@@ -2673,7 +2665,7 @@ def interactive_menu():
                 search_netmirror_and_prompt(user_input)
                 break
 
-def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None):
+def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None, standalone=False):
     url_lower = url.lower()
     custom_headers = {}
     if cookie:
@@ -2708,8 +2700,9 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None)
             return handle_studiestoday(url, target_dir=target_dir)
         elif any(v in url_lower for v in ['youtube.com', 'youtu.be', 'vimeo.com', 'tiktok.com', 'twitch.tv', 'facebook.com', 'instagram.com']):
             PROCESS_MONITOR.set_status("Extracting Video Streams...")
-            if handle_youtube_or_video(url, target_dir=target_dir, quality_arg=quality_arg, cookie=cookie):
-                return
+            video_path = handle_youtube_or_video(url, target_dir=target_dir, quality_arg=quality_arg, cookie=cookie, standalone=standalone)
+            if video_path:
+                return video_path
         
         PROCESS_MONITOR.set_status("Generic Stream Download...")
         res = handle_generic(url, out_name=out_name, custom_headers=custom_headers, target_dir=target_dir)
@@ -2734,8 +2727,9 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None)
 
 def app_cli_capabilities():
     return {
-        "name": "Universal Downloader CLI",
+        "name": "Universal Downloader Engine",
         "version": "repo-backed",
+        "runtime": "embedded-capable",
         "sources": [
             "direct files",
             "YouTube and supported video platforms",
@@ -2849,6 +2843,7 @@ def app_download(payload):
     out_name = payload.get("out_name") or None
     target_dir = payload.get("target_dir") or DEFAULT_DIR
     cookie = payload.get("cookie") or None
+    telegram_config = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else None
     lower = url.lower()
 
     if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
@@ -2859,6 +2854,13 @@ def app_download(payload):
             action_mode="download_only",
             quality_arg=quality,
         )
+    elif any(domain in lower for domain in ["t.me/", "telegram.me/", "telegram.dog/"]):
+        path = handle_telegram(
+            url,
+            out_name=out_name,
+            target_dir=target_dir,
+            telegram_config=telegram_config,
+        )
     else:
         path = download(
             url,
@@ -2866,6 +2868,7 @@ def app_download(payload):
             cookie=cookie,
             target_dir=target_dir,
             quality_arg=quality,
+            standalone=True,
         )
     if not path:
         raise Exception("The downloader returned no output file")
@@ -2891,6 +2894,15 @@ def run_app_json_request(payload):
         return {"ok": True, "action": action, "result": result, "logs": output.getvalue()[-12000:]}
     except Exception as error:
         return {"ok": False, "action": action, "error": str(error), "logs": output.getvalue()[-12000:]}
+
+
+def run_app_json_request_json(raw_payload):
+    """Chaquopy entry point: accept and return JSON strings without Java/Python type conversion."""
+    try:
+        payload = json.loads(str(raw_payload))
+        return json.dumps(run_app_json_request(payload), ensure_ascii=False)
+    except Exception as error:
+        return json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
 
 
 def main():
