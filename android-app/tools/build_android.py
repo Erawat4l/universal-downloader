@@ -255,7 +255,7 @@ def ensure_wrapper() -> Path:
         gradle_command,
         "wrapper",
         f"--gradle-version={GRADLE_VERSION}",
-        "--gradle-distribution-url={GRADLE_DISTRIBUTION_URL}",
+        f"--gradle-distribution-url={GRADLE_DISTRIBUTION_URL}",
         "--distribution-type=bin",
     ]
     if os.name == "nt":
