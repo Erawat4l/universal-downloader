@@ -12,12 +12,16 @@ The Arena workspace cannot write directly to `C:\Users\kavi\Desktop\erawat\app`.
 C:\Users\kavi\Desktop\erawat\app
 ```
 
-Open that folder in Android Studio, let it install/sync the Android Gradle Plugin and dependencies, then use **Build → Generate App Bundles or APKs → Generate APKs**.
-
-If you want the command line build, Android Studio can create the Gradle wrapper first; then run:
+From the project folder, run one command. It finds or installs the supported Java/SDK/Gradle pieces, generates the wrapper when needed, selects a version from GitHub Releases, and builds a local debug APK:
 
 ```bat
-gradlew.bat assembleDebug
+build-android.bat
+```
+
+The `.bat` file is only a thin Python launcher. Termux/fish can use the same builder with:
+
+```sh
+./build-android.sh
 ```
 
 The APK will be at:
