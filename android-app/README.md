@@ -38,7 +38,9 @@ Requirements:
 
 ## CLI connection
 
-The UI mirrors the actual `dl.py` capabilities: direct files, supported video platforms, Telegram, educational PDFs, NetMirror, quality selection, audio-only formats, direct links, VLC streaming, retries, resume, and progress.
+The app does not seed demo search results, fake files, fake progress, or fake stream URLs. Search, resolve, copy-link, and download requests are sent to the real `dl.py` JSON bridge.
+
+The UI mirrors the actual CLI capabilities: direct files, supported video platforms, Telegram, educational PDFs, NetMirror, quality selection, audio-only formats, direct links, VLC streaming, retries, resume, and progress.
 
 When Termux is installed, the Download action sends the URL and selected quality to:
 

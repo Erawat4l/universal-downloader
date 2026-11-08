@@ -10,6 +10,9 @@ import os
 import re
 import subprocess
 import urllib.parse
+import base64
+import io
+import contextlib
 import shutil
 import requests
 import html
@@ -2729,12 +2732,187 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None)
     finally:
         PROCESS_MONITOR.stop_key_listener()
 
+def app_cli_capabilities():
+    return {
+        "name": "Universal Downloader CLI",
+        "version": "repo-backed",
+        "sources": [
+            "direct files",
+            "YouTube and supported video platforms",
+            "Telegram media",
+            "SelfStudys PDFs",
+            "StudiesToday PDFs",
+            "Studocu documents",
+            "NetMirror movies and series",
+        ],
+        "qualities": ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
+        "audio_formats": ["mp3", "m4a"],
+        "actions": ["download", "resolve", "stream", "copy_link"],
+    }
+
+
+def app_search_youtube(query):
+    if not HAS_YTDLP:
+        raise Exception("yt-dlp is not installed")
+    opts = get_ytdlp_opts({
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "socket_timeout": 10,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(f"ytsearch10:{query}", download=False) or {}
+    results = []
+    for entry in data.get("entries", [])[:10]:
+        if not entry:
+            continue
+        duration = entry.get("duration")
+        results.append({
+            "title": entry.get("title") or "Untitled",
+            "source": "YouTube",
+            "uploader": entry.get("uploader") or entry.get("channel") or "",
+            "duration": duration,
+            "url": entry.get("webpage_url") or entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}",
+            "id": entry.get("id"),
+        })
+    return results
+
+
+def app_search(query, platform="netmirror"):
+    if not query or not str(query).strip():
+        raise Exception("Search query is empty")
+    if str(platform).lower() in ("youtube", "yt"):
+        return {"platform": "youtube", "results": app_search_youtube(str(query).strip())}
+
+    raw_results = search_netmirror(str(query).strip())
+    groups = group_and_deduplicate_results(raw_results)
+    results = []
+    for group in groups[:10]:
+        audio_items = []
+        for language, item in group.get("audios", {}).items():
+            audio_items.append({
+                "language": language,
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "id": item.get("id"),
+            })
+        results.append({
+            "title": group.get("title", ""),
+            "type": group.get("type", "MOVIE"),
+            "year": group.get("year", 0),
+            "audios": audio_items,
+            "providers": group.get("otts", []),
+            "source": "NetMirror",
+        })
+    return {"platform": "netmirror", "results": results}
+
+
+def app_resolve(url, quality="best"):
+    if not url:
+        raise Exception("A URL is required")
+    lower = url.lower()
+    if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
+        direct = handle_netmirror(url, action_mode="direct_link_only", quality_arg=quality)
+        if not direct:
+            raise Exception("No direct stream was found")
+        return {"url": direct, "title": "Resolved stream", "source": "NetMirror", "quality": quality}
+
+    if any(host in lower for host in ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "facebook.com", "instagram.com"]):
+        if not HAS_YTDLP:
+            raise Exception("yt-dlp is not installed")
+        format_spec, is_audio = prompt_video_quality(url, quality_arg=quality)
+        opts = get_ytdlp_opts({"quiet": True, "no_warnings": True, "format": format_spec})
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        stream_url = info.get("url")
+        if not stream_url and info.get("requested_formats"):
+            stream_url = info["requested_formats"][0].get("url")
+        if not stream_url:
+            raise Exception("No direct stream was returned by yt-dlp")
+        return {
+            "url": stream_url,
+            "title": info.get("title", "Resolved stream"),
+            "source": info.get("extractor_key", "Video source"),
+            "quality": quality,
+            "audio_only": is_audio,
+            "headers": info.get("http_headers", {}),
+        }
+
+    if url.startswith(("http://", "https://")):
+        return {"url": url, "title": os.path.basename(urllib.parse.urlparse(url).path) or "Direct file", "source": "Direct file", "quality": quality}
+    raise Exception("Unsupported URL")
+
+
+def app_download(payload):
+    url = str(payload.get("url", "")).strip()
+    quality = str(payload.get("quality", "best")).strip() or "best"
+    out_name = payload.get("out_name") or None
+    target_dir = payload.get("target_dir") or DEFAULT_DIR
+    cookie = payload.get("cookie") or None
+    lower = url.lower()
+
+    if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
+        path = handle_netmirror(
+            url,
+            out_name=out_name,
+            target_dir=target_dir,
+            action_mode="download_only",
+            quality_arg=quality,
+        )
+    else:
+        path = download(
+            url,
+            out_name=out_name,
+            cookie=cookie,
+            target_dir=target_dir,
+            quality_arg=quality,
+        )
+    if not path:
+        raise Exception("The downloader returned no output file")
+    return {"path": path, "quality": quality, "target_dir": target_dir}
+
+
+def run_app_json_request(payload):
+    action = str(payload.get("action", "")).lower().strip()
+    if action == "capabilities":
+        return {"ok": True, "capabilities": app_cli_capabilities()}
+
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            if action == "search":
+                result = app_search(payload.get("query", ""), payload.get("platform", "netmirror"))
+            elif action == "resolve":
+                result = app_resolve(payload.get("url", ""), payload.get("quality", "best"))
+            elif action == "download":
+                result = app_download(payload)
+            else:
+                raise Exception("Unknown app action. Use capabilities, search, resolve, or download.")
+        return {"ok": True, "action": action, "result": result, "logs": output.getvalue()[-12000:]}
+    except Exception as error:
+        return {"ok": False, "action": action, "error": str(error), "logs": output.getvalue()[-12000:]}
+
+
 def main():
     if len(sys.argv) < 2:
         interactive_menu()
         return
 
     args = sys.argv[1:]
+    if args[0] in ('--app-json', '--app-json-b64'):
+        if len(args) < 2:
+            print(json.dumps({"ok": False, "error": "Missing app request payload"}))
+            return
+        try:
+            raw_payload = args[1]
+            if args[0] == '--app-json-b64':
+                raw_payload = base64.urlsafe_b64decode(raw_payload.encode('ascii')).decode('utf-8')
+            payload = json.loads(raw_payload)
+            print(json.dumps(run_app_json_request(payload), ensure_ascii=False))
+        except Exception as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
+        return
+
     if args[0] in ('-i', '--interactive', 'menu'):
         interactive_menu()
         return
