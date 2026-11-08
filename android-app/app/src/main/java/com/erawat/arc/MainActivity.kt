@@ -446,7 +446,6 @@ private fun ArcApp() {
             }
         }
     }
-)
 }
 
 @Composable
