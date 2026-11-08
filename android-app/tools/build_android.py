@@ -244,6 +244,17 @@ def build_version() -> tuple[str, str]:
     return local_name, version_code
 
 
+def configure_sdk_for_gradle(sdk: Path) -> None:
+    """Make the SDK explicit for both Gradle and Android Studio."""
+    sdk_path = sdk.resolve()
+    os.environ["ANDROID_HOME"] = str(sdk_path)
+    os.environ["ANDROID_SDK_ROOT"] = str(sdk_path)
+    # local.properties is machine-local and ignored by Git. Forward slashes work on Windows too.
+    local_properties = APP_ROOT / "local.properties"
+    local_properties.write_text(f"sdk.dir={sdk_path.as_posix()}\n", encoding="utf-8")
+    say(f"Gradle SDK path configured: {sdk_path}")
+
+
 def main() -> int:
     if os.environ.get("ARC_PUBLISH", "").lower() in {"1", "true", "yes"}:
         raise BuildError("This script only creates local debug APKs. Publishing is intentionally refused.")
@@ -253,7 +264,8 @@ def main() -> int:
     os.environ["PATH"] = str(Path(java).parent) + os.pathsep + os.environ.get("PATH", "")
     say(f"Java found: {java}")
 
-    ensure_android_sdk()
+    sdk = ensure_android_sdk()
+    configure_sdk_for_gradle(sdk)
     wrapper = ensure_wrapper()
     version_name, version_code = build_version()
 
