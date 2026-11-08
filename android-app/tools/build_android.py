@@ -255,6 +255,43 @@ def configure_sdk_for_gradle(sdk: Path) -> None:
     say(f"Gradle SDK path configured: {sdk_path}")
 
 
+def number_and_send_artifact(artifact: Path) -> Path:
+    output_dir = artifact.parent
+    numbers = []
+    for existing in output_dir.glob("A4C *.apk"):
+        match = re.fullmatch(r"A4C (\d+)\.apk", existing.name, re.IGNORECASE)
+        if match:
+            numbers.append(int(match.group(1)))
+    numbered = output_dir / f"A4C {(max(numbers) + 1) if numbers else 1}.apk"
+    shutil.copy2(artifact, numbered)
+    say(f"Numbered APK: {numbered}")
+
+    tt = shutil.which("tt")
+    if not tt:
+        say("tt was not found on PATH; skipped transfer.")
+        return numbered
+
+    say(f"Sending {numbered.name} to device 2 with tt…")
+    try:
+        result = subprocess.run(
+            [tt, "send", "2", str(numbered)],
+            cwd=APP_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            say("tt transfer completed.")
+        else:
+            say(f"tt transfer failed with exit code {result.returncode}; the APK is still available locally.")
+            if result.stdout.strip():
+                print(result.stdout.strip(), flush=True)
+            if result.stderr.strip():
+                print(result.stderr.strip(), file=sys.stderr, flush=True)
+    except OSError as error:
+        say(f"tt transfer could not start: {error}; the APK is still available locally.")
+    return numbered
+
+
 def main() -> int:
     if os.environ.get("ARC_PUBLISH", "").lower() in {"1", "true", "yes"}:
         raise BuildError("This script only creates local debug APKs. Publishing is intentionally refused.")
@@ -279,6 +316,7 @@ def main() -> int:
     if not artifact.exists():
         raise BuildError(f"Gradle finished but the expected APK is missing: {artifact}")
     say(f"Built local debug APK: {artifact}")
+    number_and_send_artifact(artifact)
     say("This is a local debug artifact; it is not a release upload.")
     return 0
 

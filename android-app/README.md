@@ -30,6 +30,20 @@ The APK will be at:
 app\build\outputs\apk\debug\app-debug.apk
 ```
 
+After a successful build, the builder also creates the next local artifact:
+
+```text
+app\build\outputs\apk\debug\A4C 1.apk
+```
+
+The number increments on each build. If `tt` is available on PATH, that numbered APK is automatically sent with:
+
+```text
+tt send 2 <apk-path>
+```
+
+A failed `tt` transfer does not hide or delete the local APK.
+
 Requirements:
 
 - Android Studio with JDK 17.
