@@ -62,6 +62,60 @@ exec ./android-app/build-android.sh
 
 The first run can download more than 600 MB. Wait until the Termux prompt returns before entering another command.
 
+## Fish shell version
+
+The block above uses POSIX shell syntax. If your Termux prompt is Fish (`➜`), use this Fish-compatible block instead:
+
+```fish
+set REPO "$HOME/universal-downloader"
+set BRANCH "arena/87a00d95-universal-downloader"
+set SDK "$PREFIX/opt/android-sdk"
+
+pkg update
+pkg upgrade -y
+if not pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-17
+    pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-21
+end
+
+termux-setup-storage
+or true
+
+set PYTHON_MINOR (python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+if test "$PYTHON_MINOR" != "3.12"
+    echo "This build requires Python 3.12; found $PYTHON_MINOR."
+    exit 1
+end
+
+if test -d "$REPO/.git"
+    cd "$REPO"
+    git pull --ff-only origin "$BRANCH"
+else
+    git clone --branch "$BRANCH" --single-branch https://github.com/Erawat4l/universal-downloader.git "$REPO"
+    cd "$REPO"
+end
+
+set -gx ANDROID_HOME "$SDK"
+set -gx ANDROID_SDK_ROOT "$SDK"
+mkdir -p "$SDK"
+
+if not test -x "$SDK/cmdline-tools/latest/bin/sdkmanager"
+    set SDK_TMP (mktemp -d)
+    wget -q -O "$SDK_TMP/cmdline-tools.zip" https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+    unzip -q "$SDK_TMP/cmdline-tools.zip" -d "$SDK_TMP"
+    mkdir -p "$SDK/cmdline-tools"
+    rm -rf "$SDK/cmdline-tools/latest"
+    mv "$SDK_TMP/cmdline-tools" "$SDK/cmdline-tools/latest"
+    rm -rf "$SDK_TMP"
+end
+
+set -gx PATH "$SDK/cmdline-tools/latest/bin" "$SDK/platform-tools" $PATH
+yes | sdkmanager --sdk_root="$SDK" --licenses
+sdkmanager --sdk_root="$SDK" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+chmod +x android-app/build-android.sh
+exec ./android-app/build-android.sh
+```
+
 ## 1. Install the Termux build packages
 
 Use the current Termux release from F-Droid or the official Termux GitHub releases. Then run:
