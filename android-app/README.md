@@ -15,7 +15,7 @@ C:\Users\kavi\Desktop\erawat\app
 From the project folder, run one command. It finds or installs the supported Java/SDK/Gradle pieces, generates the wrapper when needed, selects a version from GitHub Releases, and builds a local debug APK:
 
 ```bat
-build-android.bat
+build.bat
 ```
 
 The `.bat` file is only a thin Python launcher. Termux/fish can use the same builder with:
