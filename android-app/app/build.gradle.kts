@@ -62,6 +62,9 @@ chaquopy {
             install("requests")
             install("beautifulsoup4")
             install("yt-dlp")
+            // Pyrogram depends on pyaes==1.6.1, which Chaquopy's Python 3.14
+            // index does not publish. Bundle the pure-Python package locally.
+            install("../python-vendor/pyaes")
             install("pyrogram==2.0.106")
         }
     }
