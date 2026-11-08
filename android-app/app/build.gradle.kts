@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val sourceCommit = providers.gradleProperty("SOURCE_COMMIT").orElse("dev").get()
+
 android {
     namespace = "com.erawat.arc"
     compileSdk = 35
@@ -16,7 +18,7 @@ android {
         versionName = providers.gradleProperty("VERSION_NAME").orElse("0.1.0-local").get()
 
         // CI can replace this value at build time with the commit used to build the APK.
-        buildConfigField("String", "SOURCE_COMMIT", "\"2919f29\"")
+        buildConfigField("String", "SOURCE_COMMIT", "\"$sourceCommit\"")
     }
 
     buildTypes {

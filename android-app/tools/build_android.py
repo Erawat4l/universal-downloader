@@ -270,9 +270,9 @@ def main() -> int:
     version_name, version_code = build_version()
 
     if os.name == "nt":
-        command = ["cmd", "/d", "/c", str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}"]
+        command = ["cmd", "/d", "/c", str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}", f"-PSOURCE_COMMIT={source_revision()}"]
     else:
-        command = [str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}"]
+        command = [str(wrapper), "--no-daemon", "assembleDebug", f"-PVERSION_NAME={version_name}", f"-PVERSION_CODE={version_code}", f"-PSOURCE_COMMIT={source_revision()}"]
     run(command)
 
     artifact = APP_ROOT / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
