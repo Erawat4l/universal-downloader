@@ -17,15 +17,18 @@ SDK="$PREFIX/opt/android-sdk"
 
 pkg update
 pkg upgrade -y
-pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-17 || \
-  pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-21
+pkg install -y git python wget unzip zip aapt2 apksigner openjdk-17 || \
+  pkg install -y git python wget unzip zip aapt2 apksigner openjdk-21
 termux-setup-storage || true
 
 PYTHON_MINOR="$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
-if [ "$PYTHON_MINOR" != "3.12" ]; then
-  echo "This build requires Python 3.12; found $PYTHON_MINOR."
-  exit 1
-fi
+case "$PYTHON_MINOR" in
+  3.12|3.13|3.14) ;;
+  *)
+    echo "This build requires Python 3.12, 3.13, or 3.14; found $PYTHON_MINOR."
+    exit 1
+    ;;
+esac
 
 if [ -d "$REPO/.git" ]; then
   cd "$REPO"
@@ -73,17 +76,19 @@ set SDK "$PREFIX/opt/android-sdk"
 
 pkg update
 pkg upgrade -y
-if not pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-17
-    pkg install -y git python wget unzip zip aapt2 apksigner zipalign openjdk-21
+if not pkg install -y git python wget unzip zip aapt2 apksigner openjdk-17
+    pkg install -y git python wget unzip zip aapt2 apksigner openjdk-21
 end
 
 termux-setup-storage
 or true
 
 set PYTHON_MINOR (python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
-if test "$PYTHON_MINOR" != "3.12"
-    echo "This build requires Python 3.12; found $PYTHON_MINOR."
-    exit 1
+switch "$PYTHON_MINOR"
+    case 3.12 3.13 3.14
+    case '*'
+        echo "This build requires Python 3.12, 3.13, or 3.14; found $PYTHON_MINOR."
+        exit 1
 end
 
 if test -d "$REPO/.git"
@@ -123,7 +128,7 @@ Use the current Termux release from F-Droid or the official Termux GitHub releas
 ```sh
 pkg update && pkg upgrade -y
 pkg install -y git python openjdk-17 wget unzip zip
-pkg install -y aapt2 apksigner zipalign
+pkg install -y aapt2 apksigner
 termux-setup-storage
 ```
 
@@ -134,7 +139,7 @@ python --version
 java -version
 ```
 
-The Arc builder currently packages the embedded engine with **Python 3.12**. If `python --version` does not report Python 3.12, update Termux packages before building.
+The Arc builder packages the embedded engine with Python **3.12, 3.13, or 3.14**, selecting the supported version available on the build machine. If Python reports an older or newer version, update Termux packages or install a supported Python version before building.
 
 ## 2. Clone the app branch
 
@@ -216,7 +221,7 @@ chmod +x android-app/build-android.sh
 
 The builder will:
 
-- Verify Python 3.12 and Java 17.
+- Verify Python 3.12, 3.13, or 3.14 and Java 17.
 - Configure the Android SDK path.
 - Use the Termux ARM64 `aapt2` package instead of an incompatible desktop `aapt2` binary.
 - Synchronize the root `dl.py` into the APK Python source directory.
@@ -253,7 +258,7 @@ python --version
 pkg update && pkg upgrade -y
 ```
 
-The current Android build is configured for Python 3.12. Do not change the app's Chaquopy Python version independently from the builder check.
+The builder selects Python 3.12, 3.13, or 3.14 and passes the selected version to Chaquopy. Do not change the app's Chaquopy Python version independently from the builder.
 
 ### `aapt2` is missing
 

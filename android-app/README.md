@@ -49,7 +49,7 @@ For a complete on-device Termux setup, see the repository-level [`TERMUX.md`](..
 Requirements:
 
 - Android Studio with JDK 17.
-- Python 3.12 on the build machine (Chaquopy uses it to package the engine).
+- Python 3.12, 3.13, or 3.14 on the build machine (Chaquopy packages whichever supported version the builder selects).
 - Android SDK 35.
 - Internet access during the first build so Gradle and the Python wheels can be resolved.
 - An Android device/emulator with Android 8.0 or newer.

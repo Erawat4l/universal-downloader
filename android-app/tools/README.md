@@ -4,7 +4,7 @@
 
 The Python builder:
 
-- Requires Python 3.12 for the embedded Chaquopy engine.
+- Requires Python 3.12, 3.13, or 3.14 for the embedded Chaquopy engine.
 - Finds or installs Java 17 where a supported package manager is available.
 - Finds Android SDK 35 and required build tools.
 - Generates the Gradle wrapper if the project does not have one.

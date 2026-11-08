@@ -72,34 +72,37 @@ def install_with_winget(package_id: str, label: str) -> bool:
     return True
 
 
-def ensure_build_python() -> None:
-    """Chaquopy 17.2 is configured for Python 3.12."""
-    candidates: list[list[str]] = []
-    if sys.version_info[:2] == (3, 12):
-        candidates.append([sys.executable])
-    if os.name == "nt":
-        candidates.extend([["py", "-3.12"], ["python3.12"], ["python"]])
-    else:
-        candidates.extend([["python3.12"], ["python3"], ["python"]])
+def ensure_build_python() -> str:
+    """Find a Python version supported by Chaquopy 17.2 and return its major/minor."""
+    supported = ("3.14", "3.13", "3.12")
+    for wanted in supported:
+        major, minor = (int(value) for value in wanted.split("."))
+        candidates: list[list[str]] = []
+        if sys.version_info[:2] == (major, minor):
+            candidates.append([sys.executable])
+        if os.name == "nt":
+            candidates.extend([["py", f"-{wanted}"], [f"python{wanted}"], ["python"]])
+        else:
+            candidates.extend([[f"python{wanted}"], ["python3"], ["python"]])
 
-    for candidate in candidates:
-        try:
-            result = subprocess.run(
-                [*candidate, "--version"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        version = f"{result.stdout} {result.stderr}".strip()
-        if re.search(r"Python 3\.12(?:\.|$)", version):
-            say(f"Python 3.12 found for Chaquopy: {' '.join(candidate)}")
-            return
+        for candidate in candidates:
+            try:
+                result = subprocess.run(
+                    [*candidate, "--version"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            version = f"{result.stdout} {result.stderr}".strip()
+            if re.search(rf"Python {re.escape(wanted)}(?:\.|$)", version):
+                say(f"Python {wanted} found for Chaquopy: {' '.join(candidate)}")
+                return wanted
 
     raise BuildError(
-        "Python 3.12 is required to package the embedded downloader engine. "
-        "Install Python 3.12 and run this same command again."
+        "Python 3.12, 3.13, or 3.14 is required to package the embedded downloader engine. "
+        "Install one supported version and run this same command again."
     )
 
 
@@ -360,7 +363,7 @@ def main() -> int:
     if os.environ.get("ARC_PUBLISH", "").lower() in {"1", "true", "yes"}:
         raise BuildError("This script only creates local debug APKs. Publishing is intentionally refused.")
 
-    ensure_build_python()
+    chaquopy_python_version = ensure_build_python()
     java, java_home = find_java()
     os.environ["JAVA_HOME"] = str(java_home)
     os.environ["PATH"] = str(Path(java).parent) + os.pathsep + os.environ.get("PATH", "")
@@ -378,6 +381,7 @@ def main() -> int:
         f"-PVERSION_NAME={version_name}",
         f"-PVERSION_CODE={version_code}",
         f"-PSOURCE_COMMIT={source_revision()}",
+        f"-PCHAQUOPY_PYTHON_VERSION={chaquopy_python_version}",
     ]
     aapt2_override = os.environ.get("ARC_AAPT2_OVERRIDE")
     if aapt2_override:

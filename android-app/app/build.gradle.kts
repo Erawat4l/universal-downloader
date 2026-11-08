@@ -6,6 +6,7 @@ plugins {
 }
 
 val sourceCommit = providers.gradleProperty("SOURCE_COMMIT").orElse("dev").get()
+val chaquopyPythonVersion = providers.gradleProperty("CHAQUOPY_PYTHON_VERSION").orElse("3.12").get()
 
 android {
     namespace = "com.erawat.arc"
@@ -56,7 +57,7 @@ android {
 
 chaquopy {
     defaultConfig {
-        version = "3.12"
+        version = chaquopyPythonVersion
         pip {
             install("requests")
             install("beautifulsoup4")
