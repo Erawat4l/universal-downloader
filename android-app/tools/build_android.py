@@ -233,7 +233,17 @@ def download_gradle_distribution() -> Path:
 
 def ensure_wrapper() -> Path:
     wrapper = APP_ROOT / ("gradlew.bat" if os.name == "nt" else "gradlew")
-    if wrapper.exists():
+    wrapper_properties = APP_ROOT / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    expected_distribution = f"gradle-{GRADLE_VERSION}-bin.zip"
+
+    if wrapper.exists() and wrapper_properties.exists():
+        properties = wrapper_properties.read_text(encoding="utf-8")
+        if expected_distribution not in properties:
+            # A previous Termux run may have generated a wrapper for the
+            # system Gradle (for example 9.9). AGP 8.7.3 is built with 8.9.
+            say(f"Resetting Gradle wrapper to {GRADLE_VERSION} (existing wrapper was different).")
+            properties = re.sub(r"gradle-[^/]+-(?:bin|all)\.zip", expected_distribution, properties)
+            wrapper_properties.write_text(properties, encoding="utf-8")
         if os.name != "nt":
             wrapper.chmod(wrapper.stat().st_mode | 0o111)
         return wrapper
