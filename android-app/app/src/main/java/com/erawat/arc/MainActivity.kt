@@ -352,7 +352,7 @@ private fun ArcApp() {
                             source = item.optString("source", "NetMirror"),
                             type = item.optString("type", "MEDIA"),
                             year = item.optString("year", ""),
-                            providers = item.optJSONArray("providers")?.joinToString(" · ") ?: "",
+                            providers = item.optJSONArray("providers")?.let { providers -> (0 until providers.length()).joinToString(" · ") { index -> providers.optString(index) } } ?: "",
                             audio = audios,
                         )
                     }
@@ -445,7 +445,8 @@ private fun ArcApp() {
                 )
             }
         }
-    )
+    }
+)
 }
 
 @Composable
