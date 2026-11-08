@@ -6,3 +6,11 @@ __pycache__/
 *.tmp
 downloads/
 *.part
+
+# Android build outputs and local machine settings
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
+.idea/
+*.iml

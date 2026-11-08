@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b0b0b" />
+  <title>Arc — Android UI Prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050505;
+      --bg-2: #111111;
+      --panel: rgba(18,18,18,.90);
+      --panel-strong: #1a1a1a;
+      --panel-soft: rgba(255,255,255,.045);
+      --stroke: rgba(255, 255, 255, .095);
+      --stroke-strong: rgba(255, 255, 255, .16);
+      --text: #ffffff;
+      --muted: #b8b8b8;
+      --subtle: #858585;
+      --violet: #ffffff;
+      --violet-2: #e5e5e5;
+      --mint: #ffffff;
+      --yellow: #c7c7c7;
+      --red: #ededed;
+      --green: #ffffff;
+      --shadow: 0 26px 90px rgba(0,0,0,.65);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% -10%, rgba(255,255,255,.16), transparent 34rem),
+        radial-gradient(circle at 94% 4%, rgba(255,255,255,.09), transparent 28rem),
+        linear-gradient(150deg, #050505, #0c0c0c 68%, #101010);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body::before {
+      content: ""; position: fixed; inset: 0; pointer-events: none; z-index: -1; opacity: .035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.8'/%3E%3C/svg%3E");
+    }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    a { color: inherit; text-decoration: none; }
+    .stage { width: min(1220px, calc(100% - 32px)); margin: 0 auto; padding: 30px 0 42px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 22px; }
+    .wordmark { display: flex; align-items: center; gap: 11px; font-weight: 760; letter-spacing: -.035em; }
+    .logo {
+      display: grid; place-items: center; width: 38px; height: 38px; border-radius: 13px; color: #080808;
+      font-size: 21px; font-weight: 900; background: linear-gradient(135deg, var(--violet), var(--mint));
+      box-shadow: 0 12px 30px rgba(255,255,255,.16);
+    }
+    .prototype-pill, .live-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid var(--stroke); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.035); font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 14px var(--mint); }
+    .workspace { display: grid; grid-template-columns: 226px minmax(0, 1fr); gap: 18px; align-items: stretch; }
+    .sidebar, .mobile-shell {
+      min-height: 790px; border: 1px solid var(--stroke); border-radius: var(--radius-xl); background: rgba(15,15,15,.72);
+      box-shadow: var(--shadow); backdrop-filter: blur(22px);
+    }
+    .sidebar { display: flex; flex-direction: column; padding: 18px 12px; }
+    .side-heading { display: flex; align-items: center; gap: 10px; padding: 7px 11px 24px; color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .side-heading .tiny-logo { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 8px; color: #080808; background: linear-gradient(135deg, var(--violet), var(--mint)); font-size: 13px; }
+    .nav-group { display: grid; gap: 5px; }
+    .nav-label { padding: 17px 11px 7px; color: var(--subtle); font-size: 10px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .nav-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 45px; padding: 0 12px; border: 1px solid transparent; border-radius: 14px; color: var(--muted); background: transparent; text-align: left; font-size: 13px; font-weight: 680; transition: .2s ease; }
+    .nav-item:hover { color: var(--text); background: rgba(255,255,255,.065); }
+    .nav-item.active { color: var(--text); border-color: rgba(255,255,255,.15); background: linear-gradient(100deg, rgba(255,255,255,.14), rgba(255,255,255,.035)); }
+    .nav-item.active .nav-icon { color: var(--violet-2); }
+    .nav-icon { display: grid; place-items: center; width: 20px; color: var(--subtle); }
+    .nav-count { margin-left: auto; padding: 3px 7px; border-radius: 8px; color: #080808; background: var(--mint); font-size: 10px; font-weight: 850; }
+    .side-bottom { margin-top: auto; display: grid; gap: 10px; }
+    .mini-card { padding: 14px; border: 1px solid var(--stroke); border-radius: 17px; background: linear-gradient(145deg, rgba(255,255,255,.10), rgba(255,255,255,.025)); }
+    .mini-card strong { display: block; margin-bottom: 7px; font-size: 12px; }
+    .mini-card p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .prompt-link { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; color: var(--subtle); font-size: 11px; }
+    .mobile-shell { position: relative; overflow: hidden; min-width: 0; background: linear-gradient(160deg, rgba(17,17,17,.86), rgba(11,11,11,.94)); }
+    .screen { min-height: 790px; padding: 25px 27px 92px; overflow: hidden; }
+    .screen-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 25px; }
+    .screen-title { margin: 0; font-size: clamp(22px, 3vw, 30px); letter-spacing: -.055em; line-height: 1.05; }
+    .screen-subtitle { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .icon-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 1px solid var(--stroke); border-radius: 13px; color: var(--muted); background: rgba(255,255,255,.04); transition: .2s ease; }
+    .icon-button:hover { color: var(--text); border-color: rgba(255,255,255,.55); background: rgba(255,255,255,.10); }
+    .back-button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 0; border: 0; color: var(--muted); background: transparent; font-size: 13px; font-weight: 700; }
+    .back-button:hover { color: var(--text); }
+    .eyebrow { display: flex; align-items: center; gap: 8px; margin-bottom: 15px; color: var(--mint); font-size: 10px; font-weight: 850; letter-spacing: .17em; text-transform: uppercase; }
+    .eyebrow .ping { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 12px var(--mint); }
+    .home-hero { padding: 5px 0 22px; }
+    .home-hero h1 { max-width: 660px; margin: 0; font-size: clamp(35px, 6vw, 67px); line-height: .96; letter-spacing: -.075em; }
+    .home-hero h1 span { color: var(--violet-2); }
+    .home-hero p { max-width: 570px; margin: 17px 0 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .input-wrap { display: flex; align-items: center; gap: 10px; max-width: 720px; min-height: 67px; margin-top: 26px; padding: 8px 9px 8px 18px; border: 1px solid rgba(255,255,255,.26); border-radius: 20px; background: rgba(255,255,255,.075); box-shadow: 0 16px 50px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.075); }
+    .input-icon { flex: 0 0 auto; color: var(--violet-2); }
+    .input-wrap input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 14px; }
+    .input-wrap input::placeholder { color: var(--subtle); }
+    .small-action { min-height: 39px; padding: 0 12px; border: 1px solid var(--stroke); border-radius: 12px; color: var(--muted); background: rgba(255,255,255,.045); font-size: 12px; font-weight: 760; }
+    .small-action:hover { color: var(--text); border-color: rgba(255,255,255,.4); background: rgba(255,255,255,.08); }
+    .primary-action { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 47px; padding: 0 18px; border: 0; border-radius: 14px; color: #0f0f0f; background: linear-gradient(135deg, #ffffff, #bdbdbd); box-shadow: 0 13px 28px rgba(255,255,255,.14); font-size: 13px; font-weight: 850; transition: .2s ease; }
+    .primary-action:hover { transform: translateY(-1px); filter: brightness(1.06); }
+    .form-note { display: flex; align-items: center; gap: 7px; margin: 10px 2px 0; color: var(--subtle); font-size: 11px; }
+    .quick-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+    .quick-chip { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; padding: 0 11px; border: 1px solid var(--stroke); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.035); font-size: 11px; font-weight: 700; }
+    .quick-chip:hover { color: var(--text); border-color: rgba(255,255,255,.5); background: rgba(255,255,255,.09); }
+    .grid-2 { display: grid; grid-template-columns: 1.25fr .75fr; gap: 14px; margin-top: 21px; }
+    .surface { border: 1px solid var(--stroke); border-radius: var(--radius-lg); background: var(--panel); box-shadow: 0 18px 55px rgba(0,0,0,.14); }
+    .surface-pad { padding: 19px; }
+    .section-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .section-title { margin: 0; font-size: 14px; letter-spacing: -.02em; }
+    .section-link { border: 0; padding: 0; color: var(--violet-2); background: transparent; font-size: 11px; font-weight: 750; }
+    .section-link:hover { color: var(--mint); }
+    .recent-list { display: grid; gap: 7px; }
+    .recent-item { display: flex; align-items: center; gap: 11px; padding: 9px; border-radius: 13px; transition: .2s ease; }
+    .recent-item:hover { background: var(--panel-soft); }
+    .file-badge { display: grid; place-items: center; width: 37px; height: 37px; flex: 0 0 auto; border-radius: 12px; color: var(--violet-2); background: linear-gradient(135deg, rgba(255,255,255,.15), rgba(255,255,255,.09)); }
+    .file-badge.mint { color: var(--mint); background: rgba(255,255,255,.09); }
+    .file-badge.yellow { color: var(--yellow); background: rgba(210,210,210,.11); }
+    .file-info { min-width: 0; flex: 1; }
+    .file-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .file-info span { display: block; margin-top: 4px; color: var(--subtle); font-size: 10px; }
+    .more { display: grid; place-items: center; width: 27px; height: 27px; border: 0; color: var(--subtle); background: transparent; }
+    .pulse-card { min-height: 100%; padding: 19px; overflow: hidden; position: relative; background: linear-gradient(145deg, rgba(255,255,255,.14), rgba(255,255,255,.06) 65%, rgba(255,255,255,.025)); }
+    .pulse-card::after { content: ""; position: absolute; width: 160px; height: 160px; right: -63px; bottom: -70px; border: 1px solid rgba(255,255,255,.18); border-radius: 50%; box-shadow: 0 0 0 20px rgba(255,255,255,.025), 0 0 0 42px rgba(255,255,255,.025); }
+    .pulse-card .mini-label { color: var(--mint); font-size: 10px; font-weight: 850; letter-spacing: .12em; text-transform: uppercase; }
+    .pulse-value { margin: 22px 0 4px; font-size: 38px; font-weight: 790; letter-spacing: -.08em; }
+    .pulse-card p { max-width: 160px; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .demo-note { display: flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--subtle); font-size: 10px; }
+    .demo-note b { color: var(--yellow); }
+    .download-card { padding: 17px; }
+    .download-top { display: flex; align-items: flex-start; gap: 12px; }
+    .download-title { min-width: 0; flex: 1; }
+    .download-title strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+    .download-title span { display: block; margin-top: 5px; color: var(--subtle); font-size: 10px; }
+    .status-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 9px; color: var(--mint); background: rgba(255,255,255,.09); font-size: 10px; font-weight: 800; white-space: nowrap; }
+    .status-chip.paused { color: var(--yellow); background: rgba(210,210,210,.11); }
+    .status-chip.failed { color: var(--red); background: rgba(255,255,255,.09); }
+    .progress-track { height: 8px; margin: 17px 0 9px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.10); }
+    .progress-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--violet), var(--mint)); box-shadow: 0 0 18px rgba(255,255,255,.17); transition: width .35s ease; }
+    .progress-meta { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10px; }
+    .download-actions { display: flex; gap: 8px; margin-top: 15px; }
+    .outline-action { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 37px; padding: 0 11px; border: 1px solid var(--stroke); border-radius: 11px; color: var(--muted); background: rgba(255,255,255,.035); font-size: 11px; font-weight: 750; }
+    .outline-action:hover { color: var(--text); border-color: rgba(255,255,255,.5); background: rgba(255,255,255,.09); }
+    .outline-action.danger:hover { color: var(--red); border-color: rgba(255,255,255,.42); background: rgba(255,255,255,.08); }
+    .stack { display: grid; gap: 12px; }
+    .analysis-hero { display: grid; grid-template-columns: 165px minmax(0,1fr); gap: 18px; align-items: stretch; padding: 15px; }
+    .art { position: relative; min-height: 155px; overflow: hidden; border-radius: 17px; background: linear-gradient(145deg, #333333, #111111 45%, #666666); }
+    .art::before { content: ""; position: absolute; inset: 18% 7% 7% 20%; border: 1px solid rgba(255,255,255,.35); border-radius: 50% 45% 55% 40%; transform: rotate(-25deg); box-shadow: 0 0 40px rgba(255,255,255,.24); }
+    .art::after { content: ""; position: absolute; width: 92px; height: 92px; left: 24px; top: 31px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #ffffff, #ffffff 25%, rgba(255,255,255,.05) 68%); opacity: .8; filter: blur(.2px); }
+    .art-play { position: absolute; left: 50%; top: 50%; z-index: 1; display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid rgba(255,255,255,.28); border-radius: 50%; color: white; background: rgba(7,7,7,.38); transform: translate(-50%,-50%); backdrop-filter: blur(5px); }
+    .analysis-copy { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+    .source-line { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; color: var(--mint); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .analysis-copy h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; font-size: clamp(21px, 3vw, 31px); letter-spacing: -.06em; white-space: nowrap; }
+    .analysis-copy p { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+    .meta-pill { padding: 6px 8px; border: 1px solid var(--stroke); border-radius: 8px; color: var(--muted); background: rgba(255,255,255,.035); font-size: 10px; }
+    .choice-surface { padding: 18px; }
+    .choice-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 13px; }
+    .choice-heading h3 { margin: 0; font-size: 14px; }
+    .choice-heading span { color: var(--subtle); font-size: 10px; }
+    .quality-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 8px; }
+    .quality { min-height: 55px; padding: 8px 6px; border: 1px solid var(--stroke); border-radius: 12px; color: var(--muted); background: rgba(255,255,255,.028); font-size: 11px; font-weight: 780; }
+    .quality span { display: block; margin-top: 3px; color: var(--subtle); font-size: 9px; font-weight: 550; }
+    .quality.selected { border-color: rgba(255,255,255,.72); color: var(--text); background: linear-gradient(145deg, rgba(255,255,255,.18), rgba(255,255,255,.06)); box-shadow: 0 0 0 2px rgba(255,255,255,.08); }
+    .format-toggle { display: flex; align-items: center; gap: 7px; margin-top: 14px; }
+    .format-option { flex: 1; min-height: 39px; border: 1px solid var(--stroke); border-radius: 11px; color: var(--muted); background: transparent; font-size: 11px; font-weight: 750; }
+    .format-option.selected { border-color: rgba(255,255,255,.42); color: var(--mint); background: rgba(255,255,255,.08); }
+    .action-grid { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 9px; margin-top: 15px; }
+    .action-grid button { min-height: 45px; }
+    .search-field { display: flex; align-items: center; gap: 9px; min-height: 46px; padding: 0 13px; border: 1px solid var(--stroke); border-radius: 14px; background: rgba(255,255,255,.045); }
+    .search-field input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; }
+    .search-field input::placeholder { color: var(--subtle); }
+    .result-card { display: flex; align-items: center; gap: 13px; width: 100%; padding: 12px; border: 1px solid var(--stroke); border-radius: 17px; color: var(--text); background: var(--panel); text-align: left; transition: .2s ease; }
+    .result-card:hover { border-color: rgba(255,255,255,.55); transform: translateY(-1px); }
+    .result-art { display: grid; place-items: center; width: 62px; height: 68px; flex: 0 0 auto; overflow: hidden; border-radius: 13px; color: var(--violet-2); background: linear-gradient(145deg, #505050, #151515); }
+    .result-copy { min-width: 0; flex: 1; }
+    .result-copy strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+    .result-copy p { margin: 6px 0 0; color: var(--muted); font-size: 10px; }
+    .result-copy small { display: block; margin-top: 7px; color: var(--subtle); font-size: 10px; }
+    .update-card { margin-bottom: 14px; padding: 16px; background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(255,255,255,.025)); }
+    .update-card-top { display: flex; align-items: center; gap: 12px; }
+    .update-mark { display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 auto; border: 1px solid var(--stroke); border-radius: 13px; color: var(--text); background: rgba(255,255,255,.08); }
+    .update-copy { min-width: 0; flex: 1; }
+    .update-copy .mini-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 850; letter-spacing: .12em; text-transform: uppercase; }
+    .update-copy h3 { margin: 0; font-size: 13px; letter-spacing: -.02em; }
+    .update-copy p { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .update-meta { display: flex; justify-content: space-between; gap: 12px; margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--stroke); color: var(--subtle); font-size: 10px; }
+    .settings-list { overflow: hidden; }
+    .settings-group { padding: 16px 18px 7px; color: var(--mint); font-size: 10px; font-weight: 850; letter-spacing: .13em; text-transform: uppercase; }
+    .setting-row { display: flex; align-items: center; gap: 13px; min-height: 65px; padding: 10px 18px; border-top: 1px solid rgba(255,255,255,.055); }
+    .setting-icon { display: grid; place-items: center; width: 34px; height: 34px; flex: 0 0 auto; border-radius: 11px; color: var(--violet-2); background: rgba(255,255,255,.09); }
+    .setting-copy { min-width: 0; flex: 1; }
+    .setting-copy strong { display: block; font-size: 12px; }
+    .setting-copy span { display: block; margin-top: 4px; color: var(--subtle); font-size: 10px; line-height: 1.35; }
+    .switch { position: relative; width: 39px; height: 23px; flex: 0 0 auto; border: 0; border-radius: 99px; background: #2b2b2b; }
+    .switch::after { content: ""; position: absolute; top: 4px; left: 4px; width: 15px; height: 15px; border-radius: 50%; background: #8b8b8b; transition: .2s ease; }
+    .switch.on { background: rgba(255,255,255,.28); }
+    .switch.on::after { left: 20px; background: var(--mint); box-shadow: 0 0 10px rgba(255,255,255,.45); }
+    .mobile-nav { display: none; }
+    .toast { position: fixed; right: 25px; bottom: 25px; z-index: 10; max-width: min(390px, calc(100% - 32px)); padding: 13px 16px; border: 1px solid rgba(255,255,255,.24); border-radius: 14px; color: #ffffff; background: #1b1b1b; box-shadow: var(--shadow); opacity: 0; transform: translateY(10px); pointer-events: none; transition: .22s ease; font-size: 12px; font-weight: 700; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .empty { display: grid; place-items: center; min-height: 310px; padding: 30px; text-align: center; }
+    .empty-icon { display: grid; place-items: center; width: 64px; height: 64px; margin-bottom: 15px; border: 1px solid rgba(255,255,255,.18); border-radius: 22px; color: var(--violet-2); background: rgba(255,255,255,.09); }
+    .empty h3 { margin: 0; font-size: 17px; letter-spacing: -.03em; }
+    .empty p { max-width: 310px; margin: 8px 0 17px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .legal { margin: 17px 2px 0; color: var(--subtle); font-size: 10px; line-height: 1.5; }
+    .legal b { color: var(--muted); }
+    @media (max-width: 860px) {
+      .stage { width: min(680px, calc(100% - 22px)); padding-top: 17px; }
+      .topbar { margin-bottom: 13px; }
+      .topbar .prototype-pill { display: none; }
+      .workspace { display: block; }
+      .sidebar { display: none; }
+      .mobile-shell { min-height: calc(100vh - 77px); border-radius: 25px; }
+      .screen { min-height: calc(100vh - 77px); padding: 23px 17px 95px; }
+      .mobile-nav { position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 4; display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; padding: 7px; border: 1px solid var(--stroke); border-radius: 20px; background: rgba(20,20,20,.88); box-shadow: 0 12px 35px rgba(0,0,0,.65); backdrop-filter: blur(22px); }
+      .mobile-nav button { display: grid; justify-items: center; gap: 4px; min-height: 53px; padding: 7px 4px; border: 0; border-radius: 14px; color: var(--subtle); background: transparent; font-size: 9px; font-weight: 750; }
+      .mobile-nav button.active { color: var(--text); background: rgba(255,255,255,.12); }
+      .mobile-nav .nav-count { position: absolute; margin: -3px 0 0 18px; padding: 2px 5px; font-size: 8px; }
+    }
+    @media (max-width: 540px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      .home-hero h1 { font-size: 45px; }
+      .input-wrap { align-items: stretch; flex-wrap: wrap; padding: 12px; }
+      .input-icon { padding-top: 10px; }
+      .input-wrap input { flex-basis: calc(100% - 37px); }
+      .input-wrap .small-action { margin-left: 28px; }
+      .input-wrap .primary-action { flex: 1; }
+      .analysis-hero { grid-template-columns: 1fr; }
+      .art { min-height: 190px; }
+      .quality-grid { grid-template-columns: repeat(3, 1fr); }
+      .action-grid { grid-template-columns: 1fr 1fr; }
+      .action-grid .primary-action { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <header class="topbar">
+      <a class="wordmark" href="/" title="Back to prompt viewer"><span class="logo">↓</span><span>Arc</span></a>
+      <span class="prototype-pill"><span class="live-dot"></span> Repo-backed UI · GitHub Sync</span>
+    </header>
+    <div id="app"></div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const paths = {
+      home: '<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V10Z"/>',
+      activity: '<path d="M4 19V5m0 14h16M8 16v-4m4 4V7m4 9v-7"/>',
+      library: '<path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H20v15H5.5A1.5 1.5 0 0 1 4 17.5v-12Z"/><path d="M8 8h8M8 12h5"/>',
+      settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="m19.4 15 .1.1a2 2 0 1 1-2.8 2.8l-.1-.1a2 2 0 0 0-3.4 1.4v.3a2 2 0 1 1-4 0v-.2A2 2 0 0 0 5.8 18l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A2 2 0 0 0 1.6 12H1.3a2 2 0 1 1 0-4h.2A2 2 0 0 0 3 4.6l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A2 2 0 0 0 9.2.4V.2a2 2 0 1 1 4 0v.2a2 2 0 0 0 3.4 1.4l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A2 2 0 0 0 20.8 8h.2a2 2 0 1 1 0 4h-.2a2 2 0 0 0-1.4 3Z"/>',
+      link: '<path d="M10 13.5 8.5 15a3.5 3.5 0 0 1-5-5l3-3a3.5 3.5 0 0 1 5 0"/><path d="m14 10.5 1.5-1.5a3.5 3.5 0 0 1 5 5l-3 3a3.5 3.5 0 0 1-5 0"/><path d="m8 12 8-4"/>',
+      search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',
+      clipboard: '<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M8 9h8M8 13h6"/>',
+      arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+      back: '<path d="m15 18-6-6 6-6M9 12h10"/>',
+      plus: '<path d="M12 5v14M5 12h14"/>',
+      play: '<path d="m9 5 10 7-10 7V5Z"/>',
+      pause: '<path d="M8 5v14M16 5v14"/>',
+      check: '<path d="m5 12 4 4L19 6"/>',
+      copy: '<rect x="8" y="8" width="11" height="12" rx="2"/><path d="M5 16H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+      more: '<circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/>',
+      folder: '<path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
+      video: '<rect x="3" y="5" width="14" height="14" rx="2"/><path d="m17 10 4-2v8l-4-2"/>',
+      music: '<path d="M9 18V5l10-2v13M9 18a3 3 0 1 1-3-3 3 3 0 0 1 3 3Zm10-2a3 3 0 1 1-3-3 3 3 0 0 1 3 3Z"/>',
+      file: '<path d="M6 3h8l4 4v14H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M14 3v5h5M8 13h8M8 17h6"/>',
+      lock: '<rect x="4" y="9" width="16" height="11" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/>',
+      wifi: '<path d="M2 8.5a16 16 0 0 1 20 0M5 12a11 11 0 0 1 14 0M8.5 15.5a6 6 0 0 1 7 0M12 19h.01"/>',
+      spark: '<path d="m12 2 1.5 6.5L20 10l-6.5 1.5L12 18l-1.5-6.5L4 10l6.5-1.5L12 2Z"/>',
+      moon: '<path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/>',
+      bell: '<path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 22h4"/>',
+      download: '<path d="M12 3v12m0 0 5-5m-5 5-5-5M4 20h16"/>',
+      refresh: '<path d="M20 11a8 8 0 0 0-14.7-4L3 9m0 0V4m0 5h5M4 13a8 8 0 0 0 14.7 4L21 15m0 0v5m0-5h-5"/>',
+      external: '<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/>'
+    };
+    function icon(name, size = 18) {
+      return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.spark}</svg>`;
+    }
+    const state = {
+      screen: 'home', input: '', query: '', selectedQuality: '1080p', selectedFormat: 'video', settings: { notifications: true, clipboard: true, dark: true }, engine: { status: 'checking', ready: false, commit: '', missing: [] }, update: { status: 'checking', sourceAvailable: false, appAvailable: false, message: '', commit: '', url: '' },
+      content: { title: 'Afterglow — Official Video', source: 'YouTube', type: 'Video', duration: '08:42', size: '412 MB', language: 'English', description: 'Ready for a clean, one-tap download.' },
+      downloads: [
+        { id: 1, title: 'Lunar Signals — Official Video', source: 'YouTube', meta: '1080p · MP4 · 412 MB', progress: .62, status: 'downloading', speed: '8.4 MB/s', eta: '00:24', icon: 'video' },
+        { id: 2, title: 'Physics revision notes', source: 'SelfStudys', meta: 'PDF · 18.4 MB', progress: 1, status: 'completed', speed: 'Done', eta: 'Saved', icon: 'file' }
+      ]
+    };
+    const app = document.getElementById('app');
+    const toastEl = document.getElementById('toast');
+    let toastTimer;
+    let simulationStarted = false;
+    function esc(value) { return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+    function toast(message) { toastEl.textContent = message; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2500); }
+    let updateRequestActive = false;
+    async function loadEngineStatus() {
+      try {
+        const response = await fetch('/api/engine/status', { cache: 'no-store' });
+        const data = await response.json();
+        const missing = Object.entries(data.dependencies || {}).filter(([, available]) => !available).map(([name]) => name);
+        state.engine = { status: data.exists ? 'mapped' : 'unavailable', ready: Boolean(data.runtime_ready), commit: (data.commit || '').slice(0, 7), missing };
+        const badge = document.getElementById('engineBadge');
+        if (badge) badge.textContent = data.runtime_ready ? 'Engine: dl.py Ready' : 'Engine: dl.py Mapped';
+      } catch (error) {
+        state.engine = { status: 'offline', ready: false, commit: '', missing: [] };
+      }
+    }
+    async function checkForUpdates(force = false) {
+      if (updateRequestActive && !force) return;
+      updateRequestActive = true;
+      state.update.status = 'checking';
+      if (state.screen === 'settings') render();
+      try {
+        const response = await fetch('/api/update/check', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        state.update = {
+          status: data.github_error && !data.remote_commit ? 'error' : (data.app_update_available ? 'app-available' : (data.source_update_available ? 'source-available' : 'current')),
+          sourceAvailable: Boolean(data.source_update_available),
+          appAvailable: Boolean(data.app_update_available),
+          message: data.commit_message || data.update_note || '',
+          commit: data.remote_short_commit || '',
+          url: data.release?.apk?.url || data.commit_url || '',
+          tag: data.release?.tag || '',
+          repository: data.repository || 'Erawat4l/universal-downloader',
+          note: data.update_note || ''
+        };
+      } catch (error) {
+        state.update = { ...state.update, status: 'error', message: 'GitHub is unavailable. Try again later.' };
+      } finally {
+        updateRequestActive = false;
+        if (state.screen === 'settings') render();
+      }
+    }
+    function updateCard() {
+      const u = state.update;
+      const checking = u.status === 'checking';
+      const error = u.status === 'error';
+      const appAvailable = u.status === 'app-available';
+      const sourceAvailable = u.status === 'source-available';
+      const title = checking ? 'Checking GitHub…' : error ? 'Update Check Unavailable' : appAvailable ? 'App Update Ready' : sourceAvailable ? 'CLI Source Update Found' : 'You’re Up to Date';
+      const copy = checking ? 'Checking the repository.' : error ? u.message : appAvailable ? `Release ${u.tag || 'latest'} includes a signed APK.` : sourceAvailable ? 'CLI changes are available. A signed APK is still needed for app updates.' : 'The app and CLI track the same repository.';
+      const buttonLabel = checking ? 'Checking…' : appAvailable ? 'Open Release' : 'Check Now';
+      const action = appAvailable ? 'update-app' : 'check-updates';
+      return `<div class="surface update-card"><div class="update-card-top"><span class="update-mark">${icon(appAvailable ? 'download' : 'refresh', 17)}</span><div class="update-copy"><span class="mini-label">GitHub sync</span><h3>${title}</h3><p>${copy}</p></div><button class="outline-action" data-action="${action}" ${checking ? 'disabled' : ''}>${buttonLabel}</button></div><div class="update-meta"><span>${icon('external', 12)} ${esc(u.repository || 'Erawat4l/universal-downloader')}</span><span>${u.commit ? `Latest · ${esc(u.commit)}` : 'Source + Releases'}</span></div></div>`;
+    }
+    function navItem(screen, label, iconName, count = '') { return `<button class="nav-item ${state.screen === screen ? 'active' : ''}" data-screen="${screen}">${icon(iconName, 17)}<span>${label}</span>${count ? `<span class="nav-count">${count}</span>` : ''}</button>`; }
+    function navBar() {
+      return `<nav class="mobile-nav">${navItem('home','Home','home')}${navItem('activity','Activity','activity', state.downloads.filter(d => d.status === 'downloading').length)}${navItem('library','Library','library')}${navItem('settings','Settings','settings')}</nav>`;
+    }
+    function sidebar() {
+      return `<aside class="sidebar"><div class="side-heading"><span class="tiny-logo">↓</span><span>YOUR SPACE</span></div><div class="nav-group">${navItem('home','Home','home')}${navItem('activity','Activity','activity', state.downloads.filter(d => d.status === 'downloading').length)}${navItem('library','Library','library')}${navItem('settings','Settings','settings')}</div><div class="nav-label">Quick actions</div><div class="nav-group"><button class="nav-item" data-action="quick" data-value=""><span class="nav-icon">${icon('plus',17)}</span><span>New download</span></button><button class="nav-item" data-action="quick" data-value="search"><span class="nav-icon">${icon('search',17)}</span><span>Search media</span></button></div><div class="side-bottom"><div class="mini-card"><strong>Downloads, but calmer.</strong><p>One place for links, files, progress, and the things worth keeping.</p></div><a class="prompt-link" href="/"><span>View design brief</span>${icon('external',13)}</a></div></aside>`;
+    }
+    function screenHeader(title, subtitle, back = false) {
+      return `<div class="screen-header">${back ? `<button class="back-button" data-action="back">${icon('back',17)} Back</button>` : `<div><h2 class="screen-title">${title}</h2>${subtitle ? `<p class="screen-subtitle">${subtitle}</p>` : ''}</div>`}<button class="icon-button" data-action="header-action" aria-label="More options">${icon('more',18)}</button></div>`;
+    }
+    function homeScreen() {
+      return `<section class="screen"><div class="home-hero"><div class="eyebrow"><span class="ping"></span> <span id="engineBadge">Engine: dl.py Mapped</span></div><h1>Save the good stuff.<br><span>Keep it close.</span></h1><p>Fast downloads for links, media, and files.</p><form class="input-wrap" id="downloadForm"><span class="input-icon">${icon('link',21)}</span><input id="urlInput" value="${esc(state.input)}" autocomplete="off" placeholder="Paste a link or search by name" aria-label="Paste a link or search by name"/><button class="small-action" type="button" data-action="paste">Paste</button><button class="primary-action" type="submit">${icon('arrow',17)} Analyze</button></form><div class="form-note">${icon('lock',13)} Links stay local. No account needed.</div><div class="quick-row"><button class="quick-chip" data-action="quick" data-value="https://youtu.be/afterglow">${icon('clipboard',13)} Paste from clipboard</button><button class="quick-chip" data-action="quick" data-value="Hindi playlist">${icon('search',13)} Search media</button><button class="quick-chip" data-action="quick" data-value="https://t.me/c/123456/42">${icon('external',13)} Telegram link</button></div></div><div class="grid-2"><div class="surface surface-pad"><div class="section-row"><h3 class="section-title">Recent Downloads</h3><button class="section-link" data-screen="library">See Library</button></div><div class="recent-list"><div class="recent-item"><span class="file-badge">${icon('video',18)}</span><div class="file-info"><strong>Lunar Signals — Official Video</strong><span>1080p · MP4 · 2 min ago</span></div><button class="more" data-action="open-activity" aria-label="Open activity">${icon('more',17)}</button></div><div class="recent-item"><span class="file-badge yellow">${icon('file',18)}</span><div class="file-info"><strong>Physics revision notes</strong><span>PDF · 18.4 MB · Yesterday</span></div><button class="more" data-action="open-library" aria-label="Open library">${icon('more',17)}</button></div><div class="recent-item"><span class="file-badge mint">${icon('music',18)}</span><div class="file-info"><strong>Midnight Drive — audio</strong><span>MP3 · 7.2 MB · Monday</span></div><button class="more" data-action="open-library" aria-label="Open library">${icon('more',17)}</button></div></div></div><div class="surface pulse-card"><span class="mini-label">This Week</span><div class="pulse-value">03</div><p>3 files saved.</p><div class="demo-note">${icon('spark',13)} <b>Repo-backed UI</b> · Engine status in Settings</div></div></div><p class="legal"><b>Quick note:</b> Download only content you can save.</p></section>`;
+    }
+    function analyzeScreen() {
+      const c = state.content;
+      const qualities = [['2160p','4K'],['1440p','2K'],['1080p','Full HD'],['720p','HD'],['480p','SD'],['360p','Low'],['240p','Low'],['144p','Low'],['Audio','MP3 / M4A']];
+      return `<section class="screen">${screenHeader('Ready when you are', 'Choose a format and action.', true)}<div class="surface analysis-hero"><div class="art"><span class="art-play">${icon('play',19)}</span></div><div class="analysis-copy"><div class="source-line"><span class="ping"></span> ${esc(c.source)} · Analyzed</div><h2>${esc(c.title)}</h2><p>${esc(c.description)}</p><div class="meta-row"><span class="meta-pill">${icon('video',11)} ${c.type}</span><span class="meta-pill">${c.duration}</span><span class="meta-pill">${c.size}</span><span class="meta-pill">${c.language}</span></div></div></div><div class="surface choice-surface" style="margin-top:14px"><div class="choice-heading"><h3>Pick your quality</h3><span>Higher quality may be larger</span></div><div class="quality-grid">${qualities.map(q => `<button class="quality ${state.selectedQuality === q[0] ? 'selected' : ''}" data-action="quality" data-value="${q[0]}">${q[0]}<span>${q[1]}</span></button>`).join('')}</div><div class="format-toggle"><button class="format-option ${state.selectedFormat === 'video' ? 'selected' : ''}" data-action="format" data-value="video">${icon('video',14)} Video</button><button class="format-option ${state.selectedFormat === 'audio' ? 'selected' : ''}" data-action="format" data-value="audio">${icon('music',14)} Audio only</button></div><div class="action-grid"><button class="primary-action" data-action="download">${icon('download',17)} Download ${state.selectedQuality}</button><button class="outline-action" data-action="stream">${icon('play',15)} Stream</button><button class="outline-action" data-action="copy-link">${icon('copy',15)} Copy link</button></div><p class="legal">${state.selectedFormat === 'video' ? 'Video and audio may be merged into one MP4 after download.' : 'Audio will be saved in a compatible audio format.'}</p></div></section>`;
+    }
+    function searchScreen() {
+      const q = esc(state.query || 'Your search');
+      const results = [['Afterglow — Official Video','Video · 2026','YouTube','08:42'],['Midnight Drive · Season 1','Series · 2025','NetMirror','8 episodes'],['Physics revision notes','PDF · 2026','SelfStudys','18.4 MB']];
+      return `<section class="screen">${screenHeader('Find something good', 'Find media without leaving the flow.', true)}<div class="search-field">${icon('search',17)}<input id="searchInput" value="${q === 'Your search' ? '' : q}" placeholder="Movie, series, video, or song" aria-label="Search media"/><button class="small-action" data-action="run-search">Search</button></div><div class="section-row" style="margin-top:25px"><h3 class="section-title">Results for “${q}”</h3><span class="meta">3 matches</span></div><div class="stack">${results.map((r,i) => `<button class="result-card" data-action="search-result" data-index="${i}"><span class="result-art">${icon(i === 2 ? 'file' : i === 1 ? 'play' : 'video',22)}</span><span class="result-copy"><strong>${r[0]}</strong><p>${r[1]} · ${r[2]}</p><small>${r[3]} <span style="color:var(--mint)">· Ready to analyze</span></small></span>${icon('arrow',16)}</button>`).join('')}</div><div class="surface empty" style="min-height:180px;margin-top:15px"><div><div class="empty-icon" style="width:45px;height:45px;margin:0 auto 10px">${icon('spark',17)}</div><h3>Search should stay lightweight.</h3><p>Choose a result to continue.</p></div></div></section>`;
+    }
+    function activityScreen() {
+      const active = state.downloads.filter(d => d.status === 'downloading').length;
+      return `<section class="screen">${screenHeader('Activity', active ? `${active} download in progress` : 'Everything is up to date.')}<div class="surface pulse-card" style="min-height:145px;margin-bottom:15px"><span class="mini-label">Today’s rhythm</span><div style="display:flex;align-items:end;justify-content:space-between;gap:20px"><div><div class="pulse-value" style="margin-top:13px">${active ? '01' : '00'}</div><p>${active ? 'One download in progress.' : 'No active downloads right now.'}</p></div><div style="width:115px;height:60px;display:flex;align-items:end;gap:5px;opacity:.85">${[25,42,32,58,43,75,56,88].map((h,i)=>`<i style="height:${h}%;width:9px;border-radius:5px 5px 2px 2px;background:${i > 5 ? 'var(--mint)' : 'rgba(255,255,255,.58)'}"></i>`).join('')}</div></div></div><div class="section-row"><h3 class="section-title">In Motion</h3><span class="meta">Auto-resume On</span></div><div class="stack">${state.downloads.map(d => `<div class="surface download-card"><div class="download-top"><span class="file-badge ${d.status === 'completed' ? 'mint' : ''}">${icon(d.icon,18)}</span><div class="download-title"><strong>${esc(d.title)}</strong><span>${esc(d.source)} · ${esc(d.meta)}</span></div><span class="status-chip ${d.status === 'paused' ? 'paused' : d.status === 'failed' ? 'failed' : ''}">${d.status === 'downloading' ? '<span class="ping"></span> Downloading' : d.status === 'completed' ? `${icon('check',11)} Completed` : d.status}</span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.round(d.progress*100)}%;${d.status === 'completed' ? 'background:var(--mint);box-shadow:none' : ''}"></div></div><div class="progress-meta"><span>${d.status === 'completed' ? 'Saved to Downloads' : `${Math.round(d.progress*100)}% · ${d.speed}`}</span><span>${d.status === 'completed' ? d.eta : `ETA ${d.eta}`}</span></div><div class="download-actions">${d.status === 'completed' ? `<button class="outline-action" data-action="open-library">${icon('folder',14)} Open in Library</button><button class="outline-action" data-action="copy-link">${icon('share',14)} Share</button>` : `<button class="outline-action" data-action="toggle-download" data-id="${d.id}">${icon(d.status === 'paused' ? 'play' : 'pause',14)} ${d.status === 'paused' ? 'Resume' : 'Pause'}</button><button class="outline-action danger" data-action="cancel-download" data-id="${d.id}">${icon('more',14)} Cancel</button>`}</div></div>`).join('')}</div><div class="surface" style="padding:15px;margin-top:14px"><div style="display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px">${icon('spark',15)} <span><b style="color:var(--text)">Quiet logs.</b> Open a download for process details.</span></div></div></section>`;
+    }
+    function libraryScreen() {
+      const files = [['Lunar Signals — Official Video','MP4 · 412 MB · Today','video'],['Physics revision notes','PDF · 18.4 MB · Yesterday','file'],['Midnight Drive — audio','MP3 · 7.2 MB · Monday','music'],['Telegram media_042','MP4 · 86 MB · Monday','video']];
+      return `<section class="screen">${screenHeader('Library', 'Files you chose to keep.') }<div class="search-field" style="margin-bottom:16px">${icon('search',17)}<input placeholder="Search Your Files" aria-label="Search files"/><button class="small-action" data-action="filter">Filter</button></div><div class="section-row"><h3 class="section-title">Recent Files</h3><span class="meta">4 items · 524 MB</span></div><div class="stack">${files.map((f,i)=>`<div class="surface recent-item" style="padding:12px"><span class="file-badge ${f[2] === 'music' ? 'mint' : f[2] === 'file' ? 'yellow' : ''}">${icon(f[2],18)}</span><div class="file-info"><strong>${f[0]}</strong><span>${f[1]}</span></div><button class="more" data-action="file-menu" aria-label="File actions">${icon('more',17)}</button></div>`).join('')}</div><div class="surface" style="margin-top:15px;padding:17px"><div class="section-row" style="margin-bottom:10px"><h3 class="section-title">Storage</h3><span class="meta">524 MB of 32 GB</span></div><div class="progress-track" style="height:7px;margin:0"><div class="progress-fill" style="width:9%;background:linear-gradient(90deg,var(--mint),var(--violet));box-shadow:none"></div></div><p class="legal" style="margin-top:10px">Saved to <b style="color:var(--text)">Downloads / Universal Downloader</b></p></div></section>`;
+    }
+    function settingsScreen() {
+      const row = (i, title, desc, key, control) => `<div class="setting-row"><span class="setting-icon">${icon(i,16)}</span><div class="setting-copy"><strong>${title}</strong><span>${desc}</span></div>${control || `<button class="switch ${state.settings[key] ? 'on' : ''}" data-action="toggle-setting" data-key="${key}" aria-label="Toggle ${title}"></button>`}</div>`;
+      return `<section class="screen">${screenHeader('Settings', 'Set Up your downloads.') }${updateCard()}<div class="surface settings-list"><div class="settings-group">Appearance</div>${row('moon','Dark Theme','A calm, low-glare canvas for late-night saves.','dark')}${row('bell','Notifications','Show progress and completion updates.','notifications')}<div class="settings-group">Downloads</div>${row('folder','Save Location','Downloads / Universal Downloader','',`<button class="outline-action" data-action="choose-folder">Change</button>`)}${row('spark','Default Quality','Ask each time · Best available','',`<button class="outline-action" data-action="choose-quality">Edit</button>`)}${row('clipboard','Clipboard Helper','Offer pasted links when the app opens.','clipboard')}<div class="settings-group">Accounts & Privacy</div>${row('lock','Cookies & Authentication','Credentials stay hidden from logs.','',`<button class="outline-action" data-action="credentials">Manage</button>`)}${row('external','Telegram','Not connected','',`<button class="outline-action" data-action="telegram">Set Up</button>`)}<div class="settings-group">About</div>${row('spark','About Arc','Repo-backed UI · CLI bridge ready.','',`<span class="meta">v0.1</span>`)}</div><p class="legal"><b>Legal note:</b> Download only content you are allowed to save. Availability depends on the source.</p></section>`;
+    }
+    function render() {
+      let content = state.screen === 'home' ? homeScreen() : state.screen === 'analyze' ? analyzeScreen() : state.screen === 'search' ? searchScreen() : state.screen === 'activity' ? activityScreen() : state.screen === 'library' ? libraryScreen() : settingsScreen();
+      app.innerHTML = `<div class="workspace">${sidebar()}<main class="mobile-shell">${content}${navBar()}</main></div>`;
+      const input = document.getElementById('urlInput');
+      if (input) input.focus({preventScroll:true});
+      if (state.screen === 'activity') startSimulation();
+      if (state.screen === 'settings' && state.update.status === 'checking' && !updateRequestActive) checkForUpdates();
+    }
+    function startSimulation() {
+      if (simulationStarted) return;
+      simulationStarted = true;
+      setInterval(() => {
+        const item = state.downloads.find(d => d.status === 'downloading');
+        if (!item) return;
+        item.progress = Math.min(1, item.progress + .012);
+        item.speed = `${(7.8 + Math.random() * 1.5).toFixed(1)} MB/s`;
+        item.eta = item.progress >= 1 ? 'Saved' : `00:${String(Math.max(1, Math.round((1-item.progress)*62))).padStart(2,'0')}`;
+        if (item.progress >= 1) { item.status = 'completed'; item.speed = 'Done'; toast('Download complete · saved to your library'); }
+        if (state.screen === 'activity') render();
+      }, 1300);
+    }
+    function goFromInput(value) {
+      state.input = value.trim();
+      if (!state.input) return toast('Paste a link or search for something first.');
+      if (/^https?:\/\//i.test(state.input)) {
+        state.content = { title: state.input.includes('t.me') ? 'Telegram media_042' : 'Afterglow — Official Video', source: state.input.includes('t.me') ? 'Telegram' : 'YouTube', type: state.input.includes('.pdf') ? 'PDF' : 'Video', duration: state.input.includes('.pdf') ? 'Document' : '08:42', size: state.input.includes('.pdf') ? '18.4 MB' : '412 MB', language: 'English', description: state.input.includes('t.me') ? 'Media is ready to inspect.' : 'Ready for a clean, one-tap download.' };
+        state.screen = 'analyze';
+      } else { state.query = state.input; state.screen = 'search'; }
+      render();
+    }
+    async function copyText(text) { try { await navigator.clipboard.writeText(text); toast('Direct link copied to clipboard'); } catch { toast('Link ready to copy · clipboard permission is unavailable in this preview'); } }
+    app.addEventListener('click', e => {
+      const target = e.target.closest('[data-screen],[data-action]');
+      if (!target) return;
+      if (target.dataset.screen) { state.screen = target.dataset.screen; render(); return; }
+      const action = target.dataset.action;
+      if (action === 'paste') { state.input = 'https://youtu.be/afterglow'; render(); toast('Link pasted from clipboard'); }
+      else if (action === 'quick') { const value = target.dataset.value; if (value === 'search') { state.query = ''; state.screen = 'search'; render(); } else { state.input = value; const input = document.getElementById('urlInput'); if (input) input.focus(); else render(); } }
+      else if (action === 'analyze') goFromInput(state.input);
+      else if (action === 'back') { state.screen = 'home'; render(); }
+      else if (action === 'quality') { state.selectedQuality = target.dataset.value; render(); }
+      else if (action === 'format') { state.selectedFormat = target.dataset.value; render(); }
+      else if (action === 'download') { const item = { id: Date.now(), title: state.content.title, source: state.content.source, meta: `${state.selectedQuality} · ${state.selectedFormat === 'audio' ? 'MP3' : 'MP4'} · ${state.content.size}`, progress: .02, status: 'downloading', speed: 'Starting…', eta: '01:12', icon: state.selectedFormat === 'audio' ? 'music' : 'video' }; state.downloads.unshift(item); state.screen = 'activity'; render(); toast('Download added to Activity'); }
+      else if (action === 'stream') toast('Player handoff simulated · VLC would open here');
+      else if (action === 'copy-link') copyText('https://stream.example/universal-downloader/demo');
+      else if (action === 'check-updates') checkForUpdates(true);
+      else if (action === 'update-app') { fetch('/api/update/apply', { method: 'POST' }).then(async response => { const data = await response.json(); if (data.ok && data.download_url) { window.open(data.download_url, '_blank', 'noopener'); toast('Opening the signed GitHub release'); } else { toast(data.message || 'No signed APK release is available.'); } }).catch(() => toast('GitHub update check failed.')); }
+      else if (action === 'search-result') { const idx = Number(target.dataset.index); state.content = [{title:'Afterglow — Official Video',source:'YouTube',type:'Video',duration:'08:42',size:'412 MB',language:'English',description:'Ready for a clean, one-tap download.'},{title:'Midnight Drive · Season 1',source:'NetMirror',type:'Series',duration:'8 episodes',size:'Varies',language:'Hindi / English',description:'Choose an episode and quality when you are ready.'},{title:'Physics revision notes',source:'SelfStudys',type:'PDF',duration:'Document',size:'18.4 MB',language:'English',description:'A study document ready to save for offline reading.'}][idx]; state.screen='analyze'; render(); }
+      else if (action === 'run-search') { const q = document.getElementById('searchInput')?.value.trim(); state.query = q || state.query || 'Your search'; render(); toast(`Searching for “${state.query}”`); }
+      else if (action === 'toggle-download') { const item=state.downloads.find(d=>String(d.id)===String(target.dataset.id)); if(item){item.status=item.status==='paused'?'downloading':'paused'; render(); toast(item.status==='paused'?'Download paused':'Download resumed');} }
+      else if (action === 'cancel-download') { const item=state.downloads.find(d=>String(d.id)===String(target.dataset.id)); if(item){item.status='paused'; render(); toast('Download paused');} }
+      else if (action === 'open-activity') { state.screen='activity'; render(); }
+      else if (action === 'open-library' || action === 'file-menu') { state.screen='library'; render(); }
+      else if (action === 'toggle-setting') { state.settings[target.dataset.key]=!state.settings[target.dataset.key]; render(); toast(`${target.dataset.key} ${state.settings[target.dataset.key]?'enabled':'disabled'}`); }
+      else if (action === 'choose-folder') toast('Folder picker would open here');
+      else if (action === 'choose-quality') toast('Default Quality sheet would open here');
+      else if (action === 'credentials') toast('Secure credentials manager would open here');
+      else if (action === 'telegram') toast('Telegram setup flow would open here');
+      else if (action === 'filter' || action === 'header-action' || action === 'file-menu') toast('Coming soon in the app');
+    });
+    app.addEventListener('submit', e => { if (e.target.id === 'downloadForm') { e.preventDefault(); goFromInput(document.getElementById('urlInput')?.value || state.input); } });
+    app.addEventListener('input', e => { if (e.target.id === 'urlInput') state.input = e.target.value; if (e.target.id === 'searchInput') state.query = e.target.value; });
+    render();
+    loadEngineStatus();
+  </script>
+</body>
+</html>
