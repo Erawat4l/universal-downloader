@@ -26,6 +26,7 @@ PYTHON_ENGINE_DEST = APP_ROOT / "app" / "src" / "main" / "python" / "dl.py"
 TOOLS_DIR = APP_ROOT / ".tools"
 GRADLE_VERSION = "8.9"
 GRADLE_DISTRIBUTION_URL = f"https://downloads.gradle.org/distributions/gradle-{GRADLE_VERSION}-bin.zip"
+GRADLE_NETWORK_TIMEOUT_MS = "600000"
 ANDROID_API = "35"
 BUILD_TOOLS = "35.0.0"
 REPOSITORY = "Erawat4l/universal-downloader"
@@ -232,19 +233,41 @@ def download_gradle_distribution() -> Path:
     return gradle_bin
 
 
+def pin_wrapper_properties(wrapper_properties: Path) -> None:
+    expected_distribution = f"gradle-{GRADLE_VERSION}-bin.zip"
+    properties = wrapper_properties.read_text(encoding="utf-8") if wrapper_properties.exists() else ""
+    changed = False
+
+    if expected_distribution not in properties or GRADLE_DISTRIBUTION_URL not in properties:
+        properties = re.sub(r"distributionUrl=.*", f"distributionUrl={GRADLE_DISTRIBUTION_URL}", properties)
+        changed = True
+
+    timeout_line = f"networkTimeout={GRADLE_NETWORK_TIMEOUT_MS}"
+    timeout_match = re.search(r"^networkTimeout=.*", properties, re.MULTILINE)
+    if timeout_match:
+        if timeout_match.group(0) != timeout_line:
+            properties = re.sub(r"^networkTimeout=.*", timeout_line, properties, flags=re.MULTILINE)
+            changed = True
+    else:
+        properties = properties.rstrip("\\n") + "\\n" + timeout_line + "\\n"
+        changed = True
+
+    if changed:
+        wrapper_properties.parent.mkdir(parents=True, exist_ok=True)
+        wrapper_properties.write_text(properties, encoding="utf-8")
+
+
 def ensure_wrapper() -> Path:
     wrapper = APP_ROOT / ("gradlew.bat" if os.name == "nt" else "gradlew")
     wrapper_properties = APP_ROOT / "gradle" / "wrapper" / "gradle-wrapper.properties"
-    expected_distribution = f"gradle-{GRADLE_VERSION}-bin.zip"
 
     if wrapper.exists() and wrapper_properties.exists():
-        properties = wrapper_properties.read_text(encoding="utf-8")
-        if expected_distribution not in properties or GRADLE_DISTRIBUTION_URL not in properties:
+        properties_before = wrapper_properties.read_text(encoding="utf-8")
+        if f"gradle-{GRADLE_VERSION}-bin.zip" not in properties_before:
             # A previous Termux run may have generated a wrapper for the
             # system Gradle (for example 9.9). AGP 8.7.3 is built with 8.9.
             say(f"Resetting Gradle wrapper to {GRADLE_VERSION} (existing wrapper was different).")
-            properties = re.sub(r"distributionUrl=.*", f"distributionUrl={GRADLE_DISTRIBUTION_URL}", properties)
-            wrapper_properties.write_text(properties, encoding="utf-8")
+        pin_wrapper_properties(wrapper_properties)
         if os.name != "nt":
             wrapper.chmod(wrapper.stat().st_mode | 0o111)
         return wrapper
@@ -263,6 +286,9 @@ def ensure_wrapper() -> Path:
     run(command)
     if not wrapper.exists():
         raise BuildError("Gradle wrapper generation completed but gradlew was not created.")
+    if not wrapper_properties.exists():
+        raise BuildError("Gradle wrapper generation completed but its properties file was not created.")
+    pin_wrapper_properties(wrapper_properties)
     if os.name != "nt":
         wrapper.chmod(wrapper.stat().st_mode | 0o111)
     return wrapper
