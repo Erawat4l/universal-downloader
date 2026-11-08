@@ -25,6 +25,7 @@ PYTHON_ENGINE_SOURCE = REPOSITORY_ROOT / "dl.py"
 PYTHON_ENGINE_DEST = APP_ROOT / "app" / "src" / "main" / "python" / "dl.py"
 TOOLS_DIR = APP_ROOT / ".tools"
 GRADLE_VERSION = "8.9"
+GRADLE_DISTRIBUTION_URL = f"https://downloads.gradle.org/distributions/gradle-{GRADLE_VERSION}-bin.zip"
 ANDROID_API = "35"
 BUILD_TOOLS = "35.0.0"
 REPOSITORY = "Erawat4l/universal-downloader"
@@ -223,7 +224,7 @@ def download_gradle_distribution() -> Path:
     if gradle_bin.exists():
         return gradle_bin
 
-    url = f"https://services.gradle.org/distributions/gradle-{GRADLE_VERSION}-bin.zip"
+    url = GRADLE_DISTRIBUTION_URL
     say(f"Downloading Gradle {GRADLE_VERSION}…")
     urllib.request.urlretrieve(url, archive)
     with zipfile.ZipFile(archive) as bundle:
@@ -238,11 +239,11 @@ def ensure_wrapper() -> Path:
 
     if wrapper.exists() and wrapper_properties.exists():
         properties = wrapper_properties.read_text(encoding="utf-8")
-        if expected_distribution not in properties:
+        if expected_distribution not in properties or GRADLE_DISTRIBUTION_URL not in properties:
             # A previous Termux run may have generated a wrapper for the
             # system Gradle (for example 9.9). AGP 8.7.3 is built with 8.9.
             say(f"Resetting Gradle wrapper to {GRADLE_VERSION} (existing wrapper was different).")
-            properties = re.sub(r"gradle-[^/]+-(?:bin|all)\.zip", expected_distribution, properties)
+            properties = re.sub(r"distributionUrl=.*", f"distributionUrl={GRADLE_DISTRIBUTION_URL}", properties)
             wrapper_properties.write_text(properties, encoding="utf-8")
         if os.name != "nt":
             wrapper.chmod(wrapper.stat().st_mode | 0o111)
@@ -250,7 +251,13 @@ def ensure_wrapper() -> Path:
 
     gradle = shutil.which("gradle.bat" if os.name == "nt" else "gradle")
     gradle_command = gradle or str(download_gradle_distribution())
-    command = [gradle_command, "wrapper", f"--gradle-version={GRADLE_VERSION}", "--distribution-type=bin"]
+    command = [
+        gradle_command,
+        "wrapper",
+        f"--gradle-version={GRADLE_VERSION}",
+        "--gradle-distribution-url={GRADLE_DISTRIBUTION_URL}",
+        "--distribution-type=bin",
+    ]
     if os.name == "nt":
         command = ["cmd", "/d", "/c", *command]
     run(command)
