@@ -18,4 +18,23 @@ object EmbeddedEngine {
         val rawResponse = module.callAttr("run_app_json_request_json", request.toString())
         return JSONObject(rawResponse.toString())
     }
+
+    fun getProgress(jobId: String? = null): JSONObject {
+        if (!Python.isStarted()) return JSONObject()
+        return try {
+            val module = Python.getInstance().getModule("dl")
+            val raw = module.callAttr("get_download_progress_json", jobId ?: "")
+            JSONObject(raw.toString())
+        } catch (_: Exception) {
+            JSONObject()
+        }
+    }
+
+    fun cancel(jobId: String) {
+        if (!Python.isStarted()) return
+        try {
+            val module = Python.getInstance().getModule("dl")
+            module.callAttr("cancel_download", jobId)
+        } catch (_: Exception) {}
+    }
 }

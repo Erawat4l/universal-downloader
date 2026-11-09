@@ -483,25 +483,58 @@ def wait_for_network():
 PROGRESS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 PROGRESS_SPINNER_INDEX = 0
 
+CURRENT_DOWNLOAD_JOB_ID = None
+ACTIVE_DOWNLOAD_PROGRESS = {}
+CANCELLED_DOWNLOAD_JOBS = set()
+
+def get_download_progress(job_id=None):
+    if job_id:
+        return ACTIVE_DOWNLOAD_PROGRESS.get(str(job_id), {})
+    return ACTIVE_DOWNLOAD_PROGRESS
+
+def get_download_progress_json(job_id=None):
+    return json.dumps(get_download_progress(job_id), ensure_ascii=False)
+
+def cancel_download(job_id):
+    if job_id:
+        j_str = str(job_id)
+        CANCELLED_DOWNLOAD_JOBS.add(j_str)
+        if j_str in ACTIVE_DOWNLOAD_PROGRESS:
+            ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Cancelled"
+    return True
+
 def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--"):
     """Render a sleek, animated single-line progress bar guaranteed not to wrap or spam."""
-    global PROGRESS_SPINNER_INDEX
-    try:
-        cols = shutil.get_terminal_size((70, 20)).columns
-    except Exception:
-        cols = 70
+    global PROGRESS_SPINNER_INDEX, CURRENT_DOWNLOAD_JOB_ID, ACTIVE_DOWNLOAD_PROGRESS
     try:
         pct = max(0.0, min(100.0, float(percent)))
     except Exception:
         pct = 0.0
 
-    spin = PROGRESS_SPINNER_FRAMES[PROGRESS_SPINNER_INDEX % len(PROGRESS_SPINNER_FRAMES)]
-    PROGRESS_SPINNER_INDEX += 1
-
     spd_clean = speed_str if ('s' in speed_str.lower() or speed_str.lower() in ('--', 'done', 'complete')) else f"{speed_str}/s"
     eta_clean = f"ETA {eta_str}" if not eta_str.lower().startswith('eta') else eta_str
 
-    # Info text without ANSI for calculating terminal width
+    if CURRENT_DOWNLOAD_JOB_ID:
+        ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
+            "percent": round(pct, 1),
+            "downloaded_str": total_str.split('/')[0] if '/' in total_str else total_str,
+            "total_str": total_str.split('/')[1] if '/' in total_str else "--",
+            "speed": spd_clean,
+            "eta": eta_clean,
+            "status": "Downloading"
+        }
+
+    if not sys.stdout.isatty():
+        return
+
+    try:
+        cols = shutil.get_terminal_size((70, 20)).columns
+    except Exception:
+        cols = 70
+
+    spin = PROGRESS_SPINNER_FRAMES[PROGRESS_SPINNER_INDEX % len(PROGRESS_SPINNER_FRAMES)]
+    PROGRESS_SPINNER_INDEX += 1
+
     info_plain = f" {pct:5.1f}% | {total_str} | {spd_clean} | {eta_clean}"
     overhead = len(info_plain) + 6
     bar_width = max(5, min(24, cols - overhead))
@@ -514,7 +547,7 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
     empty_blocks = max(0, bar_width - full_blocks - (1 if frac_char else 0))
 
     bar_colored = f"\033[38;5;45m{'█' * full_blocks}{frac_char}\033[38;5;238m{'░' * empty_blocks}\033[0m"
-    line = f"\033[1;36m{spin}\033[0m [{bar_colored}] \033[1;97m{pct:5.1f}%\033[0m | \033[38;5;153m{total_str}\033[0m | \033[38;5;220m⚡ {spd_clean}\033[0m | \033[38;5;141m⏳ {eta_clean}\033[0m"
+    line = f"\033[1;36m{spin}\033[0m [{bar_colored}] \033[1;97m{pct:5.1f}%\033[0m | \033[38;5;153m{total_str}\033[0m | \033[38;5;220m{spd_clean}\033[0m | \033[38;5;141m{eta_clean}\033[0m"
 
     sys.stdout.write(f"\r\033[K{line}")
     sys.stdout.flush()
@@ -667,11 +700,19 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None):
                 if mode == 'wb':
                     downloaded = 0
 
-                print(f"➜ Saving to: {dest_path}")
+                print(f"> Saving to: {dest_path}")
                 last_time = time.time()
                 last_downloaded = downloaded
                 with open(dest_path, mode) as f:
                     for chunk in r.iter_content(chunk_size=65536):
+                        if CURRENT_DOWNLOAD_JOB_ID and CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
+                            print("\n[STOP] Download cancelled by user.")
+                            try:
+                                if os.path.exists(dest_path):
+                                    os.remove(dest_path)
+                            except Exception:
+                                pass
+                            return None
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
@@ -1358,12 +1399,12 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
 
     raise Exception("Could not download Telegram link media.")
 
-def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None):
+def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None):
     if direct_link_only:
         action_mode = 'direct_link_only'
     if not action_mode:
         action_mode = 'stream_and_download'
-    print("➜ Detected NetMirror link...")
+    print("> Detected NetMirror link...")
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
     
@@ -1423,6 +1464,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     title = meta.get('title') or meta.get('name') or f"netmirror_{media_id}"
     year = meta.get('release_date', '').split(',')[-1].strip() if meta.get('release_date') else '2024'
     embed_json = meta.get('embed_json') or []
+    season_list = meta.get('season') or []
+    is_tv_series = (media_type == 'tv') or bool(season_list) or bool(embed_json)
+    poster = meta.get('backdrop_path') or meta.get('poster') or ''
     direct_stream_url = None
     stream_headers = {
         'User-Agent': HEADERS['User-Agent'],
@@ -1432,9 +1476,46 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
     clean_title = (meta.get('title') or meta.get('name') or title).strip()
 
-    if not embed_json:
-        # Movie / Single title: Resolve stream via vidsync / NetMirror external & watchbox server APIs
-        print(f"\n➜ Resolving direct stream for movie: {clean_title}")
+    if is_tv_series and action_mode in ('direct_link_only', 'direct') and target_season is None and target_episode is None:
+        formatted_seasons = []
+        if season_list:
+            for s in season_list:
+                formatted_seasons.append({
+                    "season": int(s.get('se', 1)),
+                    "episodes": int(s.get('ep', 1))
+                })
+        elif embed_json:
+            se_dict = {}
+            for item in embed_json:
+                se_num = int(item.get('se', 1))
+                se_dict[se_num] = se_dict.get(se_num, 0) + 1
+            for se_num, ep_count in sorted(se_dict.items()):
+                formatted_seasons.append({
+                    "season": se_num,
+                    "episodes": ep_count
+                })
+        if not formatted_seasons:
+            formatted_seasons = [{"season": 1, "episodes": 1}]
+
+        return {
+            "is_series": True,
+            "title": clean_title,
+            "source": "NetMirror",
+            "poster": poster,
+            "seasons": formatted_seasons,
+            "url": url,
+            "id": media_id,
+        }
+
+    se_val = str(target_season if target_season is not None else 1) if is_tv_series else '0'
+    ep_val = str(target_episode if target_episode is not None else 1) if is_tv_series else '0'
+    tv_val = '1' if is_tv_series else ''
+    display_title = f"{clean_title} S{se_val}E{ep_val}" if is_tv_series else clean_title
+
+    if not embed_json or is_tv_series:
+        # Resolve stream via vidsync / NetMirror external & watchbox server APIs
+        kind_label = f"series episode S{se_val}E{ep_val}" if is_tv_series else "movie"
+        print(f"\n> Resolving direct stream for {kind_label}: {display_title}")
         
         target_lang = None
         title_lower = title.lower()
@@ -1503,9 +1584,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
             sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
             wb_params = {
-                'id': subjectid, 'se': '0', 'ep': '0', 'dp': dp, 'na': na_b64, 'year': year,
+                'id': subjectid, 'se': se_val, 'ep': ep_val, 'dp': dp, 'na': na_b64, 'year': year,
                 'tm_id': tm_id, 'ts': str(ts), 'sig': sig_tm, 'nid': media_id, 'exten': '1',
-                'tv': '', 'token': '', 'warp': 'false', '_': str(int(time.time() * 1000))
+                'tv': tv_val, 'token': '', 'warp': 'false', '_': str(int(time.time() * 1000))
             }
             wb_query = urllib.parse.urlencode(wb_params)
             
@@ -1536,7 +1617,13 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             if u not in [c[0] for c in candidate_streams]:
                                 candidate_streams.append((u, dom))
 
-                        # 3. Extract art.tvVideoUrl
+                        # 3. Extract art.url
+                        for m_art in re.finditer(r'art\.url\s*=\s*play_url\([\"\']([^\"\']+)[\"\']', wb_r.text):
+                            u = m_art.group(1).strip()
+                            if u and u.startswith(('http://', 'https://')) and u not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((u, dom))
+
+                        # 4. Extract art.tvVideoUrl
                         for m_tv in re.finditer(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
                             raw_val = m_tv.group(1)
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
@@ -1584,7 +1671,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                 chosen_q_key = k
                                 break
                     if not chosen_q_key:
-                        if len(sorted_q) > 1 and sys.stdin.isatty():
+                        if action_mode not in ('direct_link_only', 'direct') and len(sorted_q) > 1 and sys.stdin.isatty():
                             print("\n" + "="*65)
                             print(f" Select Video Quality for: {clean_title}")
                             print("="*65)
@@ -1744,27 +1831,40 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             print("="*65)
             return None
 
-        clean_name = out_name or clean_filename(f"{title}_S{target_item.get('se',1)}E{target_item.get('ep',1)}", default_ext=".mp4")
+        clean_name = out_name or clean_filename(display_title, default_ext=".mp4")
 
-    print(f"➜ Bypassed NetMirror Stream: {title}")
+    print(f"> Bypassed NetMirror Stream: {display_title}")
     
     stream_headers = get_stream_headers_for_url(direct_stream_url, stream_headers)
 
     print("\n" + "="*65)
-    print(" 🚀 DIRECT STREAM LINK FOR ADM / 1DM (NO PRE-DOWNLOAD NEEDED):")
+    print(" [STREAM] DIRECT PLAYABLE STREAM READY:")
     print("="*65)
-    print(f" 🔗 Copy & Paste into ADM App: {direct_stream_url}")
+    print(f" [URL] {direct_stream_url}")
     if stream_headers.get('Referer'):
-        print(f" 🌐 Referer Header (if needed): {stream_headers['Referer']}")
+        print(f" [REFERER] {stream_headers['Referer']}")
     print("="*65 + "\n")
-    # Always save the ~300KB .m3u8 stream shortcut file with headers
-    m3u8_file = save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
+    
+    # Save .m3u8 stream shortcut ONLY if action_mode is stream or stream_and_download
+    if action_mode in ('stream_only', 'stream', 'stream_and_download'):
+        save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
 
     if action_mode in ('direct_link_only', 'direct'):
-        return direct_stream_url
+        return {
+            "url": direct_stream_url,
+            "title": display_title,
+            "source": "NetMirror",
+            "poster": poster,
+            "quality": quality_arg or "best",
+            "qualities": list(valid_qualities.keys()) if 'valid_qualities' in locals() and valid_qualities else ["Best", "1080p", "720p", "480p"],
+            "stream_headers": stream_headers,
+            "is_series": is_tv_series,
+            "season": int(se_val) if is_tv_series else None,
+            "episode": int(ep_val) if is_tv_series else None,
+        }
 
     if action_mode in ('stream_only', 'stream', 'stream_and_download'):
-        launch_player(direct_stream_url, player_choice="vlc", custom_headers=stream_headers, title=clean_title)
+        launch_player(direct_stream_url, player_choice="vlc", custom_headers=stream_headers, title=display_title)
 
     if action_mode in ('stream_only', 'stream'):
         print("\n" + "="*65)
@@ -2034,6 +2134,19 @@ def search_netmirror(query):
         if cleaned_words and cleaned_words not in queries_to_try:
             queries_to_try.append(cleaned_words)
 
+        # Singular and plural word variations (e.g. Son of Anarchy <-> Sons of Anarchy)
+        words = norm_q.split()
+        for i, w in enumerate(words):
+            if len(w) > 2:
+                if not w.lower().endswith('s'):
+                    v = ' '.join(words[:i] + [w + 's'] + words[i+1:])
+                    if v not in queries_to_try:
+                        queries_to_try.append(v)
+                elif w.lower().endswith('s'):
+                    v = ' '.join(words[:i] + [w[:-1]] + words[i+1:])
+                    if v not in queries_to_try:
+                        queries_to_try.append(v)
+
         def parse_year(rel_date):
             if not rel_date: return 0
             try:
@@ -2088,6 +2201,7 @@ def search_netmirror(query):
                             num_year = parse_year(rel_date)
                             if media_id:
                                 nm_url = f"https://netmirror.center/{m_type}/{media_id}"
+                                poster = item.get('backdrop_path') or item.get('poster') or item.get('pic') or ''
                                 parsed.append({
                                     'title': title,
                                     'type': m_type.upper() if m_type else 'MOVIE/SERIES',
@@ -2095,7 +2209,8 @@ def search_netmirror(query):
                                     'year': year,
                                     'num_year': num_year,
                                     'url': nm_url,
-                                    'source': 'NetMirror'
+                                    'source': 'NetMirror',
+                                    'poster': poster,
                                 })
                         if parsed:
                             return sorted(parsed, key=lambda x: rank_score(x, norm_q.lower()))
@@ -2108,26 +2223,52 @@ def search_netmirror(query):
             if res:
                 return res
 
-        # If still no results, use Google Suggestion for typo / spelling correction
+        # Fallback 1: Wikipedia opensearch for accurate movie / series spelling
         try:
-            suggest_url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote(norm_q + ' series')}"
-            s_res = requests.get(suggest_url, timeout=3).json()
-            if len(s_res) > 1 and s_res[1]:
-                for sug in s_res[1][:3]:
-                    cleaned_sug = sug
-                    for noise in ['netflix series', 'web series', 'series cast', 'series review', 'series rating', 'series', 'imdb', 'cast']:
-                        cleaned_sug = re.sub(rf'\b{noise}\b', '', cleaned_sug, flags=re.I).strip()
-                    cand = ' '.join(cleaned_sug.split())
-                    if cand and len(cand) > 2 and cand.lower() != norm_q.lower():
-                        res = query_api(cand)
+            wiki_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(norm_q)}&limit=5&namespace=0&format=json"
+            wiki_res = requests.get(wiki_url, headers={'User-Agent': 'universal-downloader/1.0'}, timeout=3).json()
+            if len(wiki_res) > 1 and wiki_res[1]:
+                for candidate in wiki_res[1]:
+                    cand_clean = re.sub(r'\(.*?\)', '', candidate).strip()
+                    for noise in ['series', 'tv series', 'movie', 'film', 'season']:
+                        cand_clean = re.sub(rf'\b{noise}\b', '', cand_clean, flags=re.I).strip()
+                    cand_clean = ' '.join(cand_clean.split())
+                    if cand_clean and cand_clean.lower() != norm_q.lower():
+                        res = query_api(cand_clean)
                         if res:
                             return res
-                        if '&' in cand:
-                            res = query_api(cand.replace('&', 'and'))
-                            if res: return res
-                        elif 'and' in cand.lower():
-                            res = query_api(re.sub(r'\band\b', '&', cand, flags=re.I))
-                            if res: return res
+                        if not cand_clean.lower().endswith('s'):
+                            res = query_api(cand_clean + 's')
+                            if res:
+                                return res
+        except Exception:
+            pass
+
+        # Fallback 2: Google Suggestion for typo / spelling correction
+        try:
+            for s_q in [norm_q, norm_q + ' series', norm_q + ' movie']:
+                suggest_url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote(s_q)}"
+                s_res = requests.get(suggest_url, timeout=3).json()
+                if len(s_res) > 1 and s_res[1]:
+                    for sug in s_res[1][:5]:
+                        cleaned_sug = sug
+                        for noise in ['netflix series', 'web series', 'series cast', 'series review', 'series rating', 'series', 'imdb', 'cast', 'movie', 'film', 'ott', 'where to watch', 'meaning', 'in hindi', 'jacket', 'bike', 'season']:
+                            cleaned_sug = re.sub(rf'\b{noise}\b', '', cleaned_sug, flags=re.I).strip()
+                        cand = ' '.join(cleaned_sug.split())
+                        if cand and len(cand) > 2 and cand.lower() != norm_q.lower():
+                            res = query_api(cand)
+                            if res:
+                                return res
+                            if not cand.lower().endswith('s'):
+                                res = query_api(cand + 's')
+                                if res:
+                                    return res
+                            if '&' in cand:
+                                res = query_api(cand.replace('&', 'and'))
+                                if res: return res
+                            elif 'and' in cand.lower():
+                                res = query_api(re.sub(r'\band\b', '&', cand, flags=re.I))
+                                if res: return res
         except Exception:
             pass
 
@@ -2252,18 +2393,24 @@ def group_and_deduplicate_results(results):
         else: aud = 'English'
 
         key = (clean_t.lower(), m_type, yr)
+        poster_url = it.get('poster') or it.get('backdrop_path') or ''
         if key not in groups:
             groups[key] = {
                 'title': clean_t,
                 'type': m_type.upper(),
                 'year': yr,
+                'poster': poster_url,
                 'audios': {},
                 'items': []
             }
+        elif not groups[key].get('poster') and poster_url:
+            groups[key]['poster'] = poster_url
+
         groups[key]['audios'][aud] = {
             'id': m_id,
             'title': t,
-            'url': it.get('url') or f"https://netmirror.center/{m_type}/{m_id}"
+            'url': it.get('url') or f"https://netmirror.center/{m_type}/{m_id}",
+            'poster': poster_url,
         }
         groups[key]['items'].append(it)
 
@@ -2779,13 +2926,16 @@ def app_search_youtube(query):
         if not entry:
             continue
         duration = entry.get("duration")
+        entry_id = entry.get("id") or ""
+        poster = entry.get("thumbnail") or (entry.get("thumbnails", [{}])[-1].get("url") if entry.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{entry_id}/hqdefault.jpg" if entry_id else "")
         results.append({
             "title": entry.get("title") or "Untitled",
             "source": "YouTube",
             "uploader": entry.get("uploader") or entry.get("channel") or "",
             "duration": duration,
-            "url": entry.get("webpage_url") or entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}",
-            "id": entry.get("id"),
+            "url": entry.get("webpage_url") or entry.get("url") or (f"https://www.youtube.com/watch?v={entry_id}" if entry_id else ""),
+            "id": entry_id,
+            "poster": poster,
         })
     return results
 
@@ -2814,7 +2964,9 @@ def app_search(query, platform="netmirror"):
                 "title": item.get("title", ""),
                 "url": item.get("url", ""),
                 "id": item.get("id"),
+                "poster": item.get("poster", "") or group.get("poster", ""),
             })
+        first_url = audio_items[0]["url"] if audio_items else ""
         results.append({
             "title": group.get("title", ""),
             "type": group.get("type", "MOVIE"),
@@ -2822,12 +2974,14 @@ def app_search(query, platform="netmirror"):
             "audios": audio_items,
             "providers": group.get("otts", []),
             "source": "NetMirror",
+            "poster": group.get("poster", ""),
+            "url": first_url,
         })
     print(f"[OK] Grouped into {len(results)} distinct title(s) with audio tracks.")
     return {"platform": "netmirror", "results": results}
 
 
-def app_resolve(url, quality="best"):
+def app_resolve(url, quality="best", season=None, episode=None):
     if not url:
         raise Exception("A URL is required")
     lower = url.lower()
@@ -2836,29 +2990,74 @@ def app_resolve(url, quality="best"):
 
     if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
         print("> Connecting to stream endpoint and resolving qualities...")
-        direct = handle_netmirror(url, action_mode="direct_link_only", quality_arg=quality)
-        if not direct:
+        res = handle_netmirror(
+            url,
+            action_mode="direct_link_only",
+            quality_arg=quality,
+            target_season=season,
+            target_episode=episode,
+        )
+        if not res:
             raise Exception("No active stream was found for this NetMirror link")
-        print(f"[OK] Direct stream URL resolved: {direct[:60]}...")
-        # Return real detected movie qualities if available
-        real_qualities = ["Best", "1080p", "720p", "480p"]
+        if isinstance(res, dict):
+            return res
         return {
-            "url": direct,
+            "url": res,
             "title": "Resolved stream",
             "source": "NetMirror",
             "quality": quality,
-            "qualities": real_qualities,
+            "qualities": ["Best", "1080p", "720p", "480p"],
         }
 
     if any(host in lower for host in ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "facebook.com", "instagram.com"]):
         if not HAS_YTDLP:
             raise Exception("yt-dlp is not available")
+        
+        is_playlist = ("list=" in lower or "playlist" in lower)
+        if is_playlist:
+            print("> Detecting playlist entries...")
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": "in_playlist",
+                "socket_timeout": 8,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            entries_raw = info.get("entries", []) or []
+            entries_list = []
+            for i, e in enumerate(entries_raw[:60]):
+                if not e: continue
+                e_id = e.get("id") or ""
+                e_title = e.get("title") or f"Item #{i+1}"
+                e_url = f"https://www.youtube.com/watch?v={e_id}" if e_id else e.get("url", "")
+                e_thumb = (e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{e_id}/hqdefault.jpg" if e_id else "")
+                entries_list.append({
+                    "id": e_id,
+                    "title": e_title,
+                    "url": e_url,
+                    "thumbnail": e_thumb,
+                    "duration": e.get("duration", 0),
+                })
+            print(f"[OK] Playlist recognized: {info.get('title', 'Playlist')} ({len(entries_raw)} items)")
+            return {
+                "is_playlist": True,
+                "title": info.get("title", "YouTube Playlist"),
+                "source": "YouTube Playlist",
+                "poster": entries_list[0]["thumbnail"] if entries_list else "",
+                "total_count": len(entries_raw),
+                "entries": entries_list,
+                "url": url,
+            }
+
         print("> Analyzing video manifest with yt-dlp...")
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
+            "noplaylist": True,
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+            "socket_timeout": 10,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
@@ -2902,11 +3101,14 @@ def app_resolve(url, quality="best"):
         if len(real_qualities) <= 1:
             real_qualities = ["Best", "1080p", "720p", "480p"]
 
+        thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get('id') else "")
+
         print(f"[OK] Stream resolved: {info.get('title', 'Video')}")
         return {
             "url": stream_url,
             "title": info.get("title", "Resolved video"),
             "source": info.get("extractor_key", "Video source"),
+            "poster": thumb,
             "quality": quality,
             "qualities": real_qualities,
             "audio_only": False,
@@ -2963,13 +3165,28 @@ def app_resolve(url, quality="best"):
 
 
 def app_download(payload):
+    global CURRENT_DOWNLOAD_JOB_ID
+    CURRENT_DOWNLOAD_JOB_ID = str(payload.get("job_id") or payload.get("id") or "job")
     url = str(payload.get("url", "")).strip()
     quality = str(payload.get("quality", "best")).strip() or "best"
     out_name = payload.get("out_name") or None
     target_dir = payload.get("target_dir") or DEFAULT_DIR
     cookie = payload.get("cookie") or None
     telegram_config = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else None
+    season = payload.get("season")
+    episode = payload.get("episode")
     lower = url.lower()
+
+    ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
+        "percent": 0.0,
+        "downloaded_str": "0 MB",
+        "total_str": "--",
+        "speed": "--",
+        "eta": "--",
+        "status": "Downloading",
+        "path": "",
+    }
+
     print(f"> Starting download for: {url}")
     print(f"> Save directory: {target_dir}")
     print(f"> Quality profile: {quality}")
@@ -2981,6 +3198,8 @@ def app_download(payload):
             target_dir=target_dir,
             action_mode="download_only",
             quality_arg=quality,
+            target_season=season,
+            target_episode=episode,
         )
     elif any(domain in lower for domain in ["t.me/", "telegram.me/", "telegram.dog/"]):
         path = handle_telegram(
@@ -2997,9 +3216,22 @@ def app_download(payload):
             target_dir=target_dir,
             quality_arg=quality,
             standalone=True,
+            noplaylist=True,
         )
     if not path:
+        if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
+            return {"cancelled": True, "status": "Cancelled"}
         raise Exception("The downloader returned no output file")
+
+    ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
+        "percent": 100.0,
+        "downloaded_str": "Done",
+        "total_str": "Done",
+        "speed": "Done",
+        "eta": "0s",
+        "status": "Complete",
+        "path": path,
+    }
     return {"path": path, "quality": quality, "target_dir": target_dir}
 
 
@@ -3007,6 +3239,11 @@ def run_app_json_request(payload):
     action = str(payload.get("action", "")).lower().strip()
     if action == "capabilities":
         return {"ok": True, "capabilities": app_cli_capabilities()}
+    if action == "progress":
+        return {"ok": True, "progress": get_download_progress(payload.get("job_id"))}
+    if action == "cancel":
+        cancel_download(payload.get("job_id"))
+        return {"ok": True, "cancelled": payload.get("job_id")}
 
     output = io.StringIO()
     try:
@@ -3014,14 +3251,30 @@ def run_app_json_request(payload):
             if action == "search":
                 result = app_search(payload.get("query", ""), payload.get("platform", "netmirror"))
             elif action == "resolve":
-                result = app_resolve(payload.get("url", ""), payload.get("quality", "best"))
+                result = app_resolve(
+                    payload.get("url", ""),
+                    quality=payload.get("quality", "best"),
+                    season=payload.get("season"),
+                    episode=payload.get("episode")
+                )
             elif action == "download":
                 result = app_download(payload)
             else:
-                raise Exception("Unknown app action. Use capabilities, search, resolve, or download.")
-        return {"ok": True, "action": action, "result": result, "logs": output.getvalue()[-12000:]}
+                raise Exception("Unknown app action. Use capabilities, search, resolve, download, progress, or cancel.")
+        
+        raw_logs = output.getvalue()
+        # Clean ANSI escape sequences, spinner control characters, and emojis
+        clean_logs = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\([a-zA-Z]', '', raw_logs)
+        clean_logs = re.sub(r'[\r\x00-\x08\x0b\x0c\x0e-\x1f]', '', clean_logs)
+        clean_logs = re.sub(r'\n{3,}', '\n\n', clean_logs).strip()
+
+        return {"ok": True, "action": action, "result": result, "logs": clean_logs[-12000:]}
     except Exception as error:
-        return {"ok": False, "action": action, "error": str(error), "logs": output.getvalue()[-12000:]}
+        raw_logs = output.getvalue()
+        clean_logs = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\([a-zA-Z]', '', raw_logs)
+        clean_logs = re.sub(r'[\r\x00-\x08\x0b\x0c\x0e-\x1f]', '', clean_logs)
+        clean_logs = re.sub(r'\n{3,}', '\n\n', clean_logs).strip()
+        return {"ok": False, "action": action, "error": str(error), "logs": clean_logs[-12000:]}
 
 
 def run_app_json_request_json(raw_payload):
