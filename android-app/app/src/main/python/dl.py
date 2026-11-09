@@ -130,7 +130,7 @@ def sync_to_sdcard_if_needed(file_path):
             if "device" in res.stdout and "emulator" in res.stdout or len(res.stdout.strip().splitlines()) > 1:
                 push_res = subprocess.run(["adb", "push", file_path, dest_sdcard], capture_output=True, text=True, timeout=60)
                 if push_res.returncode == 0:
-                    print(f"✔ Synced to: {dest_sdcard}")
+                    print(f"[OK] Synced to: {dest_sdcard}")
         except Exception:
             pass
 
@@ -195,10 +195,10 @@ def print_adm_link(file_path):
     lan_url = f"http://{my_ip}:8080/{encoded}"
     
     print("\n" + "="*65)
-    print(" 🚀 DIRECT LINK FOR ADM (ADVANCED DOWNLOAD MANAGER):")
+    print("  DIRECT LINK FOR ADM (ADVANCED DOWNLOAD MANAGER):")
     print("="*65)
-    print(f" 🔗 Copy & Paste into ADM App: {local_url}")
-    print(f" 🌐 Wi-Fi LAN Download Link:  {lan_url}")
+    print(f"  Copy & Paste into ADM App: {local_url}")
+    print(f"  Wi-Fi LAN Download Link:  {lan_url}")
     print("="*65 + "\n")
 
 def get_stream_headers_for_url(url, base_headers=None):
@@ -335,7 +335,7 @@ def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=No
                 adb_cmd += " -p org.videolan.vlc"
             adb_res = subprocess.run(["adb", "shell", adb_cmd], capture_output=True, text=True, timeout=3)
             if adb_res.returncode == 0:
-                print("🎬 Streaming opened in VLC Player!")
+                print(" Streaming opened in VLC Player!")
                 return True
     except Exception:
         pass
@@ -347,7 +347,7 @@ def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=No
             am_cmd.extend(["-p", "org.videolan.vlc"])
         res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
         if res.returncode == 0:
-            print("🎬 Streaming opened in VLC Player!")
+            print(" Streaming opened in VLC Player!")
             return True
     except Exception:
         pass
@@ -357,13 +357,13 @@ def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=No
         am_cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_uri, "-t", "video/*"]
         res = subprocess.run(am_cmd, capture_output=True, text=True, timeout=2, env=clean_env)
         if res.returncode == 0:
-            print("🎬 Streaming opened in default video player!")
+            print(" Streaming opened in default video player!")
             return True
     except Exception:
         pass
 
     # The Android UI owns media intents when this engine is embedded in the APK.
-    print(f"⚠ Could not launch media player automatically. Stream link: {play_uri}")
+    print(f"[WARN] Could not launch media player automatically. Stream link: {play_uri}")
     return False
 
 def save_m3u8_stream_file(url, title, target_dir=None):
@@ -388,7 +388,7 @@ def save_m3u8_stream_file(url, title, target_dir=None):
                     with open(file_path, 'wb') as f:
                         f.write(full_content)
                     sync_to_sdcard_if_needed(file_path)
-                    print(f"📄 Saved instant stream playlist ({len(full_content)//1024} KB) to: {file_path}")
+                    print(f" Saved instant stream playlist ({len(full_content)//1024} KB) to: {file_path}")
                     return file_path
         except Exception:
             pass
@@ -402,7 +402,7 @@ def save_m3u8_stream_file(url, title, target_dir=None):
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
         sync_to_sdcard_if_needed(file_path)
-        print(f"📄 Saved instant stream playlist to: {file_path}")
+        print(f" Saved instant stream playlist to: {file_path}")
         return file_path
     except Exception:
         pass
@@ -466,8 +466,8 @@ def wait_for_network():
     if check_network():
         return
     print("\n" + "!"*60)
-    print(" ⚠ Network connection lost! Download paused.")
-    print(" ➜ Waiting for internet connection to recover...")
+    print(" [WARN] Network connection lost! Download paused.")
+    print(" > Waiting for internet connection to recover...")
     print("!"*60, flush=True)
     
     down_start = time.time()
@@ -476,8 +476,8 @@ def wait_for_network():
         
     down_duration = int(time.time() - down_start)
     print("\n" + "="*60)
-    print(f" ✔ Network connection restored (was offline for {down_duration}s)!")
-    print(" ➜ Resuming download...")
+    print(f" [OK] Network connection restored (was offline for {down_duration}s)!")
+    print(" > Resuming download...")
     print("="*60, flush=True)
 
 PROGRESS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -652,16 +652,16 @@ def run_command_with_clean_progress(cmd):
                     p.kill()
                 except Exception:
                     pass
-        sys.stdout.write("\n⚠ Download interrupted by user.\n")
+        sys.stdout.write("\n[WARN] Download interrupted by user.\n")
         sys.stdout.flush()
         return -1
     except Exception as e:
-        print(f"✖ Process execution error: {e}")
+        print(f"[FAIL] Process execution error: {e}")
         return 1
 
 def download_file_stream(url, filename, custom_headers=None, target_dir=None):
     headers = get_stream_headers_for_url(url, {**HEADERS, **(custom_headers or {})})
-    print(f"➜ Fetching: {url}")
+    print(f"> Fetching: {url}")
     
     dest_path = get_dest_path(filename, target_dir)
     downloaded = 0
@@ -742,12 +742,12 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None):
             if not check_network():
                 wait_for_network()
             else:
-                print(f"\n⚠ Network hiccup: {e}. Retrying in 3s...", flush=True)
+                print(f"\n[WARN] Network hiccup: {e}. Retrying in 3s...", flush=True)
                 time.sleep(3)
 
     sys.stdout.write("\n")
     sys.stdout.flush()
-    print("✔ Download complete!")
+    print("[OK] Download complete!")
     sync_to_sdcard_if_needed(dest_path)
     return dest_path
 
@@ -759,7 +759,7 @@ def handle_bypasser(url, out_name=None, target_dir=None):
         if direct_url and isinstance(direct_url, str) and not direct_url.startswith("ERROR:") and direct_url.startswith(("http://", "https://", "//")):
             if direct_url.startswith("//"):
                 direct_url = "https:" + direct_url
-            print(f"➜ Direct link bypassed: {direct_url[:80]}...")
+            print(f"> Direct link bypassed: {direct_url[:80]}...")
             parsed = urllib.parse.urlparse(direct_url)
             base = os.path.basename(parsed.path)
             filename = out_name or (base if base and '.' in base else "downloaded_file")
@@ -769,7 +769,7 @@ def handle_bypasser(url, out_name=None, target_dir=None):
     return None
 
 def handle_selfstudys(url, target_dir=None):
-    print("➜ Detected SelfStudys link...")
+    print("> Detected SelfStudys link...")
     res = requests.get(url, headers=HEADERS, timeout=15)
     res.raise_for_status()
     html = res.text
@@ -809,7 +809,7 @@ def handle_selfstudys(url, target_dir=None):
     raise Exception("Could not locate PDF download link on SelfStudys page.")
 
 def handle_studiestoday(url, target_dir=None):
-    print("➜ Detected StudiesToday link...")
+    print("> Detected StudiesToday link...")
     res = requests.get(url, headers=HEADERS, timeout=15)
     res.raise_for_status()
     html = res.text
@@ -882,7 +882,7 @@ class NetworkAwareLogger:
             if not check_network():
                 wait_for_network()
     def error(self, msg):
-        print(f"✖ {msg}", flush=True)
+        print(f"[FAIL] {msg}", flush=True)
         msg_l = msg.lower()
         if "failed to resolve" in msg_l or "unreachable" in msg_l or "connection" in msg_l:
             if not check_network():
@@ -951,7 +951,7 @@ def download_hls_with_python(url, dest_path, headers=None):
             ydl.download([url])
         return 0 if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0 else 1
     except Exception as error:
-        print(f"✖ In-process HLS download failed: {error}")
+        print(f"[FAIL] In-process HLS download failed: {error}")
         return 1
 
 
@@ -987,7 +987,7 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
                 return format_map[key][0], False
 
     # Extract available qualities using yt-dlp
-    print("➜ Extracting video info and available qualities...")
+    print("> Extracting video info and available qualities...")
     title = "Video"
     available_heights = []
     try:
@@ -1006,17 +1006,17 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
                         h_set.add(h)
             available_heights = sorted(list(h_set), reverse=True)
     except Exception as e:
-        print(f"⚠ Warning: Could not fetch format metadata ({e}). Using auto best quality.")
+        print(f"[WARN] Warning: Could not fetch format metadata ({e}). Using auto best quality.")
         return 'bestvideo+bestaudio/best', False
 
     # If non-interactive shell (stdin not a tty), return default
     if not sys.stdin.isatty():
-        print(f"🎬 Video: {title}")
-        print("➜ Non-interactive mode detected. Downloading in Best Available quality.")
+        print(f" Video: {title}")
+        print("> Non-interactive mode detected. Downloading in Best Available quality.")
         return format_map['1'][0], False
 
     print("\n" + "="*55)
-    print(f" 🎬 Video: {title}")
+    print(f"  Video: {title}")
     print("="*55)
     print(" Select Quality / Format:")
     
@@ -1051,7 +1051,7 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     print("="*55)
 
     try:
-        user_input = input(f"➜ Select choice [1-{len(options)}] (Default: 1): ").strip()
+        user_input = input(f"> Select choice [1-{len(options)}] (Default: 1): ").strip()
     except (EOFError, KeyboardInterrupt):
         user_input = '1'
 
@@ -1068,18 +1068,18 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     if user_input.lower() in ('audio', 'mp3', 'm4a'):
         return 'bestaudio/best', True
 
-    print("➜ Selection invalid or default picked. Downloading Best Available quality.")
+    print("> Selection invalid or default picked. Downloading Best Available quality.")
     return format_map['1'][0], False
 
 def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False):
     if not HAS_YTDLP:
-        print("⚠ yt-dlp is not installed. Falling back to generic download...")
+        print("[WARN] yt-dlp is not installed. Falling back to generic download...")
         return False
         
     try:
         format_spec, is_audio_only = prompt_video_quality(url, quality_arg=quality_arg, cookie=cookie)
     except Exception as e:
-        print(f"✖ Error extracting video metadata: {e}")
+        print(f"[FAIL] Error extracting video metadata: {e}")
         return False
 
     if standalone:
@@ -1095,7 +1095,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
     out_dir = target_dir or DEFAULT_DIR
     os.makedirs(out_dir, exist_ok=True)
     
-    print(f"➜ Downloading video via yt-dlp [{format_spec}]...")
+    print(f"> Downloading video via yt-dlp [{format_spec}]...")
     ydl_opts = get_ytdlp_opts({
         'format': format_spec,
         'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
@@ -1139,7 +1139,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             return filename
         except Exception as e:
             err_str = str(e)
-            print(f"\n✖ Download error encountered: {err_str}")
+            print(f"\n[FAIL] Download error encountered: {err_str}")
 
             if not check_network():
                 wait_for_network()
@@ -1147,8 +1147,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
             if "Conversion failed" in err_str or "Postprocessing" in err_str or "obu_forbidden_bit" in err_str or "Invalid data" in err_str:
                 print("\n" + "!"*60)
-                print(" ⚠ Postprocessing failed: Video stream fragments were corrupted due to network disconnection.")
-                print(" ➜ Cleaning corrupted partial fragments & retrying with network-resilient H.264 format...")
+                print(" [WARN] Postprocessing failed: Video stream fragments were corrupted due to network disconnection.")
+                print(" > Cleaning corrupted partial fragments & retrying with network-resilient H.264 format...")
                 print("!"*60 + "\n")
                 for f in os.listdir(out_dir):
                     if ".f" in f or ".temp" in f or ".part" in f or ".ytdl" in f:
@@ -1161,20 +1161,20 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 continue
 
             if '403' in err_str or 'Forbidden' in err_str:
-                print("⚠ HTTP 403 Forbidden encountered. Retrying with fallback player clients...")
+                print("[WARN] HTTP 403 Forbidden encountered. Retrying with fallback player clients...")
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': ['mweb', 'android', 'ios', 'web']}}
                 continue
 
             if attempt < max_attempts:
-                print(f"➜ Retrying download (attempt {attempt}/{max_attempts})...")
+                print(f"> Retrying download (attempt {attempt}/{max_attempts})...")
                 time.sleep(3)
             else:
-                print("✖ Download failed after retries.")
+                print("[FAIL] Download failed after retries.")
                 return False
     return False
 
 def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
-    print("➜ Detected Studocu link...")
+    print("> Detected Studocu link...")
     headers = {**HEADERS, **(custom_headers or {})}
     
     parsed = urllib.parse.urlparse(url)
@@ -1200,16 +1200,16 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
         return download_file_stream(url, filename, custom_headers=headers, target_dir=target_dir)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
-            print("\n✖ Access Denied (403 Forbidden) by Studocu.")
-            print("➜ Studocu download links require active browser authentication cookies.")
-            print("➜ Usage with Cookie:")
+            print("\n[FAIL] Access Denied (403 Forbidden) by Studocu.")
+            print("> Studocu download links require active browser authentication cookies.")
+            print("> Usage with Cookie:")
             print("   dl \"<URL>\" -c \"session_cookie_string\"")
             print("   or set STUDOCU_COOKIE=\"...\" in your shell.\n")
             return None
         raise e
 
 def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
-    print("➜ Detected Telegram link...")
+    print("> Detected Telegram link...")
     parsed = urllib.parse.urlparse(url)
     path_parts = [p for p in parsed.path.split('/') if p]
     
@@ -1275,12 +1275,12 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                     os.makedirs(out_dir, exist_ok=True)
                     target_file = os.path.join(out_dir, out_name) if out_name else (out_dir + "/")
 
-                    print(f"➜ Fetching Telegram media from {chat_id}/{msg_id} via Pyrogram...")
+                    print(f"> Fetching Telegram media from {chat_id}/{msg_id} via Pyrogram...")
                     file_path = None
                     try:
                         file_path = await app.download_media(msg, file_name=target_file, progress=progress_cb)
                     except Exception as dl_err:
-                        print(f"\n⚠ Pyrogram download notice: {dl_err}")
+                        print(f"\n[WARN] Pyrogram download notice: {dl_err}")
                         # Check if file was downloaded or partially downloaded
                         if isinstance(target_file, str) and not target_file.endswith("/"):
                             if os.path.exists(target_file) and os.path.getsize(target_file) > 0:
@@ -1293,14 +1293,14 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                                     file_path = item_p
                                     break
                     if file_path:
-                        print(f"\n✔ Telegram media downloaded to: {file_path}")
+                        print(f"\n[OK] Telegram media downloaded to: {file_path}")
                         sync_to_sdcard_if_needed(file_path)
                         return file_path
                 elif msg:
                     # Message exists but has no direct media attachment (e.g. text/update post)
                     if msg.text or msg.caption:
                         print("\n" + "="*65)
-                        print(f" 📄 Telegram Post {chat_id}/{msg_id} (Text Only):")
+                        print(f"  Telegram Post {chat_id}/{msg_id} (Text Only):")
                         print("="*65)
                         print((msg.text or msg.caption).strip())
                         print("="*65 + "\n")
@@ -1328,12 +1328,12 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                             pass
 
                     if adjacent_media:
-                        print(" 📦 Detected media attachments in preceding messages from same post:")
+                        print("  Detected media attachments in preceding messages from same post:")
                         for idx, (m, fn, sz) in enumerate(adjacent_media, 1):
                             print(f"   [{idx}] {fn}{sz} (Msg {m.id})")
                         print("="*65)
                         try:
-                            pick = input(f"➜ Select media to download [1-{len(adjacent_media)}] (Default: 1): ").strip()
+                            pick = input(f"> Select media to download [1-{len(adjacent_media)}] (Default: 1): ").strip()
                             if not pick:
                                 pick = '1'
                             if pick.isdigit() and 1 <= int(pick) <= len(adjacent_media):
@@ -1341,17 +1341,17 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                                 out_dir = target_dir or DEFAULT_DIR
                                 os.makedirs(out_dir, exist_ok=True)
                                 target_file = os.path.join(out_dir, out_name or chosen_name)
-                                print(f"\n➜ Fetching {chosen_name}...")
+                                print(f"\n> Fetching {chosen_name}...")
                                 fpath = await app.download_media(chosen_msg, file_name=target_file, progress=progress_cb)
                                 if fpath:
-                                    print(f"\n✔ Telegram media downloaded to: {fpath}")
+                                    print(f"\n[OK] Telegram media downloaded to: {fpath}")
                                     sync_to_sdcard_if_needed(fpath)
                                     return fpath
                         except (KeyboardInterrupt, EOFError):
                             pass
                     return None
                 else:
-                    print("⚠ No downloadable media found in Telegram message via Pyrogram.")
+                    print("[WARN] No downloadable media found in Telegram message via Pyrogram.")
             finally:
                 await app.stop()
             return None
@@ -1535,14 +1535,14 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         dp = meta.get('dp') or ''
 
         lang_label = f"[{target_lang}]" if target_lang else "default"
-        print(f"  [1/4] 🔍 Querying movie metadata & audio tracks ({lang_label})... ✔")
+        print(f"  [1/4]  Querying movie metadata & audio tracks ({lang_label})... [OK]")
 
         candidate_streams = []
         qualities_dict = {}
 
         # Step 2: Primary Gateway (vidsync.pro) with 3.5s timeout
         if tm_id:
-            sys.stdout.write("  [2/4] 🌐 Connecting to primary stream gateway (vidsync.pro)... ")
+            sys.stdout.write("  [2/4]  Connecting to primary stream gateway (vidsync.pro)... ")
             sys.stdout.flush()
             try:
                 vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
@@ -1569,17 +1569,17 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                 qualities_dict[q_k] = {'label': lbl, 'url': u, 'dom': 'https://vidsync.pro', 'headers': s.get('headers')}
                                 if u not in [c[0] for c in candidate_streams]:
                                     candidate_streams.append((u, 'https://vidsync.pro'))
-                        print(f"✔ Found {len(matching)} source(s)")
+                        print(f"[OK] Found {len(matching)} source(s)")
                     else:
-                        print("✖ (no stream sources)")
+                        print("[FAIL] (no stream sources)")
                 else:
-                    print(f"✖ (status {v_res.status_code})")
+                    print(f"[FAIL] (status {v_res.status_code})")
             except Exception:
-                print("✖ (offline/timed out)")
+                print("[FAIL] (offline/timed out)")
 
         # Step 3: Multi-Server CDN manifests (watchbox.php across bet/limit/webvp)
         if tm_id:
-            sys.stdout.write("  [3/4] ⚡ Querying multi-server CDN manifests (watchbox)... ")
+            sys.stdout.write("  [3/4]  Querying multi-server CDN manifests (watchbox)... ")
             sys.stdout.flush()
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
             sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -1641,13 +1641,13 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     pass
 
             if candidate_streams:
-                print(f"✔ Found {len(candidate_streams)} stream candidate(s)")
+                print(f"[OK] Found {len(candidate_streams)} stream candidate(s)")
             else:
-                print("✖ (no direct stream nodes found)")
+                print("[FAIL] (no direct stream nodes found)")
 
             # Step 4: Validate candidate streams and prompt quality
             if candidate_streams:
-                sys.stdout.write("  [4/4] 🔐 Validating media stream health... ")
+                sys.stdout.write("  [4/4]  Validating media stream health... ")
                 sys.stdout.flush()
 
                 valid_qualities = {}
@@ -1662,7 +1662,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                         pass
 
                 if valid_qualities:
-                    print("✔ Verified (status 200)")
+                    print("[OK] Verified (status 200)")
                     sorted_q = sorted(valid_qualities.keys(), key=lambda q: q_order.get(q, 0), reverse=True)
                     chosen_q_key = None
                     if quality_arg:
@@ -1677,12 +1677,12 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             print("="*65)
                             for q_idx, q_k in enumerate(sorted_q, 1):
                                 q_obj = valid_qualities[q_k]
-                                badge = "💎" if q_k in ('4k', '1080p') else ("📺" if q_k == '720p' else "📱")
+                                badge = "" if q_k in ('4k', '1080p') else ("" if q_k == '720p' else "")
                                 rec = "  [Recommended]" if q_idx == 1 else ""
                                 print(f"   [{q_idx}] {badge} {q_obj['label']}{rec}")
                             print("="*65)
                             try:
-                                q_sel = input(f"➜ Select quality [1-{len(sorted_q)}] (Default: 1): ").strip()
+                                q_sel = input(f"> Select quality [1-{len(sorted_q)}] (Default: 1): ").strip()
                                 if not q_sel or not q_sel.isdigit() or not (1 <= int(q_sel) <= len(sorted_q)):
                                     q_sel = '1'
                             except (KeyboardInterrupt, EOFError):
@@ -1694,7 +1694,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     chosen_info = valid_qualities[chosen_q_key]
                     direct_stream_url = chosen_info['url']
                     stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{chosen_info['dom']}/"})
-                    print(f"➜ Selected Quality: {chosen_info['label']}")
+                    print(f"> Selected Quality: {chosen_info['label']}")
                 else:
                     for c_url, c_dom in candidate_streams:
                         chk_headers = get_stream_headers_for_url(c_url, {'Referer': f"{c_dom}/"})
@@ -1703,14 +1703,14 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             if chk.status_code in (200, 206, 302, 301):
                                 direct_stream_url = c_url
                                 stream_headers = chk_headers
-                                print(f"✔ Verified (status {chk.status_code})")
+                                print(f"[OK] Verified (status {chk.status_code})")
                                 break
                         except Exception:
                             pass
                     if not direct_stream_url and candidate_streams:
                         direct_stream_url = candidate_streams[0][0]
                         stream_headers = get_stream_headers_for_url(direct_stream_url, {'Referer': f"{candidate_streams[0][1]}/"})
-                        print("✔ Decrypted stream ready")
+                        print("[OK] Decrypted stream ready")
 
         # Step 3b: Fallback to external.php
         if not direct_stream_url and tm_id:
@@ -1747,7 +1747,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
         if not direct_stream_url:
             print("\n" + "="*65)
-            print(f" ⚠ No active streaming servers found on NetMirror for: {clean_title}")
+            print(f" [WARN] No active streaming servers found on NetMirror for: {clean_title}")
             print("   (NetMirror CDN nodes are currently rate-limiting or offline)")
             print("="*65)
             return None
@@ -1759,7 +1759,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         target_item = embed_json[0]
         if len(embed_json) > 1 and sys.stdin.isatty():
             print("\n" + "="*55)
-            print(f" 🎬 NetMirror: {title}")
+            print(f"  NetMirror: {title}")
             print("="*55)
             print(" Available Episodes:")
             for idx, item in enumerate(embed_json, 1):
@@ -1769,7 +1769,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 print(f"   [{idx}] Season {se} Episode {ep} ({size})")
             print("="*55)
             try:
-                ep_choice = input(f"➜ Select episode [1-{len(embed_json)}] (Default: 1): ").strip()
+                ep_choice = input(f"> Select episode [1-{len(embed_json)}] (Default: 1): ").strip()
                 if ep_choice.isdigit() and 1 <= int(ep_choice) <= len(embed_json):
                     target_item = embed_json[int(ep_choice) - 1]
             except (KeyboardInterrupt, EOFError):
@@ -1827,7 +1827,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
         if not direct_stream_url:
             print("\n" + "="*65)
-            print(f" ⚠ No active streaming servers could be retrieved for: {title}")
+            print(f" [WARN] No active streaming servers could be retrieved for: {title}")
             print("="*65)
             return None
 
@@ -1868,26 +1868,26 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
     if action_mode in ('stream_only', 'stream'):
         print("\n" + "="*65)
-        print(" 🍿 STREAMING ACTIVE IN VLC PLAYER")
+        print("  STREAMING ACTIVE IN VLC PLAYER")
         print("="*65)
-        print(f" 🎬 Media: {clean_title}")
-        print(f" 🌐 Stream Proxy: {LOCAL_PROXY_URL or direct_stream_url}")
-        print(" ⚡ Full seek/scrub bar support enabled")
+        print(f"  Media: {clean_title}")
+        print(f"  Stream Proxy: {LOCAL_PROXY_URL or direct_stream_url}")
+        print("  Full seek/scrub bar support enabled")
         print("="*65)
-        print(" ➜ VLC is currently playing the stream directly on your tablet.")
-        print(" ➜ Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
+        print(" > VLC is currently playing the stream directly on your tablet.")
+        print(" > Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
         try:
             input()
         except (KeyboardInterrupt, EOFError):
             pass
-        print("\n✔ Streaming session ended.")
+        print("\n[OK] Streaming session ended.")
         return direct_stream_url
 
     # Direct download execution: support HLS m3u8 and MP4 multi-threaded download via aria2c.
     try:
         dest_path = get_dest_path(clean_name, target_dir)
         if '.m3u8' in direct_stream_url:
-            print("➜ Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
+            print("> Downloading HLS Stream via multi-threaded aria2c / yt-dlp...")
             if not clean_name.lower().endswith('.mp4'):
                 clean_name = os.path.splitext(clean_name)[0] + '.mp4'
             dest_path = get_dest_path(clean_name, target_dir)
@@ -1910,7 +1910,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             else:
                 ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers)
             if ret == -1:
-                print("⚠ Download cancelled.")
+                print("[WARN] Download cancelled.")
                 return None
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 sync_to_sdcard_if_needed(dest_path)
@@ -1918,7 +1918,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             else:
                 dest_file = None
         elif shutil.which('aria2c'):
-            print(f"➜ Downloading via multi-threaded aria2c (16x): {clean_name}...")
+            print(f"> Downloading via multi-threaded aria2c (16x): {clean_name}...")
             out_dir = os.path.dirname(dest_path) or DEFAULT_DIR
             out_file = os.path.basename(dest_path)
             cmd = [
@@ -1940,7 +1940,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             cmd.append(direct_stream_url)
             ret = run_command_with_clean_progress(cmd)
             if ret == -1:
-                print("⚠ Download cancelled.")
+                print("[WARN] Download cancelled.")
                 return None
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 sync_to_sdcard_if_needed(dest_path)
@@ -2040,7 +2040,7 @@ class ProcessMonitor:
     def show_logs(self):
         with self.lock:
             print("\n" + "="*60)
-            print(f" 📊 LIVE PROCESS LOGS | Status: {self.status}")
+            print(f"  LIVE PROCESS LOGS | Status: {self.status}")
             print("="*60)
             if not self.logs:
                 print(" (No process logs recorded yet)")
@@ -2072,17 +2072,17 @@ def log_unsupported_url(url, error_msg=""):
         json.dump(data, f, indent=2)
 
     print("\n" + "!"*65)
-    print(" ⚠ Unsupported or Complex Link Detected!")
-    print(f" ➜ URL logged for Antigravity AI auto-fix: {url}")
-    print(" ➜ CLI status: Running background analysis...")
-    print(" ➜ Press Ctrl+O (or type 'o') anytime to view live process logs!")
+    print(" [WARN] Unsupported or Complex Link Detected!")
+    print(f" > URL logged for Antigravity AI auto-fix: {url}")
+    print(" > CLI status: Running background analysis...")
+    print(" > Press Ctrl+O (or type 'o') anytime to view live process logs!")
     print("!"*65 + "\n")
 
 def download_youtube_audio(url, codec='mp3', quality='320', target_dir=None):
     out_dir = target_dir or DEFAULT_DIR
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"➜ Downloading audio [{codec.upper()}]...")
+    print(f"> Downloading audio [{codec.upper()}]...")
     ydl_opts = get_ytdlp_opts({
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
@@ -2106,11 +2106,11 @@ def download_youtube_audio(url, codec='mp3', quality='320', target_dir=None):
                 target = f"{base}.{codec}" if codec != 'best' else filename
                 if os.path.exists(target):
                     filename = target
-                print(f"✔ Audio downloaded to: {filename}")
+                print(f"[OK] Audio downloaded to: {filename}")
                 sync_to_sdcard_if_needed(filename)
                 return filename
     except Exception as e:
-        print(f"✖ Error downloading audio: {e}")
+        print(f"[FAIL] Error downloading audio: {e}")
         return None
 
 def search_netmirror(query):
@@ -2279,9 +2279,9 @@ def search_netmirror(query):
 def handle_video_stream_only(url):
     """Extract direct stream URL using yt-dlp and launch in VLC immediately without saving."""
     if not HAS_YTDLP:
-        print("⚠ yt-dlp is required for streaming.")
+        print("[WARN] yt-dlp is required for streaming.")
         return False
-    print("➜ Extracting direct stream URL for instant playback...")
+    print("> Extracting direct stream URL for instant playback...")
     try:
         ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'format': 'bestvideo+bestaudio/best'})
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2294,21 +2294,21 @@ def handle_video_stream_only(url):
                         break
             if stream_url:
                 title = info.get('title', 'Video Stream')
-                print(f"🎬 Video: {title}")
+                print(f" Video: {title}")
                 launch_player(stream_url, player_choice="vlc", custom_headers=info.get('http_headers'), title=title)
                 print("\n" + "="*65)
-                print(" 🍿 STREAMING ACTIVE IN VLC PLAYER")
+                print("  STREAMING ACTIVE IN VLC PLAYER")
                 print("="*65)
-                print(f" 🎬 Media: {title}")
-                print(" ➜ Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
+                print(f"  Media: {title}")
+                print(" > Press [Enter] or [Ctrl+C] to stop stream and return to menu...")
                 try:
                     input()
                 except (KeyboardInterrupt, EOFError):
                     pass
-                print("\n✔ Streaming session ended.")
+                print("\n[OK] Streaming session ended.")
                 return True
     except Exception as e:
-        print(f"⚠ Could not launch stream player: {e}")
+        print(f"[WARN] Could not launch stream player: {e}")
     return False
 
 def handle_video_stream_and_download(url):
@@ -2429,11 +2429,11 @@ def group_and_deduplicate_results(results):
 def prompt_results_list(results, query, target_dir=None):
     sorted_groups = group_and_deduplicate_results(results)
     if not sorted_groups:
-        print("⚠ No matching results found on NetMirror. Searching YouTube instead...")
+        print("[WARN] No matching results found on NetMirror. Searching YouTube instead...")
         return search_youtube_and_prompt(query, target_dir=target_dir)
 
     print("\n" + "="*65)
-    print(f" 🎬 NetMirror Search Results for: \"{query}\"")
+    print(f"  NetMirror Search Results for: \"{query}\"")
     print("="*65)
     for idx, g in enumerate(sorted_groups[:10], 1):
         yr_str = f" ({g['year']})" if g['year'] else ""
@@ -2441,12 +2441,12 @@ def prompt_results_list(results, query, target_dir=None):
         aud_str = f" • Audio: [{', '.join(aud_list)}]"
         ott_str = f" • [{' / '.join(g['otts'])}]" if g['otts'] else ""
         print(f"   [{idx}] {g['title']} [{g['type']}{yr_str}]{ott_str}{aud_str}")
-    print("   [Y] 📺 Search on YouTube instead")
+    print("   [Y]  Search on YouTube instead")
     print("="*65)
 
     while True:
         try:
-            sel = input(f"➜ Select result [1-{len(sorted_groups[:10])}] (Default: 1, Y: YouTube): ").strip()
+            sel = input(f"> Select result [1-{len(sorted_groups[:10])}] (Default: 1, Y: YouTube): ").strip()
             if not sel:
                 sel = '1'
         except (KeyboardInterrupt, EOFError):
@@ -2463,26 +2463,26 @@ def prompt_results_list(results, query, target_dir=None):
                 print("="*65)
                 audio_keys = list(audios.keys())
                 for a_idx, lang in enumerate(audio_keys, 1):
-                    flag = '🇮🇳' if lang == 'Hindi' else ('🌐' if lang == 'English' else '🎵')
+                    flag = '[Hindi]' if lang == 'Hindi' else ('' if lang == 'English' else '')
                     print(f"   [{a_idx}] {flag} {lang}")
                 print("="*65)
                 try:
-                    a_sel = input(f"➜ Select audio [1-{len(audio_keys)}] (Default: 1): ").strip()
+                    a_sel = input(f"> Select audio [1-{len(audio_keys)}] (Default: 1): ").strip()
                     if not a_sel or not a_sel.isdigit() or not (1 <= int(a_sel) <= len(audio_keys)):
                         a_sel = '1'
                 except (KeyboardInterrupt, EOFError):
                     return
                 chosen_lang = audio_keys[int(a_sel) - 1]
                 chosen_url = audios[chosen_lang]['url']
-                print(f"➜ Selected Audio: {chosen_lang}")
+                print(f"> Selected Audio: {chosen_lang}")
             else:
                 chosen_url = list(audios.values())[0]['url']
                 
-            print(f"\n➜ Selected: {selected_group['title']}")
+            print(f"\n> Selected: {selected_group['title']}")
             prompt_action_mode_and_run(chosen_url, query_context=query, all_results=sorted_groups, target_dir=target_dir)
             return
         else:
-            print(f"✖ Invalid selection. Please select choice 1 to {len(sorted_groups[:10])} or 'Y'.")
+            print(f"[FAIL] Invalid selection. Please select choice 1 to {len(sorted_groups[:10])} or 'Y'.")
 
 def prompt_action_mode_and_run(url, query_context=None, all_results=None, target_dir=None):
     is_netmirror = any(nm in url.lower() for nm in ['netmirror.', 'net52.', 'net77.', 'watch21.', 'watch22.'])
@@ -2490,12 +2490,12 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
         print("\n" + "="*65)
         print(" Select Action / Mode:")
         print("   [1] ⬇ Download Video Only (Multi-threaded aria2c 16x in Terminal)")
-        print("   [2] 🔗 Copy Direct Stream Link (No Pre-Download, for ADM / 1DM)")
-        print("   [3] 🎬 Stream in VLC Player (Instant Play, No Storage Used)")
-        print("   [4] 🍿 Stream in VLC & Download Video (Instant Play + Save)")
+        print("   [2]  Copy Direct Stream Link (No Pre-Download, for ADM / 1DM)")
+        print("   [3]  Stream in VLC Player (Instant Play, No Storage Used)")
+        print("   [4]  Stream in VLC & Download Video (Instant Play + Save)")
         print("="*65)
         try:
-            mode_choice = input("➜ Select choice [1-4] (Default: 1): ").strip()
+            mode_choice = input("> Select choice [1-4] (Default: 1): ").strip()
             if not mode_choice:
                 mode_choice = '1'
         except (KeyboardInterrupt, EOFError):
@@ -2524,25 +2524,25 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
                 else:
                     res = handle_video_stream_and_download(url)
             else:
-                print("✖ Invalid selection. Please select choice 1 to 4.")
+                print("[FAIL] Invalid selection. Please select choice 1 to 4.")
                 continue
         except Exception as e:
-            print(f"⚠ Stream processing encountered an issue: {e}")
+            print(f"[WARN] Stream processing encountered an issue: {e}")
             res = None
 
         if not res and is_netmirror:
             print("\n" + "="*65)
             print(" Select an alternative option:")
             search_title = query_context or "this title"
-            print(f"   [1] 📺 Search on YouTube for \"{search_title}\" (Instant Stream & Download)")
+            print(f"   [1]  Search on YouTube for \"{search_title}\" (Instant Stream & Download)")
             if all_results and len(all_results) > 1:
-                print("   [2] 🔄 Choose another result from NetMirror search list")
+                print("   [2]  Choose another result from NetMirror search list")
                 print("   [3] ↩ Return to main menu")
             else:
                 print("   [2] ↩ Return to main menu")
             print("="*65)
             try:
-                alt = input("➜ Select choice (Default: 1): ").strip()
+                alt = input("> Select choice (Default: 1): ").strip()
                 if not alt:
                     alt = '1'
             except (KeyboardInterrupt, EOFError):
@@ -2556,22 +2556,22 @@ def prompt_action_mode_and_run(url, query_context=None, all_results=None, target
         break
 
 def search_netmirror_and_prompt(query, target_dir=None):
-    print(f"\n➜ Searching NetMirror for: \"{query}\"...")
+    print(f"\n> Searching NetMirror for: \"{query}\"...")
     try:
         results = search_netmirror(query)
     except KeyboardInterrupt:
-        print("\n⚠ Search cancelled.")
+        print("\n[WARN] Search cancelled.")
         return
     if not results:
-        print(f"\n⚠ No search results found on NetMirror for: \"{query}\"")
+        print(f"\n[WARN] No search results found on NetMirror for: \"{query}\"")
         print("="*60)
         print(" Select an option:")
-        print(f"   [1] 📺 Search on YouTube for \"{query}\"")
-        print("   [2] 🔄 Try a different search term")
+        print(f"   [1]  Search on YouTube for \"{query}\"")
+        print("   [2]  Try a different search term")
         print("   [3] ↩ Return to main menu")
         print("="*60)
         try:
-            choice = input("➜ Select choice [1-3] (Default: 2): ").strip()
+            choice = input("> Select choice [1-3] (Default: 2): ").strip()
             if not choice:
                 choice = '2'
         except (KeyboardInterrupt, EOFError):
@@ -2580,7 +2580,7 @@ def search_netmirror_and_prompt(query, target_dir=None):
             return search_youtube_and_prompt(query, target_dir=target_dir)
         elif choice == '2':
             try:
-                new_q = input("\n➜ Enter movie or video name: ").strip()
+                new_q = input("\n> Enter movie or video name: ").strip()
                 if new_q and new_q.lower() not in ('q', 'quit', 'exit'):
                     return search_netmirror_and_prompt(new_q, target_dir=target_dir)
             except (KeyboardInterrupt, EOFError):
@@ -2589,7 +2589,7 @@ def search_netmirror_and_prompt(query, target_dir=None):
     return prompt_results_list(results, query, target_dir=target_dir)
 
 def search_youtube_and_prompt(query, target_dir=None):
-    print(f"\n➜ Searching YouTube for: \"{query}\"...")
+    print(f"\n> Searching YouTube for: \"{query}\"...")
     yt_entries = []
     if HAS_YTDLP:
         try:
@@ -2598,17 +2598,17 @@ def search_youtube_and_prompt(query, target_dir=None):
                 res = ydl.extract_info(f"ytsearch10:{query}", download=False)
                 yt_entries = [e for e in res.get('entries', []) if e] if res else []
         except KeyboardInterrupt:
-            print("\n⚠ YouTube search cancelled.")
+            print("\n[WARN] YouTube search cancelled.")
             return
         except Exception:
             yt_entries = []
 
     if not yt_entries:
-        print("⚠ No search results found on YouTube.")
+        print("[WARN] No search results found on YouTube.")
         return
 
     print("\n" + "="*65)
-    print(f" 🎵 YouTube Search Results for: \"{query}\"")
+    print(f"  YouTube Search Results for: \"{query}\"")
     print("="*65)
     for idx, entry in enumerate(yt_entries[:10], 1):
         title = entry.get('title', 'Unknown Title')
@@ -2621,7 +2621,7 @@ def search_youtube_and_prompt(query, target_dir=None):
 
     while True:
         try:
-            sel = input(f"➜ Select result [1-{len(yt_entries[:10])}] (Default: 1): ").strip()
+            sel = input(f"> Select result [1-{len(yt_entries[:10])}] (Default: 1): ").strip()
             if not sel:
                 sel = '1'
         except (KeyboardInterrupt, EOFError):
@@ -2629,20 +2629,20 @@ def search_youtube_and_prompt(query, target_dir=None):
         if sel.isdigit() and 1 <= int(sel) <= len(yt_entries[:10]):
             selected_entry = yt_entries[int(sel) - 1]
             selected_url = selected_entry.get('url') or selected_entry.get('webpage_url') or f"https://www.youtube.com/watch?v={selected_entry.get('id')}"
-            print(f"\n➜ Selected: {selected_entry.get('title')}")
+            print(f"\n> Selected: {selected_entry.get('title')}")
             prompt_action_mode_and_run(selected_url)
             return
         else:
-            print(f"✖ Invalid selection. Please select choice 1 to {len(yt_entries[:10])}.")
+            print(f"[FAIL] Invalid selection. Please select choice 1 to {len(yt_entries[:10])}.")
 
 def search_by_name(target_dir=None):
     print("\n" + "="*65)
     print(" Select Search Platform:")
-    print("   [1] 🎬 NetMirror (Movies / Series / Web Shows)")
-    print("   [2] 📺 YouTube (Video / Music / Audio)")
+    print("   [1]  NetMirror (Movies / Series / Web Shows)")
+    print("   [2]  YouTube (Video / Music / Audio)")
     print("="*65)
     try:
-        p_choice = input("➜ Select choice [1-2] (Default: 1): ").strip()
+        p_choice = input("> Select choice [1-2] (Default: 1): ").strip()
         if not p_choice:
             p_choice = '1'
     except (KeyboardInterrupt, EOFError):
@@ -2650,14 +2650,14 @@ def search_by_name(target_dir=None):
 
     if p_choice == '1':
         try:
-            query = input("\n➜ Enter Movie / Series Name to Search NetMirror: ").strip()
+            query = input("\n> Enter Movie / Series Name to Search NetMirror: ").strip()
         except (KeyboardInterrupt, EOFError):
             return
         if query:
             search_netmirror_and_prompt(query, target_dir=target_dir)
     elif p_choice == '2':
         try:
-            query = input("\n➜ Enter Video / Song Name to Search YouTube: ").strip()
+            query = input("\n> Enter Video / Song Name to Search YouTube: ").strip()
         except (KeyboardInterrupt, EOFError):
             return
         if query:
@@ -2670,7 +2670,7 @@ def generate_adm_links_for_url(url):
         print(" ℹ NOTE FOR YOUTUBE DIRECT LINKS:")
         print(" • Modern YouTube splits HD/4K videos into separate video and audio streams.")
         print(" • Raw single video links extracted for ADM will NOT contain audio.")
-        print(" • 👉 To download 1080p/4K WITH sound merged into an MP4 file,")
+        print(" • > To download 1080p/4K WITH sound merged into an MP4 file,")
         print("   select Option [1] in 'dl' (downloads at 16x speed and merges in 1s).")
         print("="*65)
 
@@ -2681,9 +2681,9 @@ def generate_adm_links_for_url(url):
     else:
         stream_format = f"{format_spec}/bestvideo+bestaudio/best"
 
-    print(f"\n➜ Extracting direct stream links for: {url}...")
+    print(f"\n> Extracting direct stream links for: {url}...")
     if not HAS_YTDLP:
-        print("✖ yt-dlp is required for extracting stream links.")
+        print("[FAIL] yt-dlp is required for extracting stream links.")
         return
         
     try:
@@ -2692,7 +2692,7 @@ def generate_adm_links_for_url(url):
             info = ydl.extract_info(url, download=False)
             
         if not info:
-            print("✖ Could not extract link metadata.")
+            print("[FAIL] Could not extract link metadata.")
             return
 
         entries = info.get('entries', []) if isinstance(info, dict) else []
@@ -2701,7 +2701,7 @@ def generate_adm_links_for_url(url):
         if entries:
             pl_title = info.get('title', 'Playlist')
             print("\n" + "="*65)
-            print(f" 🎬 Playlist / Batch Detected: {pl_title} ({len(entries)} items)")
+            print(f"  Playlist / Batch Detected: {pl_title} ({len(entries)} items)")
             print("="*65)
             
             for idx, entry in enumerate(entries, 1):
@@ -2720,7 +2720,7 @@ def generate_adm_links_for_url(url):
                         if stream_url:
                             adm_links.append((idx, v_title, stream_url))
                             print(f"   [{idx}] {v_title}")
-                            print(f"       🔗 Direct Stream Link: {stream_url[:90]}...\n")
+                            print(f"        Direct Stream Link: {stream_url[:90]}...\n")
                 except Exception as e:
                     print(f"   [{idx}] {v_title} - Error extracting stream link: {e}")
         else:
@@ -2737,15 +2737,15 @@ def generate_adm_links_for_url(url):
                     if stream_url:
                         adm_links.append((1, v_title, stream_url))
                         print("\n" + "="*65)
-                        print(f" 🎬 Video: {v_title}")
+                        print(f"  Video: {v_title}")
                         print("="*65)
-                        print(f" 🔗 Direct Video Stream Link: {stream_url}\n")
+                        print(f"  Direct Video Stream Link: {stream_url}\n")
                         if audio_stream_url:
-                            print(f" 🎵 Direct Audio Stream Link: {audio_stream_url}\n")
-                            print(" ⚠ Note: Single video stream link above has no sound because YouTube")
+                            print(f"  Direct Audio Stream Link: {audio_stream_url}\n")
+                            print(" [WARN] Note: Single video stream link above has no sound because YouTube")
                             print("   serves video and audio separately. Use Mode [1] for auto-merged MP4.\n")
             except Exception as e:
-                print(f"✖ Error extracting stream link: {e}")
+                print(f"[FAIL] Error extracting stream link: {e}")
 
         if adm_links:
             if len(adm_links) > 1:
@@ -2767,27 +2767,27 @@ def generate_adm_links_for_url(url):
                 lan_url = f"http://{my_ip}:8080/adm_playlist_links.txt"
 
                 print("="*65)
-                print(f" 📄 Saved {len(adm_links)} direct link(s) to: {txt_path}")
-                print(f" 🚀 Single All-in-One Link for ADM: {single_hosted_url}")
-                print(f" 🌐 Wi-Fi LAN Download Link:       {lan_url}")
+                print(f"  Saved {len(adm_links)} direct link(s) to: {txt_path}")
+                print(f"  Single All-in-One Link for ADM: {single_hosted_url}")
+                print(f"  Wi-Fi LAN Download Link:       {lan_url}")
                 clipboard_target = single_hosted_url
             else:
                 clipboard_target = adm_links[0][2]
                 print("="*65)
-                print(f" 🚀 Direct Stream Link for ADM / VLC: {clipboard_target}")
+                print(f"  Direct Stream Link for ADM / VLC: {clipboard_target}")
             
             print("="*65 + "\n")
             
     except Exception as e:
-        print(f"✖ Error extracting direct links: {e}")
+        print(f"[FAIL] Error extracting direct links: {e}")
 
 def interactive_menu():
     while True:
         print("\n" + "="*65)
-        print("           🚀 UNIVERSAL DOWNLOADER CLI 🚀           ")
+        print("            UNIVERSAL DOWNLOADER CLI            ")
         print("="*65)
         try:
-            user_input = input("➜ Enter URL or Movie/Video Name (or 'q' to quit): ").strip()
+            user_input = input("> Enter URL or Movie/Video Name (or 'q' to quit): ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             sys.exit(0)
@@ -2801,7 +2801,7 @@ def interactive_menu():
         # Backward compatibility for entering '1' or '2'
         if user_input == '1':
             try:
-                user_input = input("➜ Enter URL / Playlist Link: ").strip()
+                user_input = input("> Enter URL / Playlist Link: ").strip()
             except (KeyboardInterrupt, EOFError):
                 return
             if not user_input:
@@ -2877,8 +2877,8 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None,
         raise Exception("Extractor returned no stream data.")
     except Exception as e:
         PROCESS_MONITOR.log(f"Primary download failed: {e}")
-        print(f"✖ Error downloading from primary handler: {e}")
-        print("➜ Attempting generic fallback...")
+        print(f"[FAIL] Error downloading from primary handler: {e}")
+        print("> Attempting generic fallback...")
         try:
             res = handle_generic(url, out_name=out_name, custom_headers=custom_headers, target_dir=target_dir)
             if res:
@@ -3168,6 +3168,7 @@ def app_download(payload):
     global CURRENT_DOWNLOAD_JOB_ID
     CURRENT_DOWNLOAD_JOB_ID = str(payload.get("job_id") or payload.get("id") or "job")
     url = str(payload.get("url", "")).strip()
+    stream_url = str(payload.get("stream_url", "")).strip()
     quality = str(payload.get("quality", "best")).strip() or "best"
     out_name = payload.get("out_name") or None
     target_dir = payload.get("target_dir") or DEFAULT_DIR
@@ -3175,7 +3176,11 @@ def app_download(payload):
     telegram_config = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else None
     season = payload.get("season")
     episode = payload.get("episode")
+    custom_headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+    title = payload.get("title") or "download"
+
     lower = url.lower()
+    stream_lower = stream_url.lower()
 
     ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
         "percent": 0.0,
@@ -3187,11 +3192,27 @@ def app_download(payload):
         "path": "",
     }
 
-    print(f"> Starting download for: {url}")
+    print(f"> Starting download request for: {title}")
+    print(f"> Target URL: {url or stream_url}")
     print(f"> Save directory: {target_dir}")
     print(f"> Quality profile: {quality}")
 
-    if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
+    path = None
+
+    # Priority 1: Direct CDN stream URL with headers (e.g. hakunaymatata or direct mp4/mkv)
+    target_direct = None
+    if stream_url and any(h in stream_lower for h in ["hakunaymatata.com", "bcdn", ".mp4", ".mkv", ".webm"]):
+        target_direct = stream_url
+    elif any(h in lower for h in ["hakunaymatata.com", "bcdn"]):
+        target_direct = url
+
+    if target_direct:
+        clean_name = out_name or clean_filename(title, default_ext=".mp4")
+        s_headers = get_stream_headers_for_url(target_direct, custom_headers)
+        print(f"> Downloading direct media stream: {target_direct[:70]}...")
+        path = download_file_stream(target_direct, clean_name, custom_headers=s_headers, target_dir=target_dir)
+
+    elif any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
         path = handle_netmirror(
             url,
             out_name=out_name,
@@ -3209,8 +3230,9 @@ def app_download(payload):
             telegram_config=telegram_config,
         )
     else:
+        target_run_url = stream_url if (stream_url and stream_url.startswith(('http://', 'https://'))) else url
         path = download(
-            url,
+            target_run_url,
             out_name=out_name,
             cookie=cookie,
             target_dir=target_dir,
@@ -3366,13 +3388,13 @@ def main():
             search_netmirror_and_prompt(full_query, target_dir=target_dir)
             break
         else:
-            print(f"⚠ Skipping invalid argument: {url}")
+            print(f"[WARN] Skipping invalid argument: {url}")
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n👋 Exited.")
+        print("\n\n Exited.")
         try:
             sys.exit(0)
         except SystemExit:
