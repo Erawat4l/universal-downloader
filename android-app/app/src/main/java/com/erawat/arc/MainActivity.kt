@@ -1,18 +1,28 @@
 package com.erawat.arc
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.view.ViewGroup
 import android.webkit.MimeTypeMap
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -44,15 +54,17 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.ArrowDropDown
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
-import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ErrorOutline
@@ -60,21 +72,28 @@ import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Forward10
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.NotificationsNone
+import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Replay10
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Stop
+import androidx.compose.material.icons.outlined.Subtitles
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -85,6 +104,8 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -97,6 +118,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -113,14 +135,22 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -280,7 +310,7 @@ private fun ArcApp() {
     var showPathDialog by rememberSaveable { mutableStateOf(false) }
 
     var defaultQuality by rememberSaveable {
-        mutableStateOf(preferences.getString("default_quality", "1080p") ?: "1080p")
+        mutableStateOf(preferences.getString("default_quality", "Best") ?: "Best")
     }
     var selectedQuality by rememberSaveable { mutableStateOf(defaultQuality) }
     var showQualityDialog by rememberSaveable { mutableStateOf(false) }
@@ -298,7 +328,7 @@ private fun ArcApp() {
     var hits by remember { mutableStateOf(emptyList<SearchHit>()) }
     var jobs by remember { mutableStateOf(emptyList<DownloadJob>()) }
     var update by remember { mutableStateOf(UpdateInfo()) }
-    var notifications by rememberSaveable { mutableStateOf(true) }
+    var notifications by rememberSaveable { mutableStateOf(preferences.getBoolean("notifications_enabled", true)) }
     var telegramApiId by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_id", "").orEmpty()) }
     var telegramApiHash by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_hash", "").orEmpty()) }
     var telegramSession by rememberSaveable { mutableStateOf(preferences.getString("telegram_session", "").orEmpty()) }
@@ -310,6 +340,9 @@ private fun ArcApp() {
     var liveStepText by remember { mutableStateOf("") }
 
     var playingMedia by remember { mutableStateOf<PlaybackInfo?>(null) }
+    var showDeleteConfirmJobId by remember { mutableStateOf<String?>(null) }
+    var showSeriesDownloadDialog by remember { mutableStateOf(false) }
+    var showStreamChoiceDialog by remember { mutableStateOf(false) }
 
     val tab = AppTab.entries.firstOrNull { it.name == tabName } ?: AppTab.HOME
 
@@ -317,42 +350,95 @@ private fun ArcApp() {
         scope.launch { snackbar.showSnackbar(text) }
     }
 
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { isGranted ->
+            notifications = isGranted
+            preferences.edit().putBoolean("notifications_enabled", isGranted).apply()
+            if (isGranted) {
+                message("Notifications enabled.")
+            } else {
+                message("Notification permission denied in system settings.")
+            }
+        }
+    )
+
     fun copyToClipboard(text: String, label: String = "Copied") {
         clipboard.setText(AnnotatedString(text))
         message("$label copied to clipboard.")
+    }
+
+    fun postNotification(title: String, filePath: String) {
+        if (!notifications) return
+        try {
+            val channelId = "arc_downloads"
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(channelId, "Arc Downloads", NotificationManager.IMPORTANCE_HIGH).apply {
+                    description = "Download completion alerts"
+                    enableVibration(true)
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+            val pendingIntent = if (filePath.isNotBlank()) {
+                val file = File(filePath)
+                val uri = try {
+                    FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+                } catch (_: Exception) {
+                    Uri.fromFile(file)
+                }
+                val openIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/*")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                PendingIntent.getActivity(
+                    context,
+                    0,
+                    openIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            } else null
+
+            val notification = NotificationCompat.Builder(context, channelId)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("Download Complete")
+                .setContentText(title)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .apply {
+                    if (pendingIntent != null) {
+                        setContentIntent(pendingIntent)
+                    }
+                }
+                .build()
+            notificationManager.notify((System.currentTimeMillis() % 100000).toInt(), notification)
+        } catch (_: Exception) {}
     }
 
     LaunchedEffect(Unit) {
         scope.launch {
             update = GitHubUpdateChecker.check()
         }
+        if (notifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 
     LaunchedEffect(searchLoading, resolveLoading) {
         if (searchLoading || resolveLoading) {
             elapsedSeconds = 0f
-            val isSearch = searchLoading
-            val searchSteps = listOf(
-                "Initializing media catalog engine...",
-                "Querying content index & active mirrors...",
-                "Scanning provider stream manifests...",
-                "Extracting resolution profiles & audio...",
-                "Formatting media results...",
-            )
-            val resolveSteps = listOf(
-                "Initializing media resolver...",
-                "Analyzing stream endpoints...",
-                "Extracting manifest and headers...",
-                "Verifying playable direct link...",
-            )
-            val steps = if (isSearch) searchSteps else resolveSteps
-            var idx = 0
+            val baseText = if (searchLoading) "Searching media catalog" else "Resolving media stream"
             val startTime = System.currentTimeMillis()
+            var dotCount = 0
             while (searchLoading || resolveLoading) {
                 elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f
-                liveStepText = steps[idx % steps.size]
-                delay(300)
-                idx++
+                val dots = ".".repeat(1 + (dotCount % 3))
+                liveStepText = "$baseText$dots"
+                delay(350)
+                dotCount++
             }
         }
     }
@@ -368,14 +454,19 @@ private fun ArcApp() {
                 jobs = jobs.map { job ->
                     val p = progressObj.optJSONObject(job.id)
                     if (p != null) {
+                        val status = p.optString("status", job.status)
+                        val path = p.optString("path", job.path).ifEmpty { job.path }
+                        if (status == "Complete" && job.status != "Complete") {
+                            postNotification(job.title, path)
+                        }
                         job.copy(
                             progress = p.optDouble("percent", job.progress.toDouble()).toFloat(),
                             downloaded = p.optString("downloaded_str", job.downloaded),
                             total = p.optString("total_str", job.total),
                             speed = p.optString("speed", job.speed),
                             eta = p.optString("eta", job.eta),
-                            status = p.optString("status", job.status),
-                            path = p.optString("path", job.path).ifEmpty { job.path },
+                            status = status,
+                            path = path,
                         )
                     } else job
                 }
@@ -408,13 +499,13 @@ private fun ArcApp() {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(Intent.createChooser(intent, "Open with"))
+            context.startActivity(Intent.createChooser(intent, "Open media"))
         } catch (e: Exception) {
             message("Could not open media: ${e.message}")
         }
     }
 
-    fun openStreamInVlc(streamUrl: String, headers: Map<String, String> = emptyMap()) {
+    fun openStreamExternal(streamUrl: String, headers: Map<String, String> = emptyMap()) {
         try {
             val uri = Uri.parse(streamUrl)
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -530,7 +621,6 @@ private fun ArcApp() {
                         "Media engine activated",
                         "Search query: \"$query\"",
                         "Catalogs queried and releases analyzed",
-                        "Grouped audio tracks and sources",
                         "[OK] Found ${resultList.size} titles ready",
                     ),
                     stdoutLogs = logs,
@@ -596,17 +686,17 @@ private fun ArcApp() {
 
                 val resolvedTitle = data?.optString("title").takeUnless { it.isNullOrBlank() } ?: target.title
                 val resolvedPoster = data?.optString("poster").takeUnless { it.isNullOrBlank() } ?: target.poster
-                val resolvedSource = data?.optString("source").takeUnless { it.isNullOrBlank() } ?: target.source
+                val rawSource = data?.optString("source").takeUnless { it.isNullOrBlank() } ?: (if (isSeries) "TV Series" else (if (isPlaylist) "Playlist" else "Media"))
 
                 target = target.copy(
                     title = resolvedTitle,
-                    source = resolvedSource,
+                    source = rawSource,
                     detail = "${selectedQuality}${if (audioOnly) " · Audio" else " · Video"}",
                     availableQualities = qualitiesList,
                     poster = resolvedPoster,
                     streamHeaders = headersMap,
                     isSeries = isSeries,
-                    seasons = seasonsList,
+                    seasons = seasonsList.ifEmpty { target.seasons },
                     isPlaylist = isPlaylist,
                     playlistEntries = playlistEntriesList,
                 )
@@ -619,7 +709,7 @@ private fun ArcApp() {
 
                 currentTrace = CliTrace(
                     action = actionLabel,
-                    target = input,
+                    target = resolvedTitle,
                     durationSeconds = duration,
                     steps = listOf(
                         "Media engine activated",
@@ -634,8 +724,11 @@ private fun ArcApp() {
             }
             "download" -> {
                 val path = data?.optString("path").orEmpty()
+                val jobTitle = jobs.firstOrNull { it.id == result.jobId }?.title ?: "Download"
                 jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path, progress = 100f) else it }
                 message("Download complete.")
+                postNotification(jobTitle, path)
+                tabName = AppTab.LIBRARY.name
             }
         }
     }
@@ -671,17 +764,16 @@ private fun ArcApp() {
             message("Paste a link or enter a search.")
             return
         }
-        input = clean
-        if (defaultQuality != "Ask each time") {
-            selectedQuality = defaultQuality
-        }
+        currentTrace = null
+        liveStepText = ""
+        elapsedSeconds = 0f
 
         val isDirectUrl = clean.startsWith("http://") || clean.startsWith("https://")
         if (isDirectUrl) {
             resolveLoading = true
             target = MediaTarget(
                 title = titleOverride ?: (clean.split("/").lastOrNull { it.isNotBlank() } ?: "Media stream"),
-                source = "Analyzing...",
+                source = "Stream",
                 detail = "${selectedQuality}${if (audioOnly) " · Audio" else " · Video"}",
                 size = "Detecting",
                 description = clean,
@@ -712,40 +804,29 @@ private fun ArcApp() {
         }
     }
 
-    fun resolveEpisode(season: Int, episode: Int) {
-        resolveLoading = true
-        target = target.copy(selectedSeason = season, selectedEpisode = episode)
-        submit(
-            JSONObject().apply {
-                put("action", "resolve")
-                put("url", input)
-                put("season", season)
-                put("episode", episode)
-                put("quality", selectedQuality)
-            },
-            "resolve"
-        )
-    }
+    fun startDownload(customTitle: String = target.title, seasonOverride: Int? = null, episodeOverride: Int? = null) {
+        val sNum = seasonOverride ?: target.selectedSeason
+        val epNum = episodeOverride ?: target.selectedEpisode
+        val finalTitle = if (target.isSeries) "${target.title} S${sNum}E${epNum}" else customTitle
 
-    fun startDownload(targetUrl: String = resolvedUrl.ifEmpty { input }, customTitle: String = target.title) {
         val job = DownloadJob(
             id = java.util.UUID.randomUUID().toString(),
-            title = customTitle.ifBlank { target.title.ifBlank { "Media Download" } },
+            title = finalTitle,
             source = target.source.ifBlank { "Stream" },
             detail = "${selectedQuality}${if (audioOnly) " · Audio" else " · Video"}",
             status = "Downloading",
             poster = target.poster,
-            url = targetUrl,
+            url = resolvedUrl.ifEmpty { input },
             headers = target.streamHeaders,
         )
         jobs = listOf(job) + jobs
-        message("Download started: ${job.title}")
+        message("Download queued: $finalTitle")
 
         val payload = JSONObject().apply {
             put("action", "download")
-            put("url", input)
+            put("url", if (resolvedUrl.isNotBlank()) resolvedUrl else input)
             put("stream_url", resolvedUrl)
-            put("title", job.title)
+            put("title", finalTitle)
             put("quality", selectedQuality)
             put("target_dir", downloadPath)
             put("job_id", job.id)
@@ -755,8 +836,8 @@ private fun ArcApp() {
                 put("headers", hObj)
             }
             if (target.isSeries) {
-                put("season", target.selectedSeason)
-                put("episode", target.selectedEpisode)
+                put("season", sNum)
+                put("episode", epNum)
             }
             if (telegramSession.isNotBlank()) {
                 put("telegram", JSONObject().apply {
@@ -794,7 +875,7 @@ private fun ArcApp() {
             runCatching { File(job.path).delete() }
         }
         jobs = jobs.filterNot { it.id == jobId }
-        message("Item removed.")
+        message("Media file removed.")
     }
 
     Scaffold(
@@ -838,8 +919,8 @@ private fun ArcApp() {
                     onCopyLogs = { copyToClipboard(currentTrace?.stdoutLogs.orEmpty(), "Process logs") },
                     onBack = ::openHome,
                     onSelect = { hit, audio ->
-                        input = audio.url.ifEmpty { hit.url }
-                        analyze(audio.url.ifEmpty { hit.url }, titleOverride = hit.title, posterOverride = hit.poster)
+                        val targetUrl = audio.url.ifEmpty { hit.url }
+                        analyze(targetUrl, titleOverride = hit.title, posterOverride = hit.poster)
                     },
                 )
                 overlay == "analysis" -> AnalysisScreen(
@@ -856,19 +937,17 @@ private fun ArcApp() {
                     onBack = ::openHome,
                     onQuality = { selectedQuality = it },
                     onAudioOnly = { audioOnly = it },
-                    onDownload = { startDownload() },
-                    onStream = {
-                        if (resolvedUrl.isNotBlank()) {
-                            playingMedia = PlaybackInfo(resolvedUrl, target.title, target.streamHeaders)
+                    onDownload = {
+                        if (target.isSeries) {
+                            showSeriesDownloadDialog = true
                         } else {
-                            message("Stream link not ready yet.")
+                            startDownload()
                         }
                     },
-                    onCopyLink = { copyToClipboard(resolvedUrl.ifEmpty { input }, "Stream link") },
-                    onSelectSeason = { s -> resolveEpisode(s, 1) },
-                    onSelectEpisode = { s, e -> resolveEpisode(s, e) },
+                    onStream = { showStreamChoiceDialog = true },
+                    onSelectSeason = { s -> target = target.copy(selectedSeason = s, selectedEpisode = 1) },
+                    onSelectEpisode = { ep -> target = target.copy(selectedEpisode = ep) },
                     onSelectPlaylistItem = { entry ->
-                        input = entry.url
                         analyze(entry.url, titleOverride = entry.title, posterOverride = entry.thumbnail)
                     },
                 )
@@ -884,38 +963,27 @@ private fun ArcApp() {
                             }
                         },
                         onLibrary = { tabName = AppTab.LIBRARY.name },
-                        jobs = jobs,
+                        jobs = jobs.filter { it.status == "Complete" },
                         onOpen = { openFile(it) },
                         onShare = { shareFile(it) },
                     )
                     AppTab.ACTIVITY -> ActivityScreen(
-                        jobs = jobs,
+                        jobs = jobs.filter { it.status == "Downloading" || it.status == "Queued" },
+                        onCancelJob = { cancelJob(it) },
+                    )
+                    AppTab.LIBRARY -> LibraryScreen(
+                        jobs = jobs.filter { it.status == "Complete" },
                         onOpen = { openFile(it) },
                         onShare = { shareFile(it) },
                         onPlayInApp = { job ->
-                            if (job.path.isNotBlank() && File(job.path).exists()) {
-                                playingMedia = PlaybackInfo(job.path, job.title)
-                            } else if (job.url.isNotBlank()) {
-                                playingMedia = PlaybackInfo(job.url, job.title, job.headers)
+                            val p = job.path.ifBlank { job.url }
+                            if (p.isNotBlank()) {
+                                playingMedia = PlaybackInfo(p, job.title, job.headers)
                             } else {
                                 message("Media file not ready.")
                             }
                         },
-                        onCancelJob = { cancelJob(it) },
-                        onDeleteJob = { id, removeFile -> deleteJob(id, removeFile) },
-                    )
-                    AppTab.LIBRARY -> LibraryScreen(
-                        jobs = jobs,
-                        onOpen = { openFile(it) },
-                        onShare = { shareFile(it) },
-                        onPlayInApp = { job ->
-                            if (job.path.isNotBlank() && File(job.path).exists()) {
-                                playingMedia = PlaybackInfo(job.path, job.title)
-                            } else {
-                                openFile(job.path)
-                            }
-                        },
-                        onDeleteJob = { id, removeFile -> deleteJob(id, removeFile) },
+                        onDeletePrompt = { id -> showDeleteConfirmJobId = id },
                     )
                     AppTab.SETTINGS -> SettingsScreen(
                         downloadPath = downloadPath,
@@ -923,7 +991,23 @@ private fun ArcApp() {
                         defaultQuality = defaultQuality,
                         onOpenQualityDialog = { showQualityDialog = true },
                         notifications = notifications,
-                        onToggleNotifications = { notifications = it },
+                        onToggleNotifications = { enabled ->
+                            if (enabled) {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    notifications = true
+                                    preferences.edit().putBoolean("notifications_enabled", true).apply()
+                                    message("Notifications enabled.")
+                                }
+                            } else {
+                                notifications = false
+                                preferences.edit().putBoolean("notifications_enabled", false).apply()
+                                message("Notifications disabled.")
+                            }
+                        },
                         onTelegramSetup = { showTelegramSetup = true },
                         update = update,
                         onCheckUpdates = {
@@ -940,13 +1024,128 @@ private fun ArcApp() {
                 }
             }
 
-            // In-app embedded Media3 video player
+            // Stream Choice Dialog
+            if (showStreamChoiceDialog) {
+                AlertDialog(
+                    onDismissRequest = { showStreamChoiceDialog = false },
+                    title = { Text("Stream Media") },
+                    text = { Text("Choose a media player to stream this video.") },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showStreamChoiceDialog = false
+                                val streamTarget = resolvedUrl.ifEmpty { input }
+                                if (streamTarget.isNotBlank()) {
+                                    playingMedia = PlaybackInfo(streamTarget, target.title, target.streamHeaders)
+                                } else {
+                                    message("Stream link not ready yet.")
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                            shape = RoundedCornerShape(10.dp),
+                        ) {
+                            Text("Arc Player")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = {
+                                showStreamChoiceDialog = false
+                                val streamTarget = resolvedUrl.ifEmpty { input }
+                                if (streamTarget.isNotBlank()) {
+                                    openStreamExternal(streamTarget, target.streamHeaders)
+                                } else {
+                                    message("Stream link not ready yet.")
+                                }
+                            }
+                        ) {
+                            Text("External Player")
+                        }
+                    }
+                )
+            }
+
+            // Series Download Options Dialog
+            if (showSeriesDownloadDialog) {
+                AlertDialog(
+                    onDismissRequest = { showSeriesDownloadDialog = false },
+                    title = { Text("Download TV Series") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Choose download scope:", color = ArcMuted, fontSize = 12.sp)
+                            Button(
+                                onClick = {
+                                    showSeriesDownloadDialog = false
+                                    startDownload()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text("Episode S${target.selectedSeason}E${target.selectedEpisode}")
+                            }
+                            Button(
+                                onClick = {
+                                    showSeriesDownloadDialog = false
+                                    startDownload(customTitle = "${target.title} Season ${target.selectedSeason}")
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text("Season ${target.selectedSeason} (All Episodes)")
+                            }
+                            Button(
+                                onClick = {
+                                    showSeriesDownloadDialog = false
+                                    startDownload(customTitle = "${target.title} Complete Series")
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text("Complete Series (All Seasons)")
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { showSeriesDownloadDialog = false }) { Text("Cancel") }
+                    }
+                )
+            }
+
+            // Confirm Delete Dialog
+            showDeleteConfirmJobId?.let { delId ->
+                AlertDialog(
+                    onDismissRequest = { showDeleteConfirmJobId = null },
+                    title = { Text("Confirm Delete") },
+                    text = { Text("Are you sure you want to delete this media file from your device?") },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                deleteJob(delId, true)
+                                showDeleteConfirmJobId = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F), contentColor = Color.White),
+                            shape = RoundedCornerShape(10.dp),
+                        ) {
+                            Text("Delete")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showDeleteConfirmJobId = null }) { Text("Cancel") }
+                    }
+                )
+            }
+
+            // In-app embedded Arc Player (Inspired by LFS Web Player)
             playingMedia?.let { playback ->
-                InAppVideoPlayerDialog(
+                ArcWebStylePlayerDialog(
                     info = playback,
                     onDismiss = { playingMedia = null },
                     onOpenExternal = {
-                        openStreamInVlc(playback.url, playback.headers)
+                        openStreamExternal(playback.url, playback.headers)
                     },
                 )
             }
@@ -1202,28 +1401,6 @@ private fun ClaudeThinkingCard(
                             }
                         }
 
-                        if (isThinking && liveStep.isNotBlank()) {
-                            Row(
-                                verticalAlignment = Alignment.Top,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    ">",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    color = Color(0xFFFFB300),
-                                    fontWeight = FontWeight.Bold,
-                                )
-                                Text(
-                                    "$liveStep _",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    color = Color(0xFFFFB300),
-                                    lineHeight = 15.sp,
-                                )
-                            }
-                        }
-
                         if (trace?.stdoutLogs?.isNotBlank() == true) {
                             Spacer(Modifier.height(4.dp))
                             Text(
@@ -1290,6 +1467,8 @@ private fun HomeScreen(
                 label = { Text("Link or search") },
                 leadingIcon = { Icon(Icons.Outlined.Link, contentDescription = null) },
                 trailingIcon = { TextButton(onClick = onPaste) { Text("Paste") } },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { onAnalyze() }),
             )
             Spacer(Modifier.height(10.dp))
             Button(
@@ -1417,18 +1596,20 @@ private fun AnalysisScreen(
     onAudioOnly: (Boolean) -> Unit,
     onDownload: () -> Unit,
     onStream: () -> Unit,
-    onCopyLink: () -> Unit,
     onSelectSeason: ((Int) -> Unit)? = null,
-    onSelectEpisode: ((Int, Int) -> Unit)? = null,
+    onSelectEpisode: ((Int) -> Unit)? = null,
     onSelectPlaylistItem: ((PlaylistEntry) -> Unit)? = null,
 ) {
-    val displayQualities = remember(target.availableQualities) {
-        if (target.availableQualities.isNotEmpty()) {
+    val displayQualities = remember(target.availableQualities, audioOnly) {
+        if (audioOnly) {
+            listOf("Best Audio (320kbps)", "High Audio (256kbps)", "Standard Audio (192kbps)", "Compact Audio (128kbps)")
+        } else if (target.availableQualities.isNotEmpty()) {
             target.availableQualities
         } else {
-            listOf("Best", "1080p", "720p", "480p")
+            listOf("Best", "2160p (4K UHD)", "1440p (2K QHD)", "1080p (Full HD)", "720p (HD)", "480p (SD)", "360p (SD)")
         }
     }
+    var qualityMenuExpanded by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1474,7 +1655,12 @@ private fun AnalysisScreen(
                         MediaGlyph(Icons.Outlined.Movie, Modifier.size(76.dp))
                     }
                     Column(Modifier.weight(1f)) {
-                        Text(target.source.uppercase().ifBlank { "MEDIA" }, color = ArcMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (target.isSeries) "TV SERIES" else target.source.uppercase().ifBlank { "MEDIA" },
+                            color = ArcMuted,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
                         Spacer(Modifier.height(5.dp))
                         Text(target.title.ifBlank { "Resolving link..." }, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Spacer(Modifier.height(6.dp))
@@ -1484,7 +1670,7 @@ private fun AnalysisScreen(
             }
         }
 
-        // TV Series season and episode selectors if available
+        // TV Series season and episode selectors
         if (!loading && target.isSeries && target.seasons.isNotEmpty()) {
             item {
                 SectionHeader("Season", "S${target.selectedSeason}")
@@ -1501,14 +1687,14 @@ private fun AnalysisScreen(
             }
             item {
                 val currentSeason = target.seasons.firstOrNull { it.season == target.selectedSeason } ?: target.seasons.first()
-                SectionHeader("Episode", "E${target.selectedEpisode}")
+                SectionHeader("Episode", "E${target.selectedEpisode} of ${currentSeason.episodes}")
                 Spacer(Modifier.height(6.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items((1..currentSeason.episodes).toList()) { epNum ->
                         FilterChip(
                             selected = target.selectedEpisode == epNum,
-                            onClick = { onSelectEpisode?.invoke(target.selectedSeason, epNum) },
-                            label = { Text("Episode $epNum") },
+                            onClick = { onSelectEpisode?.invoke(epNum) },
+                            label = { Text("E$epNum") },
                         )
                     }
                 }
@@ -1521,7 +1707,7 @@ private fun AnalysisScreen(
                 SectionHeader("Playlist Items", "${target.playlistEntries.size} Videos")
                 Spacer(Modifier.height(6.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    target.playlistEntries.take(15).forEach { entry ->
+                    target.playlistEntries.take(30).forEach { entry ->
                         Card(
                             colors = CardDefaults.cardColors(containerColor = ArcRaised),
                             shape = RoundedCornerShape(10.dp),
@@ -1563,28 +1749,85 @@ private fun AnalysisScreen(
 
         if (!loading) {
             item {
-                SectionHeader("Quality", "$quality Selected")
-                Spacer(Modifier.height(10.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    displayQualities.chunked(4).forEach { row ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            row.forEach { option ->
-                                FilterChip(
-                                    selected = quality == option,
-                                    onClick = { onQuality(option) },
-                                    label = { Text(option) },
-                                    modifier = Modifier.weight(1f),
-                                )
+                SectionHeader("Stream Type")
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    FilterChip(
+                        selected = !audioOnly,
+                        onClick = {
+                            if (audioOnly) {
+                                onAudioOnly(false)
+                                onQuality("Best")
                             }
-                            repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
-                        }
-                    }
+                        },
+                        label = { Text("Video") },
+                        modifier = Modifier.weight(1f),
+                    )
+                    FilterChip(
+                        selected = audioOnly,
+                        onClick = {
+                            if (!audioOnly) {
+                                onAudioOnly(true)
+                                onQuality("Best Audio (320kbps)")
+                            }
+                        },
+                        label = { Text("Audio Only") },
+                        modifier = Modifier.weight(1f),
+                    )
                 }
             }
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    FilterChip(selected = !audioOnly, onClick = { onAudioOnly(false) }, label = { Text("Video") }, modifier = Modifier.weight(1f))
-                    FilterChip(selected = audioOnly, onClick = { onAudioOnly(true) }, label = { Text("Audio Only") }, modifier = Modifier.weight(1f))
+                SectionHeader(if (audioOnly) "Audio Quality" else "Video Quality")
+                Spacer(Modifier.height(8.dp))
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, Color(0xFF2B2B2B)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { qualityMenuExpanded = true },
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column {
+                                Text(if (audioOnly) "Bitrate Profile" else "Quality Profile", fontSize = 11.sp, color = ArcMuted)
+                                Text(quality, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = ArcWhite)
+                            }
+                            Icon(Icons.Outlined.ArrowDropDown, contentDescription = null, tint = ArcWhite)
+                        }
+                    }
+                    DropdownMenu(
+                        expanded = qualityMenuExpanded,
+                        onDismissRequest = { qualityMenuExpanded = false },
+                        modifier = Modifier.background(ArcSurface),
+                    ) {
+                        displayQualities.forEach { opt ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        opt,
+                                        color = if (opt == quality) ArcWhite else ArcMuted,
+                                        fontWeight = if (opt == quality) FontWeight.Bold else FontWeight.Normal,
+                                    )
+                                },
+                                onClick = {
+                                    onQuality(opt)
+                                    qualityMenuExpanded = false
+                                },
+                                trailingIcon = {
+                                    if (opt == quality) {
+                                        Icon(Icons.Outlined.Check, contentDescription = null, tint = ArcWhite, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            )
+                        }
+                    }
                 }
             }
             item {
@@ -1596,20 +1839,20 @@ private fun AnalysisScreen(
                 ) {
                     Icon(Icons.Outlined.FileDownload, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Download $quality", fontWeight = FontWeight.Bold)
+                    Text(
+                        if (target.isSeries) "Download S${target.selectedSeason}E${target.selectedEpisode}" else "Download $quality",
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
                 Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedButton(onClick = onStream, modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
-                        Icon(Icons.Outlined.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(5.dp))
-                        Text("Stream")
-                    }
-                    OutlinedButton(onClick = onCopyLink, modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
-                        Icon(Icons.Outlined.Share, contentDescription = null)
-                        Spacer(Modifier.width(5.dp))
-                        Text("Copy Link")
-                    }
+                OutlinedButton(
+                    onClick = onStream,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Icon(Icons.Outlined.PlayArrow, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Stream", fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -1619,11 +1862,7 @@ private fun AnalysisScreen(
 @Composable
 private fun ActivityScreen(
     jobs: List<DownloadJob>,
-    onOpen: (String) -> Unit,
-    onShare: (String) -> Unit,
-    onPlayInApp: (DownloadJob) -> Unit,
     onCancelJob: (String) -> Unit,
-    onDeleteJob: (String, Boolean) -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1633,10 +1872,10 @@ private fun ActivityScreen(
         item {
             Text("Activity", fontSize = 26.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
-            Text("Active and completed downloads", color = ArcMuted, fontSize = 13.sp)
+            Text("Active downloads in progress", color = ArcMuted, fontSize = 13.sp)
         }
         if (jobs.isEmpty()) {
-            item { EmptyState("No Activity", "Downloads will appear here.") }
+            item { EmptyState("No Active Downloads", "Active downloads will appear here.") }
         } else {
             items(jobs) { job ->
                 Card(
@@ -1680,14 +1919,7 @@ private fun ActivityScreen(
                             }
                             Box(
                                 modifier = Modifier
-                                    .background(
-                                        when (job.status) {
-                                            "Downloading" -> Color(0xFF1E3A5F)
-                                            "Complete" -> Color(0xFF1E4620)
-                                            else -> Color(0xFF3A1E1E)
-                                        },
-                                        RoundedCornerShape(8.dp),
-                                    )
+                                    .background(Color(0xFF1E3A5F), RoundedCornerShape(8.dp))
                                     .padding(horizontal = 8.dp, vertical = 4.dp),
                             ) {
                                 Text(
@@ -1699,101 +1931,46 @@ private fun ActivityScreen(
                             }
                         }
 
-                        // Animated progress indicator if downloading
-                        if (job.status == "Downloading") {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            LinearProgressIndicator(
-                                progress = { (job.progress / 100f).coerceIn(0f, 1f) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(RoundedCornerShape(3.dp)),
-                                color = ArcWhite,
-                                trackColor = Color(0xFF262626),
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val animatedProgress by animateFloatAsState(
+                            targetValue = (job.progress / 100f).coerceIn(0f, 1f),
+                            animationSpec = tween(durationMillis = 350, easing = LinearOutSlowInEasing),
+                            label = "jobProgress",
+                        )
+                        LinearProgressIndicator(
+                            progress = { animatedProgress },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp)),
+                            color = ArcWhite,
+                            trackColor = Color(0xFF262626),
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = "${String.format("%.1f", job.progress)}% | ${job.downloaded}/${job.total}",
+                                fontSize = 11.sp,
+                                color = ArcMuted,
                             )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
+                            Text(
+                                text = "${job.speed} | ETA ${job.eta}",
+                                fontSize = 11.sp,
+                                color = ArcMuted,
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(
+                                onClick = { onCancelJob(job.id) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                             ) {
-                                Text(
-                                    text = "${String.format("%.1f", job.progress)}% | ${job.downloaded}/${job.total}",
-                                    fontSize = 11.sp,
-                                    color = ArcMuted,
-                                )
-                                Text(
-                                    text = "${job.speed} | ETA ${job.eta}",
-                                    fontSize = 11.sp,
-                                    color = ArcMuted,
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                                OutlinedButton(
-                                    onClick = { onCancelJob(job.id) },
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                ) {
-                                    Icon(Icons.Outlined.Stop, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Cancel", fontSize = 11.sp)
-                                }
-                            }
-                        } else if (job.status == "Complete") {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            if (job.path.isNotBlank()) {
-                                Text(job.path, color = ArcSubtle, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Spacer(modifier = Modifier.height(6.dp))
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.End,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Button(
-                                    onClick = { onPlayInApp(job) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                    shape = RoundedCornerShape(8.dp),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                ) {
-                                    Icon(Icons.Outlined.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Play", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                }
-                                Spacer(modifier = Modifier.width(6.dp))
-                                OutlinedButton(
-                                    onClick = { onOpen(job.path) },
-                                    shape = RoundedCornerShape(8.dp),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                ) {
-                                    Text("Open", fontSize = 11.sp)
-                                }
-                                Spacer(modifier = Modifier.width(6.dp))
-                                OutlinedButton(
-                                    onClick = { onShare(job.path) },
-                                    shape = RoundedCornerShape(8.dp),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                ) {
-                                    Text("Share", fontSize = 11.sp)
-                                }
-                                Spacer(modifier = Modifier.width(6.dp))
-                                IconButton(
-                                    onClick = { onDeleteJob(job.id, true) },
-                                    modifier = Modifier.size(32.dp),
-                                ) {
-                                    Icon(Icons.Outlined.Delete, contentDescription = "Delete", tint = Color(0xFFFF5252), modifier = Modifier.size(16.dp))
-                                }
-                            }
-                        } else {
-                            // Cancelled or Failed
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                                OutlinedButton(
-                                    onClick = { onDeleteJob(job.id, false) },
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                    shape = RoundedCornerShape(8.dp),
-                                ) {
-                                    Text("Dismiss", fontSize = 11.sp)
-                                }
+                                Icon(Icons.Outlined.Stop, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Cancel", fontSize = 11.sp)
                             }
                         }
                     }
@@ -1809,9 +1986,8 @@ private fun LibraryScreen(
     onOpen: (String) -> Unit,
     onShare: (String) -> Unit,
     onPlayInApp: (DownloadJob) -> Unit,
-    onDeleteJob: (String, Boolean) -> Unit,
+    onDeletePrompt: (String) -> Unit,
 ) {
-    val completed = jobs.filter { it.status == "Complete" }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 22.dp),
@@ -1822,10 +1998,10 @@ private fun LibraryScreen(
             Spacer(Modifier.height(4.dp))
             Text("Downloaded media files on device.", color = ArcMuted, fontSize = 13.sp)
         }
-        if (completed.isEmpty()) {
+        if (jobs.isEmpty()) {
             item { EmptyState("No Files Yet", "Completed downloads will appear here.") }
         } else {
-            items(completed) { job ->
+            items(jobs) { job ->
                 Card(
                     colors = CardDefaults.cardColors(containerColor = ArcRaised),
                     shape = RoundedCornerShape(14.dp),
@@ -1892,7 +2068,7 @@ private fun LibraryScreen(
                                 shape = RoundedCornerShape(8.dp),
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             ) {
-                                Text("Open", fontSize = 11.sp)
+                                Text("External", fontSize = 11.sp)
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             OutlinedButton(
@@ -1904,7 +2080,7 @@ private fun LibraryScreen(
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             IconButton(
-                                onClick = { onDeleteJob(job.id, true) },
+                                onClick = { onDeletePrompt(job.id) },
                                 modifier = Modifier.size(32.dp),
                             ) {
                                 Icon(Icons.Outlined.Delete, contentDescription = "Delete", tint = Color(0xFFFF5252), modifier = Modifier.size(16.dp))
@@ -1991,12 +2167,44 @@ private fun SettingsScreen(
 
         item {
             SettingsGroup("Preferences")
-            SettingRow(
-                title = "Notifications",
-                detail = "Alerts when downloads finish",
-                icon = Icons.Outlined.NotificationsNone,
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onToggleNotifications(!notifications) },
             ) {
-                Switch(checked = notifications, onCheckedChange = onToggleNotifications)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                ) {
+                    MediaGlyph(Icons.Outlined.NotificationsNone, Modifier.size(36.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Notifications", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(
+                            if (notifications) "Enabled · Alerts when downloads finish" else "Disabled · Muted",
+                            color = if (notifications) ArcWhite else ArcMuted,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (notifications) Color(0xFF1E3A5F) else Color(0xFF222222))
+                            .border(1.dp, if (notifications) Color(0xFF2A5A8C) else Color(0xFF333333), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = if (notifications) "ON" else "OFF",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (notifications) Color.White else ArcMuted,
+                        )
+                    }
+                }
             }
         }
 
@@ -2026,13 +2234,25 @@ private fun SettingsScreen(
     }
 }
 
+/**
+ * Fullscreen Arc Player designed after the LFS Web Player (Local File Sharer).
+ * Cinema dark (#000), seek slider, +/-10s scrub, speed, and audio/subtitle track pickers.
+ */
 @Composable
-private fun InAppVideoPlayerDialog(
+private fun ArcWebStylePlayerDialog(
     info: PlaybackInfo,
     onDismiss: () -> Unit,
     onOpenExternal: () -> Unit,
 ) {
     val context = LocalContext.current
+    var isPlaying by remember { mutableStateOf(true) }
+    var currentPosition by remember { mutableLongStateOf(0L) }
+    var totalDuration by remember { mutableLongStateOf(0L) }
+    var showControls by remember { mutableStateOf(true) }
+    var currentSpeed by remember { mutableFloatStateOf(1.0f) }
+    var showAudioTrackDialog by remember { mutableStateOf(false) }
+    var showSubtitleDialog by remember { mutableStateOf(false) }
+
     val exoPlayer = remember(info.url) {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -2040,13 +2260,19 @@ private fun InAppVideoPlayerDialog(
         if (info.headers.isNotEmpty()) {
             httpDataSourceFactory.setDefaultRequestProperties(info.headers)
         }
-        val mediaSourceFactory = DefaultMediaSourceFactory(context)
-            .setDataSourceFactory(httpDataSourceFactory)
+        val upstreamFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
+        val mediaSourceFactory = DefaultMediaSourceFactory(upstreamFactory)
+
+        val mediaUri = when {
+            info.url.startsWith("http://") || info.url.startsWith("https://") -> Uri.parse(info.url)
+            info.url.startsWith("content://") || info.url.startsWith("file://") -> Uri.parse(info.url)
+            else -> Uri.fromFile(File(info.url))
+        }
 
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(mediaSourceFactory)
             .build().apply {
-                val mediaItem = MediaItem.fromUri(Uri.parse(info.url))
+                val mediaItem = MediaItem.fromUri(mediaUri)
                 setMediaItem(mediaItem)
                 prepare()
                 playWhenReady = true
@@ -2054,8 +2280,46 @@ private fun InAppVideoPlayerDialog(
     }
 
     DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+            }
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                totalDuration = exoPlayer.duration.coerceAtLeast(0L)
+            }
+        }
+        exoPlayer.addListener(listener)
         onDispose {
+            exoPlayer.removeListener(listener)
             exoPlayer.release()
+        }
+    }
+
+    LaunchedEffect(exoPlayer, isPlaying) {
+        while (true) {
+            currentPosition = exoPlayer.currentPosition.coerceAtLeast(0L)
+            totalDuration = exoPlayer.duration.coerceAtLeast(0L)
+            delay(500)
+        }
+    }
+
+    // Auto-hide controls after 3.5s
+    LaunchedEffect(showControls, isPlaying) {
+        if (showControls && isPlaying) {
+            delay(3500)
+            showControls = false
+        }
+    }
+
+    fun formatTime(ms: Long): String {
+        val totalSecs = (ms / 1000).coerceAtLeast(0)
+        val hours = totalSecs / 3600
+        val mins = (totalSecs % 3600) / 60
+        val secs = totalSecs % 60
+        return if (hours > 0) {
+            String.format("%d:%02d:%02d", hours, mins, secs)
+        } else {
+            String.format("%02d:%02d", mins, secs)
         }
     }
 
@@ -2067,11 +2331,12 @@ private fun InAppVideoPlayerDialog(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
+                .clickable { showControls = !showControls }
         ) {
             AndroidView(
                 factory = { ctx ->
                     PlayerView(ctx).apply {
-                        useController = true
+                        useController = false
                         layoutParams = ViewGroup.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT
@@ -2082,42 +2347,284 @@ private fun InAppVideoPlayerDialog(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // Top control bar
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp)
-                    .align(Alignment.TopCenter),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            // Overlaid Controls (Cinema Style)
+            AnimatedVisibility(
+                visible = showControls,
+                enter = fadeIn(),
+                exit = fadeOut(),
             ) {
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.background(Color(0x88000000), CircleShape),
-                ) {
-                    Icon(Icons.Outlined.Close, contentDescription = "Close", tint = Color.White)
-                }
-
-                Text(
-                    text = info.title,
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                Box(
                     modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 12.dp),
-                )
-
-                Button(
-                    onClick = onOpenExternal,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xAA222222), contentColor = Color.White),
-                    shape = RoundedCornerShape(20.dp),
+                        .fillMaxSize()
+                        .background(Color(0x88000000))
                 ) {
-                    Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("VLC", fontSize = 12.sp)
+                    // Top Bar
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                            .align(Alignment.TopCenter),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.background(Color(0xAA111111), CircleShape),
+                        ) {
+                            Icon(Icons.Outlined.Close, contentDescription = "Close", tint = Color.White)
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 12.dp)
+                        ) {
+                            Text(
+                                text = info.title,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = if (info.url.startsWith("http")) "Live Media Stream" else "Local Storage Media",
+                                color = ArcMuted,
+                                fontSize = 11.sp,
+                            )
+                        }
+
+                        Button(
+                            onClick = onOpenExternal,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xAA222222), contentColor = Color.White),
+                            shape = RoundedCornerShape(20.dp),
+                        ) {
+                            Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("External Player", fontSize = 12.sp)
+                        }
+                    }
+
+                    // Center Transport Controls
+                    Row(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalArrangement = Arrangement.spacedBy(32.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(
+                            onClick = { exoPlayer.seekTo((exoPlayer.currentPosition - 10000).coerceAtLeast(0)) },
+                            modifier = Modifier.size(48.dp).background(Color(0x55000000), CircleShape),
+                        ) {
+                            Icon(Icons.Outlined.Replay10, contentDescription = "Rewind 10s", tint = Color.White, modifier = Modifier.size(28.dp))
+                        }
+
+                        Surface(
+                            modifier = Modifier
+                                .size(64.dp)
+                                .clickable {
+                                    if (exoPlayer.isPlaying) {
+                                        exoPlayer.pause()
+                                    } else {
+                                        exoPlayer.play()
+                                    }
+                                },
+                            shape = CircleShape,
+                            color = Color.White,
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Outlined.Pause else Icons.Outlined.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pause" else "Play",
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(36.dp),
+                                )
+                            }
+                        }
+
+                        IconButton(
+                            onClick = { exoPlayer.seekTo((exoPlayer.currentPosition + 10000).coerceAtMost(exoPlayer.duration)) },
+                            modifier = Modifier.size(48.dp).background(Color(0x55000000), CircleShape),
+                        ) {
+                            Icon(Icons.Outlined.Forward10, contentDescription = "Forward 10s", tint = Color.White, modifier = Modifier.size(28.dp))
+                        }
+                    }
+
+                    // Bottom Bar with Scrub Bar & Track Selection
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 16.dp)
+                            .align(Alignment.BottomCenter)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(formatTime(currentPosition), color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                            Text(formatTime(totalDuration), color = ArcMuted, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        }
+
+                        Slider(
+                            value = if (totalDuration > 0) (currentPosition.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f) else 0f,
+                            onValueChange = { frac ->
+                                if (totalDuration > 0) {
+                                    val targetMs = (frac * totalDuration).toLong()
+                                    exoPlayer.seekTo(targetMs)
+                                }
+                            },
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color.White,
+                                activeTrackColor = Color.White,
+                                inactiveTrackColor = Color(0x55FFFFFF),
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            // Speed Toggle
+                            OutlinedButton(
+                                onClick = {
+                                    val speeds = listOf(1.0f, 1.25f, 1.5f, 2.0f)
+                                    val nextIdx = (speeds.indexOf(currentSpeed) + 1) % speeds.size
+                                    currentSpeed = speeds[nextIdx]
+                                    exoPlayer.setPlaybackSpeed(currentSpeed)
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Text("${currentSpeed}x", fontSize = 11.sp, color = Color.White)
+                            }
+
+                            // Audio Tracks
+                            OutlinedButton(
+                                onClick = { showAudioTrackDialog = true },
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Text("Audio", fontSize = 11.sp, color = Color.White)
+                            }
+
+                            // Subtitles
+                            OutlinedButton(
+                                onClick = { showSubtitleDialog = true },
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Icon(Icons.Outlined.Subtitles, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Subtitles", fontSize = 11.sp, color = Color.White)
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Audio Track Selection Dialog
+            if (showAudioTrackDialog) {
+                val tracks = exoPlayer.currentTracks
+                val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+                AlertDialog(
+                    onDismissRequest = { showAudioTrackDialog = false },
+                    title = { Text("Select Audio Track") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (audioGroups.isEmpty()) {
+                                Text("Default audio track only.", color = ArcMuted)
+                            } else {
+                                audioGroups.forEachIndexed { gIdx, group ->
+                                    for (tIdx in 0 until group.length) {
+                                        val isSelected = group.isTrackSelected(tIdx)
+                                        val format = group.getTrackFormat(tIdx)
+                                        val label = format.language?.uppercase() ?: format.label ?: "Track #${gIdx + 1}"
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                                        .buildUpon()
+                                                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, tIdx))
+                                                        .build()
+                                                    showAudioTrackDialog = false
+                                                }
+                                                .padding(vertical = 8.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Text(label, color = if (isSelected) ArcWhite else ArcMuted)
+                                            if (isSelected) {
+                                                Icon(Icons.Outlined.Check, contentDescription = null, tint = ArcWhite)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showAudioTrackDialog = false }) { Text("Close") }
+                    }
+                )
+            }
+
+            // Subtitle Selection Dialog
+            if (showSubtitleDialog) {
+                val tracks = exoPlayer.currentTracks
+                val textGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
+                AlertDialog(
+                    onDismissRequest = { showSubtitleDialog = false },
+                    title = { Text("Subtitles") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                            .buildUpon()
+                                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                            .build()
+                                        showSubtitleDialog = false
+                                    }
+                                    .padding(vertical = 8.dp),
+                            ) {
+                                Text("Off (Disable Subtitles)", color = ArcWhite)
+                            }
+                            textGroups.forEachIndexed { gIdx, group ->
+                                for (tIdx in 0 until group.length) {
+                                    val isSelected = group.isTrackSelected(tIdx)
+                                    val format = group.getTrackFormat(tIdx)
+                                    val label = format.language?.uppercase() ?: format.label ?: "Subtitle #${gIdx + 1}"
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                                    .buildUpon()
+                                                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                                    .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, tIdx))
+                                                    .build()
+                                                showSubtitleDialog = false
+                                            }
+                                            .padding(vertical = 8.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Text(label, color = if (isSelected) ArcWhite else ArcMuted)
+                                        if (isSelected) {
+                                            Icon(Icons.Outlined.Check, contentDescription = null, tint = ArcWhite)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showSubtitleDialog = false }) { Text("Close") }
+                    }
+                )
             }
         }
     }
@@ -2140,7 +2647,7 @@ private fun SaveLocationDialog(
     }
     var inputPath by remember { mutableStateOf(currentPath) }
 
-    androidx.compose.material3.AlertDialog(
+    AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Download Save Location") },
         text = {
@@ -2236,8 +2743,8 @@ private fun DefaultQualityDialog(
     onQualitySelected: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val options = listOf("Best", "1080p", "720p", "480p", "Audio Only")
-    androidx.compose.material3.AlertDialog(
+    val options = listOf("Best", "2160p (4K)", "1440p (2K)", "1080p (Full HD)", "720p (HD)", "480p (SD)", "Audio Only")
+    AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Default Download Quality") },
         text = {
@@ -2283,16 +2790,21 @@ private fun TelegramSetupDialog(
     onSave: (String, String, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var id by remember { mutableStateOf(apiId) }
     var hash by remember { mutableStateOf(apiHash) }
     var sess by remember { mutableStateOf(session) }
+    var checkLoading by remember { mutableStateOf(false) }
+    var checkResult by remember { mutableStateOf<String?>(null) }
+    var checkSuccess by remember { mutableStateOf(false) }
 
-    androidx.compose.material3.AlertDialog(
+    AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Telegram Session Credentials") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Enter Pyrogram session details for Telegram media downloads.", color = ArcMuted, fontSize = 11.sp)
+                Text("Enter Pyrogram session credentials for Telegram media downloads.", color = ArcMuted, fontSize = 11.sp)
                 OutlinedTextField(
                     value = id,
                     onValueChange = { id = it },
@@ -2314,6 +2826,49 @@ private fun TelegramSetupDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+
+                if (checkResult != null) {
+                    Text(
+                        text = checkResult.orEmpty(),
+                        color = if (checkSuccess) Color(0xFF4CAF50) else Color(0xFFFF5252),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        checkLoading = true
+                        checkResult = null
+                        scope.launch {
+                            val payload = JSONObject().apply {
+                                put("action", "telegram_check")
+                                put("api_id", id.trim())
+                                put("api_hash", hash.trim())
+                                put("session", sess.trim())
+                            }
+                            val res = withContext(Dispatchers.IO) {
+                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                            }
+                            checkLoading = false
+                            if (res != null && res.optBoolean("ok", false)) {
+                                val rObj = res.optJSONObject("result")
+                                val u = rObj?.optString("user", "Account Verified") ?: "Verified"
+                                checkSuccess = true
+                                checkResult = "Connected: $u"
+                            } else {
+                                checkSuccess = false
+                                checkResult = "Error: ${res?.optString("error") ?: "Connection failed"}"
+                            }
+                        }
+                    },
+                    enabled = !checkLoading && id.isNotBlank() && hash.isNotBlank() && sess.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Outlined.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (checkLoading) "Testing connection..." else "Test Connection", fontSize = 12.sp)
+                }
             }
         },
         confirmButton = {
@@ -2376,18 +2931,6 @@ private fun SectionHeader(title: String, action: String? = null, onAction: (() -
 @Composable
 private fun SettingsGroup(title: String) {
     Text(title, color = ArcMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 10.dp, bottom = 3.dp))
-}
-
-@Composable
-private fun SettingRow(title: String, detail: String, icon: ImageVector, control: @Composable (() -> Unit)? = null) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-        MediaGlyph(icon, Modifier.size(36.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-            Text(detail, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        if (control != null) control()
-    }
 }
 
 @Composable

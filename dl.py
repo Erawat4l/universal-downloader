@@ -1442,21 +1442,22 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         'Origin': 'https://netmirror.plus'
     }
 
-    # Query NetMirror API with auto-fallback between movie and tv
-    results = []
-    types_to_try = [media_type, 'tv' if media_type == 'movie' else 'movie']
-    for m_type in types_to_try:
-        try:
-            api_url = f'https://api2.imdb3.shop/api/{m_type}/{media_id}'
-            res = requests.get(api_url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                results = data.get('results', [])
-                if results:
-                    media_type = m_type
-                    break
-        except Exception:
-            continue
+    hosts_to_try = ['api2.imdb4.shop', 'api2.imdb3.shop']
+    for h in hosts_to_try:
+        for m_type in types_to_try:
+            try:
+                api_url = f'https://{h}/api/{m_type}/{media_id}'
+                res = requests.get(api_url, headers=headers, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
+                    results = data.get('results', [])
+                    if results:
+                        media_type = m_type
+                        break
+            except Exception:
+                continue
+        if results:
+            break
     if not results:
         raise Exception(f"No metadata found on NetMirror for ID {media_id}")
         
@@ -2182,12 +2183,28 @@ def search_netmirror(query):
                 return (7, -it['num_year'])
             return (8, -it['num_year'])
 
+        # Title-casing and common typo word replacements (e.g. "son f anachy" -> "Sons of Anarchy")
+        if norm_q.title() not in queries_to_try:
+            queries_to_try.append(norm_q.title())
+
+        typo_words = []
+        for w in norm_q.split():
+            lw = w.lower()
+            if lw == 'f': typo_words.append('of')
+            elif lw == 'n': typo_words.append('and')
+            elif lw == 'anachy': typo_words.append('anarchy')
+            else: typo_words.append(w)
+        fixed_typo_str = ' '.join(typo_words)
+        if fixed_typo_str not in queries_to_try:
+            queries_to_try.append(fixed_typo_str)
+            queries_to_try.append(fixed_typo_str.title())
+
         def query_api(q):
             clean_q = urllib.parse.quote(q)
-            for host in ['api2.imdb3.shop', 'api2.imdb4.shop']:
+            for host in ['api2.imdb4.shop', 'api2.imdb3.shop']:
                 try:
                     url = f'https://{host}/api/search2/{clean_q}?page=0'
-                    r = s.get(url, timeout=3.5)
+                    r = s.get(url, timeout=7)
                     if r.status_code == 200:
                         data = r.json()
                         results = data.get('results', [])
@@ -2223,18 +2240,21 @@ def search_netmirror(query):
             if res:
                 return res
 
-        # Fallback 1: Wikipedia opensearch for accurate movie / series spelling
+        # Fallback 1: Wikipedia opensearch for typo-correction (e.g. "son f anachy" -> "Sons of Anarchy")
         try:
             wiki_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(norm_q)}&limit=5&namespace=0&format=json"
-            wiki_res = requests.get(wiki_url, headers={'User-Agent': 'universal-downloader/1.0'}, timeout=3).json()
+            wiki_res = requests.get(wiki_url, headers={'User-Agent': 'universal-downloader/1.0'}, timeout=4).json()
             if len(wiki_res) > 1 and wiki_res[1]:
                 for candidate in wiki_res[1]:
                     cand_clean = re.sub(r'\(.*?\)', '', candidate).strip()
                     for noise in ['series', 'tv series', 'movie', 'film', 'season']:
                         cand_clean = re.sub(rf'\b{noise}\b', '', cand_clean, flags=re.I).strip()
                     cand_clean = ' '.join(cand_clean.split())
-                    if cand_clean and cand_clean.lower() != norm_q.lower():
+                    if cand_clean:
                         res = query_api(cand_clean)
+                        if res:
+                            return res
+                        res = query_api(cand_clean.title())
                         if res:
                             return res
                         if not cand_clean.lower().endswith('s'):
@@ -2248,15 +2268,18 @@ def search_netmirror(query):
         try:
             for s_q in [norm_q, norm_q + ' series', norm_q + ' movie']:
                 suggest_url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote(s_q)}"
-                s_res = requests.get(suggest_url, timeout=3).json()
+                s_res = requests.get(suggest_url, timeout=4).json()
                 if len(s_res) > 1 and s_res[1]:
                     for sug in s_res[1][:5]:
                         cleaned_sug = sug
                         for noise in ['netflix series', 'web series', 'series cast', 'series review', 'series rating', 'series', 'imdb', 'cast', 'movie', 'film', 'ott', 'where to watch', 'meaning', 'in hindi', 'jacket', 'bike', 'season']:
                             cleaned_sug = re.sub(rf'\b{noise}\b', '', cleaned_sug, flags=re.I).strip()
                         cand = ' '.join(cleaned_sug.split())
-                        if cand and len(cand) > 2 and cand.lower() != norm_q.lower():
+                        if cand and len(cand) > 2:
                             res = query_api(cand)
+                            if res:
+                                return res
+                            res = query_api(cand.title())
                             if res:
                                 return res
                             if not cand.lower().endswith('s'):
@@ -3020,13 +3043,15 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 "quiet": True,
                 "no_warnings": True,
                 "extract_flat": "in_playlist",
-                "socket_timeout": 8,
+                "playlist_items": "1:50",
+                "ignoreerrors": True,
+                "socket_timeout": 12,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False) or {}
             entries_raw = info.get("entries", []) or []
             entries_list = []
-            for i, e in enumerate(entries_raw[:60]):
+            for i, e in enumerate(entries_raw[:50]):
                 if not e: continue
                 e_id = e.get("id") or ""
                 e_title = e.get("title") or f"Item #{i+1}"
@@ -3039,13 +3064,13 @@ def app_resolve(url, quality="best", season=None, episode=None):
                     "thumbnail": e_thumb,
                     "duration": e.get("duration", 0),
                 })
-            print(f"[OK] Playlist recognized: {info.get('title', 'Playlist')} ({len(entries_raw)} items)")
+            print(f"[OK] Playlist recognized: {info.get('title', 'Playlist')} ({len(entries_list)} items)")
             return {
                 "is_playlist": True,
                 "title": info.get("title", "YouTube Playlist"),
-                "source": "YouTube Playlist",
+                "source": "YouTube",
                 "poster": entries_list[0]["thumbnail"] if entries_list else "",
-                "total_count": len(entries_raw),
+                "total_count": len(entries_list),
                 "entries": entries_list,
                 "url": url,
             }
@@ -3095,11 +3120,23 @@ def app_resolve(url, quality="best", season=None, episode=None):
         if not stream_url:
             raise Exception("No direct stream could be extracted from video source")
 
-        # Extract REAL qualities from formats list
-        heights = sorted(list(set(f.get("height") for f in formats if f.get("height"))), reverse=True)
-        real_qualities = ["Best"] + [f"{h}p" for h in heights]
+        # Extract REAL video qualities, formatting them cleanly (4K, 1440p, 1080p, 720p, 480p, 360p)
+        heights = sorted(list(set(f.get("height") for f in formats if f.get("height") and f.get("height") >= 360)), reverse=True)
+        quality_map = {
+            2160: "2160p (4K)",
+            1440: "1440p (2K)",
+            1080: "1080p (Full HD)",
+            720: "720p (HD)",
+            480: "480p (SD)",
+            360: "360p (SD)",
+        }
+        real_qualities = ["Best"]
+        for h in heights:
+            lbl = quality_map.get(h, f"{h}p")
+            if lbl not in real_qualities:
+                real_qualities.append(lbl)
         if len(real_qualities) <= 1:
-            real_qualities = ["Best", "1080p", "720p", "480p"]
+            real_qualities = ["Best", "1080p (Full HD)", "720p (HD)", "480p (SD)"]
 
         thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get('id') else "")
 
@@ -3107,7 +3144,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
         return {
             "url": stream_url,
             "title": info.get("title", "Resolved video"),
-            "source": info.get("extractor_key", "Video source"),
+            "source": info.get("extractor_key", "YouTube"),
             "poster": thumb,
             "quality": quality,
             "qualities": real_qualities,
@@ -3257,6 +3294,54 @@ def app_download(payload):
     return {"path": path, "quality": quality, "target_dir": target_dir}
 
 
+def app_telegram_check(payload):
+    api_id = payload.get("api_id")
+    api_hash = str(payload.get("api_hash", "")).strip()
+    session = str(payload.get("session", "")).strip()
+
+    if not api_id or not str(api_id).strip().isdigit():
+        raise Exception("API ID must be a numeric integer")
+    if not api_hash:
+        raise Exception("API HASH is required")
+    if not session:
+        raise Exception("String session is required")
+
+    try:
+        from pyrogram import Client
+    except ImportError:
+        raise Exception("Pyrogram is not available in environment")
+
+    try:
+        client = Client(
+            "temp_tg_checker",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            session_string=session,
+            in_memory=True,
+        )
+        client.start()
+        me = client.get_me()
+        user_info = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        if me.username:
+            user_info += f" (@{me.username})"
+        phone = me.phone_number or ""
+        client.stop()
+        return {
+            "valid": True,
+            "user": user_info or "Telegram User",
+            "phone": phone,
+        }
+    except Exception as e:
+        err_msg = str(e)
+        if "API_ID_INVALID" in err_msg:
+            raise Exception("Invalid API ID or Hash")
+        if "SESSION_STRING" in err_msg or "SESSION_PASSWORD" in err_msg:
+            raise Exception("Invalid or expired string session")
+        if "AUTH_KEY" in err_msg:
+            raise Exception("Session revoked or expired")
+        raise Exception(f"Connection failed: {err_msg[:60]}")
+
+
 def run_app_json_request(payload):
     action = str(payload.get("action", "")).lower().strip()
     if action == "capabilities":
@@ -3281,6 +3366,8 @@ def run_app_json_request(payload):
                 )
             elif action == "download":
                 result = app_download(payload)
+            elif action == "telegram_check":
+                result = app_telegram_check(payload)
             else:
                 raise Exception("Unknown app action. Use capabilities, search, resolve, download, progress, or cancel.")
         
