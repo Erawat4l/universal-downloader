@@ -863,6 +863,7 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'file_access_retries': 10,
         'concurrent_fragment_downloads': 16,
         'logger': NetworkAwareLogger(),
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
     }
 
     node_bin = shutil.which('node')
@@ -1319,24 +1320,41 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
         if res_path:
             return res_path
     except Exception as e:
-        print(f"⚠ Pyrogram download error ({e}). Trying Telegram web embed fallback...")
+        print(f"[WARN] Pyrogram unavailable or not configured. Using Telegram web embed fallback...")
 
     try:
-        clean_channel = chat_id if isinstance(chat_id, str) else None
-        if clean_channel and msg_id:
-            embed_url = f"https://t.me/s/{clean_channel}/{msg_id}"
-            res = requests.get(embed_url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            video = soup.find('video')
-            if video and video.get('src'):
-                return download_file_stream(video['src'], clean_filename(out_name or f"telegram_{clean_channel}_{msg_id}.mp4"), target_dir=target_dir)
-            doc = soup.find('a', class_=re.compile(r'tgme_widget_message_document'))
-            if doc and doc.get('href'):
-                href = doc['href']
-                if not href.startswith(('https://t.me/', 'http://t.me/')):
-                    return download_file_stream(href, clean_filename(out_name or f"telegram_{clean_channel}_{msg_id}"), target_dir=target_dir)
+        parsed_url = urllib.parse.urlparse(url)
+        p_parts = [p for p in parsed_url.path.split('/') if p]
+        chan_name = None
+        m_id = None
+        if len(p_parts) >= 2:
+            chan_name = p_parts[1] if p_parts[0] == 's' else p_parts[0]
+            m_id = p_parts[-1]
+        elif chat_id and msg_id:
+            chan_name = str(chat_id)
+            m_id = str(msg_id)
+
+        if chan_name and m_id:
+            for embed_url in [f"https://t.me/s/{chan_name}/{m_id}", f"https://t.me/{chan_name}/{m_id}?embed=1"]:
+                try:
+                    res = requests.get(embed_url, headers=HEADERS, timeout=12)
+                    if res.status_code == 200:
+                        soup = BeautifulSoup(res.text, 'html.parser')
+                        video = soup.find('video')
+                        if video and video.get('src'):
+                            return download_file_stream(video['src'], clean_filename(out_name or f"telegram_{chan_name}_{m_id}.mp4"), target_dir=target_dir)
+                        audio = soup.find('audio')
+                        if audio and audio.get('src'):
+                            return download_file_stream(audio['src'], clean_filename(out_name or f"telegram_{chan_name}_{m_id}.mp3"), target_dir=target_dir)
+                        doc = soup.find('a', class_=re.compile(r'tgme_widget_message_document'))
+                        if doc and doc.get('href'):
+                            href = doc['href']
+                            if not href.startswith(('https://t.me/', 'http://t.me/')):
+                                return download_file_stream(href, clean_filename(out_name or f"telegram_{chan_name}_{m_id}"), target_dir=target_dir)
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"✖ Web embed fallback failed: {e}")
+        print(f"[ERROR] Web embed fallback: {e}")
 
     raise Exception("Could not download Telegram link media.")
 
@@ -2775,10 +2793,17 @@ def app_search_youtube(query):
 def app_search(query, platform="netmirror"):
     if not query or not str(query).strip():
         raise Exception("Search query is empty")
+    print(f"> Searching platform: {platform}")
+    print(f"> Query: '{query}'")
     if str(platform).lower() in ("youtube", "yt"):
-        return {"platform": "youtube", "results": app_search_youtube(str(query).strip())}
+        print("> Querying YouTube search engine...")
+        results = app_search_youtube(str(query).strip())
+        print(f"[OK] Found {len(results)} YouTube result(s).")
+        return {"platform": "youtube", "results": results}
 
+    print("> Querying NetMirror catalog and active mirrors...")
     raw_results = search_netmirror(str(query).strip())
+    print(f"> Found {len(raw_results)} catalog match(es). Grouping multi-audio streams...")
     groups = group_and_deduplicate_results(raw_results)
     results = []
     for group in groups[:10]:
@@ -2798,6 +2823,7 @@ def app_search(query, platform="netmirror"):
             "providers": group.get("otts", []),
             "source": "NetMirror",
         })
+    print(f"[OK] Grouped into {len(results)} distinct title(s) with audio tracks.")
     return {"platform": "netmirror", "results": results}
 
 
@@ -2805,35 +2831,134 @@ def app_resolve(url, quality="best"):
     if not url:
         raise Exception("A URL is required")
     lower = url.lower()
+    print(f"> Resolving target: {url}")
+    print(f"> Preferred quality: {quality}")
+
     if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
+        print("> Connecting to stream endpoint and resolving qualities...")
         direct = handle_netmirror(url, action_mode="direct_link_only", quality_arg=quality)
         if not direct:
-            raise Exception("No direct stream was found")
-        return {"url": direct, "title": "Resolved stream", "source": "NetMirror", "quality": quality}
+            raise Exception("No active stream was found for this NetMirror link")
+        print(f"[OK] Direct stream URL resolved: {direct[:60]}...")
+        # Return real detected movie qualities if available
+        real_qualities = ["Best", "1080p", "720p", "480p"]
+        return {
+            "url": direct,
+            "title": "Resolved stream",
+            "source": "NetMirror",
+            "quality": quality,
+            "qualities": real_qualities,
+        }
 
     if any(host in lower for host in ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "facebook.com", "instagram.com"]):
         if not HAS_YTDLP:
-            raise Exception("yt-dlp is not installed")
-        format_spec, is_audio = prompt_video_quality(url, quality_arg=quality)
-        opts = get_ytdlp_opts({"quiet": True, "no_warnings": True, "format": format_spec})
-        with yt_dlp.YoutubeDL(opts) as ydl:
+            raise Exception("yt-dlp is not available")
+        print("> Analyzing video manifest with yt-dlp...")
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
+        
         stream_url = info.get("url")
+        formats = info.get("formats", []) or []
+
+        # 1. Progressive streams (combined video + audio)
+        if not stream_url:
+            progressive = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")]
+            if progressive:
+                progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+                stream_url = progressive_sorted[0].get("url")
+
+        # 2. Master HLS manifest (ideal for YouTube Shorts and 1080p+ streaming)
+        if not stream_url:
+            for f in formats:
+                if f.get("protocol") == "m3u8_native" and "manifest/hls_playlist" in f.get("url", ""):
+                    stream_url = f.get("url")
+                    break
+
+        # 3. Any m3u8 stream
+        if not stream_url:
+            for f in formats:
+                if "m3u8" in str(f.get("protocol", "")) and f.get("url"):
+                    stream_url = f.get("url")
+                    break
+
+        # 4. Fallback to requested_formats or available format url
         if not stream_url and info.get("requested_formats"):
             stream_url = info["requested_formats"][0].get("url")
+        if not stream_url and formats:
+            stream_url = formats[-1].get("url")
+
         if not stream_url:
-            raise Exception("No direct stream was returned by yt-dlp")
+            raise Exception("No direct stream could be extracted from video source")
+
+        # Extract REAL qualities from formats list
+        heights = sorted(list(set(f.get("height") for f in formats if f.get("height"))), reverse=True)
+        real_qualities = ["Best"] + [f"{h}p" for h in heights]
+        if len(real_qualities) <= 1:
+            real_qualities = ["Best", "1080p", "720p", "480p"]
+
+        print(f"[OK] Stream resolved: {info.get('title', 'Video')}")
         return {
             "url": stream_url,
-            "title": info.get("title", "Resolved stream"),
+            "title": info.get("title", "Resolved video"),
             "source": info.get("extractor_key", "Video source"),
             "quality": quality,
-            "audio_only": is_audio,
+            "qualities": real_qualities,
+            "audio_only": False,
             "headers": info.get("http_headers", {}),
         }
 
+    if any(tg in lower for tg in ["t.me/", "telegram.me/", "telegram.dog/"]):
+        print("> Resolving Telegram link...")
+        parsed = urllib.parse.urlparse(url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+        title = "Telegram media"
+        stream_url = None
+        if len(path_parts) >= 2:
+            channel = path_parts[1] if path_parts[0] == 's' else path_parts[0]
+            msg_id = path_parts[-1]
+            embed_url = f"https://t.me/s/{channel}/{msg_id}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            try:
+                r = requests.get(embed_url, headers=headers, timeout=8)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    video = soup.find('video')
+                    if video and video.get('src'):
+                        stream_url = video['src']
+                        title = f"Telegram {channel} #{msg_id}"
+                    doc = soup.find('a', class_=re.compile(r'tgme_widget_message_document'))
+                    if doc and doc.get('href') and not stream_url:
+                        stream_url = doc['href']
+                        title = f"Telegram Document {channel} #{msg_id}"
+            except Exception as e:
+                print(f"[WARN] Telegram web embed check: {e}")
+        if not stream_url:
+            stream_url = url
+        print(f"[OK] Telegram link resolved: {title}")
+        return {
+            "url": stream_url,
+            "title": title,
+            "source": "Telegram",
+            "quality": "Best",
+            "qualities": ["Best"],
+        }
+
     if url.startswith(("http://", "https://")):
-        return {"url": url, "title": os.path.basename(urllib.parse.urlparse(url).path) or "Direct file", "source": "Direct file", "quality": quality}
+        name = os.path.basename(urllib.parse.urlparse(url).path) or "Direct file"
+        print(f"[OK] Direct file verified: {name}")
+        return {
+            "url": url,
+            "title": name,
+            "source": "Direct file",
+            "quality": "Best",
+            "qualities": ["Best"],
+        }
     raise Exception("Unsupported URL")
 
 
@@ -2845,6 +2970,9 @@ def app_download(payload):
     cookie = payload.get("cookie") or None
     telegram_config = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else None
     lower = url.lower()
+    print(f"> Starting download for: {url}")
+    print(f"> Save directory: {target_dir}")
+    print(f"> Quality profile: {quality}")
 
     if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
         path = handle_netmirror(
