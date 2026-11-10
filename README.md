@@ -180,9 +180,7 @@ A native Windows program with the same monochrome UI as the APK, built on PySide
 
 ### Windows (Arc.exe)
 
-**Easiest:** download `Arc-windows-x64.exe` (one file) or `Arc-windows-x64-portable.zip` (starts faster) from
-the repository's **Releases** page, then double-click it. Windows SmartScreen may warn about an unsigned build:
-choose *More info* → *Run anyway*.
+**Easiest:** download the single `Arc-windows-x64.exe` from the repository's **Releases** page, then double-click it. Windows SmartScreen may warn about an unsigned build: choose *More info* → *Run anyway*.
 
 **Build it yourself** on any Windows 10/11 machine with Python 3.9 – 3.13 from python.org
 (tick *"Add python.exe to PATH"*):
@@ -203,7 +201,7 @@ winget install Gyan.FFmpeg
 ```
 
 **CI builds it for you.** `.github/workflows/build-windows-exe.yml` runs the engine and desktop test suites,
-builds the GUI headless, freezes both layouts and smoke-tests the resulting exe — then attaches them to a
+builds the GUI headless, freezes and startup-tests the single-file exe — then attaches it to a
 release when you push a `v*` tag. Trigger a build from anywhere, including a tablet:
 
 ```bash

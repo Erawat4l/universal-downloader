@@ -3508,14 +3508,12 @@ private fun GitHubCard(update: UpdateInfo, onCheck: () -> Unit, onOpenRelease: (
         update.loading -> "Checking updates..."
         update.error.isNotBlank() -> "Update check unavailable"
         update.appUpdateAvailable -> "App update ready"
-        update.sourceUpdateAvailable -> "Source update found"
         else -> "Up to date"
     }
     val body = when {
         update.loading -> "Checking GitHub for updates."
         update.error.isNotBlank() -> "Could not reach repository."
         update.appUpdateAvailable -> "Release ${update.releaseTag.ifBlank { "Latest" }} includes a new APK."
-        update.sourceUpdateAvailable -> "New commits available on repository."
         else -> "You are on the latest version."
     }
     Card(colors = CardDefaults.cardColors(containerColor = ArcSurface), shape = RoundedCornerShape(20.dp)) {

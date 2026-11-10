@@ -157,18 +157,14 @@ Two things the bridge adds on top:
 ## Build options
 
 ```bat
-python build_exe.py                    REM one-file dist\Arc.exe (default)
-python build_exe.py --onedir           REM dist\Arc\ folder: starts seconds faster
-python build_exe.py --run-selftest     REM prove the UI builds before freezing
-python build_exe.py --skip-checks      REM just freeze
-python -m arc_desktop --selftest       REM headless UI check on its own
+python build_exe.py                    REM single-file dist\Arc.exe (default)
+python build_exe.py --run-selftest      REM prove the UI builds before freezing
+python build_exe.py --skip-checks       REM just freeze
+python -m arc_desktop --selftest        REM headless UI check on its own
 ```
 
-**One file vs one directory.** `Arc.exe` alone is easiest to share, but PyInstaller
-unpacks it to a temp folder on every launch (~3–6 s on an SSD). The `--onedir`
-build starts immediately — zip the whole `dist\Arc` folder to distribute it.
-
-CI publishes both. See `.github/workflows/build-windows-exe.yml`.
+Arc is distributed as one `Arc.exe` file. PyInstaller unpacks its bundled runtime
+at launch; the self-test checks the frozen entry point before CI publishes it.
 
 ---
 
@@ -187,9 +183,7 @@ CI publishes both. See `.github/workflows/build-windows-exe.yml`.
   module the engine looks for at `~/Projects/Link-Bypasser-Bot`. It is not part of
   this repository, so those links resolve only if you have it installed.
 * **Antivirus.** Unsigned PyInstaller builds sometimes trigger SmartScreen.
-  Click "More info" → "Run anyway", or build with `--onedir` (fewer heuristics
-  fire on a folder than on a packed single exe). UPX is disabled in `arc.spec`
-  for the same reason.
+  Click "More info" → "Run anyway". UPX is disabled in `arc.spec` to reduce false positives.
 * Download only what you have the right to keep.
 
 ---

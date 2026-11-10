@@ -972,20 +972,6 @@ class SettingsPage(QWidget):
         self.update_layout.addLayout(update_buttons)
         self._scroll.add(self.update_card)
 
-        # -------------------------------------------------------------- about
-        self._scroll.add(self._group("About"))
-        about_card, about_layout = card("vertical", 6, 14, "Card")
-        self.about_engine = label("", "MetaDim")
-        self.about_engine.setWordWrap(True)
-        self.about_engine.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        about_layout.addWidget(self.about_engine)
-        legal = QLabel("Download only what you have the right to keep. This tool fetches media you "
-                       "can already open in a browser, without the ads, and respects the terms of "
-                       "the services you use.")
-        legal.setObjectName("MetaDim")
-        legal.setWordWrap(True)
-        about_layout.addWidget(legal)
-        self._scroll.add(about_card)
         self._scroll.add_stretch()
         self._accel_rows: list[QWidget] = []
 
@@ -1050,9 +1036,6 @@ class SettingsPage(QWidget):
             self.accel_layout.addWidget(row)
             self._accel_rows.append(row)
 
-        self.about_engine.setText(
-            f"Arc {environment.get('python', '')} \u00b7 {environment.get('engine_load_seconds', 0)}s"
-        )
         self.quality_note.setText("Used automatically when available.")
 
     def set_telegram(self, api_id: str, api_hash: str, session: str) -> None:

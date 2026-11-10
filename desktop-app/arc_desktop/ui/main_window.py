@@ -13,12 +13,14 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QProcess
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -54,8 +56,8 @@ class MainWindow(QMainWindow):
         self.bridge = bridge
         self.store = store
         self.setWindowTitle("Arc \u2014 Universal Downloader")
-        self.resize(1180, 820)
-        self.setMinimumSize(960, 680)
+        self.resize(1100, 760)
+        self.setMinimumSize(640, 480)
 
         self.jobs: dict[str, dict] = {}
         self.results: list[dict] = []
@@ -69,7 +71,10 @@ class MainWindow(QMainWindow):
         self.current_query: str = ""
         self.download_scope: str = "episode"
         self._think_started_at: float = 0.0
-        self._installer_processes: list[QProcess] = []
+        self._pending_installations: dict[str, int] = {}
+        self._installer_timer = QTimer(self)
+        self._installer_timer.setInterval(5000)
+        self._installer_timer.timeout.connect(self._poll_installers)
 
         self.signals = _WorkerSignals(self)
         self.signals.done.connect(self._on_engine_result)
@@ -292,9 +297,13 @@ class MainWindow(QMainWindow):
         text = (raw_input or "").strip()
         if not text:
             return
-        looks_like_link = text.lower().startswith(
-            ("http", "magnet:", "ftp:", "t.me", "telegram:", "igl:", "yt:"))
-        if " " in text and not looks_like_link:
+        lower = text.lower()
+        # Match the APK: plain text is always a catalogue search, even a
+        # one-word title or a dotted title. Only explicit link schemes resolve.
+        looks_like_link = lower.startswith(
+            ("http://", "https://", "magnet:", "ftp://", "t.me/",
+             "telegram.me/", "telegram.dog/", "igl:"))
+        if not looks_like_link:
             self.start_search(text)
             return
         self.results = []
@@ -904,40 +913,51 @@ class MainWindow(QMainWindow):
     def install_accelerator(self, key: str) -> None:
         packages = {
             "aria2c": ("aria2.aria2", "aria2"),
-            "ffmpeg": ("Gyan.FFmpeg", "ffmpeg"),
+            "ffmpeg": ("Gyan.FFmpeg", "FFmpeg"),
             "vlc": ("VideoLAN.VLC", "VLC"),
         }
         package = packages.get(key.lower())
         if package is None:
             return
         package_id, display = package
-        process = QProcess(self)
-        self._installer_processes.append(process)
-        args = ["install", "--id", package_id, "--exact", "--silent",
+        if sys.platform != "win32":
+            self.notify("Install buttons require Windows with winget; they are unavailable in Winlator.")
+            return
+        args = ["install", "--id", package_id, "--exact",
                 "--accept-source-agreements", "--accept-package-agreements"]
-        process.finished.connect(
-            lambda code, _status, proc=process, title=display:
-            self._installer_finished(proc, title, code))
-        process.errorOccurred.connect(
-            lambda _error, proc=process: self._installer_failed(proc))
-        process.start("winget", args)
-        self.notify(f"Installing {display}...")
+        # Open a visible installer terminal: winget can request confirmation,
+        # and any failure is shown to the user instead of disappearing silently.
+        command = subprocess.list2cmdline(["winget", *args])
+        try:
+            process = subprocess.Popen(
+                ["cmd.exe", "/c", "start", f"Arc {display} installer", "cmd.exe", "/k", command],
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+        except Exception as error:
+            self.notify(f"Could not launch winget: {error}")
+            return
+        self._pending_installations[key.lower()] = 0
+        self._installer_timer.start()
+        self.notify(f"{display} installer opened in a terminal.")
 
-    def _installer_finished(self, process: QProcess, display: str, code: int) -> None:
-        if process in self._installer_processes:
-            self._installer_processes.remove(process)
-        process.deleteLater()
-        self.settings_page.set_environment(self.bridge.environment())
-        if code == 0:
-            self.notify(f"{display} installed. Restart Arc if it still shows missing.")
-        else:
-            self.notify(f"Could not install {display}; check Windows Package Manager.")
-
-    def _installer_failed(self, process: QProcess) -> None:
-        if process in self._installer_processes:
-            self._installer_processes.remove(process)
-        process.deleteLater()
-        self.notify("winget is not available on this Windows installation.")
+    def _poll_installers(self) -> None:
+        environment = self.bridge.environment()
+        self.settings_page.set_environment(environment)
+        accelerators = environment.get("accelerators", {}) or {}
+        for key, checks in list(self._pending_installations.items()):
+            installed = bool(environment.get("vlc")) if key == "vlc" else bool(accelerators.get(key))
+            if installed:
+                self._pending_installations.pop(key, None)
+                self.notify(f"{key} installed and detected.")
+                continue
+            checks += 1
+            if checks >= 120:
+                self._pending_installations.pop(key, None)
+                self.notify(f"{key} was not detected; check the installer terminal for errors.")
+            else:
+                self._pending_installations[key] = checks
+        if not self._pending_installations:
+            self._installer_timer.stop()
 
     def save_telegram_credentials(self, api_id: str, api_hash: str, session: str) -> None:
         self.store.update({"telegram_api_id": api_id, "telegram_api_hash": api_hash,
@@ -955,7 +975,7 @@ class MainWindow(QMainWindow):
                       "session": _pad_base64(session)}, "Check Telegram session")
 
     def check_for_updates(self) -> None:
-        self.settings_page.set_update("Checking...", "Contacting GitHub releases...")
+        self.settings_page.set_update("Checking...", "Checking Arc for Windows")
         try:
             import urllib.request
             request = urllib.request.Request(
@@ -966,16 +986,21 @@ class MainWindow(QMainWindow):
             with urllib.request.urlopen(request, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8", "replace"))
             tag = str(data.get("tag_name", "")).strip()
-            name = str(data.get("name", "")).strip() or tag
-            if tag:
-                self.settings_page.set_update(
-                    "Latest release on GitHub", f"{name} \u00b7 {tag}", True)
-                self.notify(f"Latest release: {tag}")
+            exe_asset = next((asset for asset in data.get("assets", [])
+                              if str(asset.get("name", "")).lower() == "arc-windows-x64.exe"), None)
+            remote = tuple(int(part) for part in tag.lstrip("v").split("-")[0].split(".") if part.isdigit())
+            local = tuple(int(part) for part in str(__version__).lstrip("v").split("-")[0].split(".") if part.isdigit())
+            width = max(len(remote), len(local), 3)
+            newer = exe_asset is not None and remote + (0,) * (width - len(remote)) > local + (0,) * (width - len(local))
+            if newer:
+                self.settings_page.set_update("Windows app update found", f"Arc {tag} is ready", True)
+                self.notify(f"Arc for Windows update available: {tag}")
+            elif exe_asset is None:
+                self.settings_page.set_update("No Windows update", "No Windows exe release is published yet.")
             else:
-                self.settings_page.set_update("No release published",
-                                              "You are running the current build.")
+                self.settings_page.set_update("Windows app is up to date", f"Arc {__version__}")
         except Exception as error:
-            self.settings_page.set_update("Could not check GitHub", str(error))
+            self.settings_page.set_update("Could not check Windows updates", str(error))
 
     def open_releases_page(self) -> None:
         QDesktopServices.openUrl(
