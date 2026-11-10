@@ -2302,21 +2302,54 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
                     return final_filename
                 elif os.path.exists(temp_v):
-                    had_audio = os.path.exists(temp_a)
+                    # Never report a video-only track as a successful download.
+                    # If native/ffmpeg muxing is unavailable, fall back to the
+                    # best progressive (audio+video) format at the requested cap.
+                    fallback_height = int(height_match.group(1)) if height_match else 720
+                    fallback_template = os.path.join(stage_dir, f"{raw_title}_with_audio.%(ext)s")
+                    fallback_format = (
+                        f"best[height<={fallback_height}][ext=mp4]/"
+                        f"best[height<={fallback_height}]/best"
+                    )
+                    print("> Mux unavailable; retrying as one combined audio+video file...")
+                    try:
+                        fallback_opts = get_ytdlp_opts({
+                            'format': fallback_format,
+                            'outtmpl': fallback_template,
+                            'quiet': False,
+                            'no_warnings': True,
+                            'progress_hooks': [ytdlp_progress_hook],
+                        }, cookie=cookie)
+                        with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
+                            ydl_fallback.download([url])
+                        fallback_files = [
+                            os.path.join(stage_dir, name) for name in os.listdir(stage_dir)
+                            if name.startswith(f"{raw_title}_with_audio.")
+                            and not name.endswith((".part", ".ytdl"))
+                        ]
+                        fallback_file = next((p for p in fallback_files if os.path.isfile(p)), None)
+                        if fallback_file and os.path.getsize(fallback_file) > 0:
+                            if fallback_file != final_filename:
+                                safe_move(fallback_file, final_filename)
+                            if os.path.exists(temp_v): os.remove(temp_v)
+                            if os.path.exists(temp_a): os.remove(temp_a)
+                            if cache_dir and stage_dir != out_dir:
+                                shutil.rmtree(stage_dir, ignore_errors=True)
+                            print(f"[OK] Downloaded combined audio/video: {final_filename}")
+                            if jid:
+                                render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                            return final_filename
+                    except Exception as fallback_error:
+                        print(f"[FAIL] Could not produce a combined audio/video file: {fallback_error}")
                     if cache_dir and stage_dir != out_dir:
-                        safe_move(temp_v, final_filename)
                         shutil.rmtree(stage_dir, ignore_errors=True)
                     else:
-                        safe_move(temp_v, final_filename)
-                        if had_audio:
-                            try: os.remove(temp_a)
-                            except Exception: pass
-                    if had_audio:
-                        print("[WARN] Video and audio could not be merged, so the saved file has NO SOUND.")
-                        print("       Install ffmpeg to enable merging, then download this title again.")
-                    if jid:
-                        render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
-                    return final_filename
+                        for track in (temp_v, temp_a):
+                            try:
+                                if os.path.exists(track): os.remove(track)
+                            except OSError:
+                                pass
+                    return None
             else:
                 format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
 
@@ -5505,12 +5538,70 @@ def run_app_json_request_json(raw_payload):
         return json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
 
 
+def _update_cli(branch_override=None):
+    """Update the active Git checkout or a copied standalone dl.py in place."""
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    try:
+        root = subprocess.check_output(
+            ["git", "-C", script_dir, "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        root = ""
+
+    if root:
+        try:
+            branch = branch_override or subprocess.check_output(
+                ["git", "-C", root, "branch", "--show-current"],
+                text=True, stderr=subprocess.PIPE,
+            ).strip()
+            if not branch:
+                raise RuntimeError("Current branch could not be detected.")
+            print(f"> Updating CLI checkout on branch '{branch}'...")
+            subprocess.run(["git", "-C", root, "pull", "--ff-only", "origin", branch], check=True)
+            print("[OK] CLI checkout update complete.")
+            return
+        except Exception as error:
+            print(f"[FAIL] Git checkout update failed: {error}")
+            return
+
+    # Termux users often install a single script in ~/scripts/dl.py rather than
+    # running it from the cloned repository. In that case update the script
+    # itself. An explicit branch is supported for testing/preview branches.
+    branch = branch_override or os.environ.get("ARC_UPDATE_BRANCH", "main")
+    url = f"https://raw.githubusercontent.com/Erawat4l/universal-downloader/{urllib.parse.quote(branch, safe='/')}/dl.py"
+    temp_path = script_path + ".update.tmp"
+    try:
+        from urllib.request import Request, urlopen
+        request = Request(url, headers={"User-Agent": "Arc-Universal-Downloader-Updater"})
+        with urlopen(request, timeout=25) as response:
+            updated = response.read()
+        if not updated.startswith(b"#!/usr/bin/env python") or len(updated) < 10000:
+            raise RuntimeError("The downloaded file did not look like a valid dl.py.")
+        with open(temp_path, "wb") as output:
+            output.write(updated)
+        os.chmod(temp_path, os.stat(script_path).st_mode)
+        os.replace(temp_path, script_path)
+        print(f"[OK] Updated standalone CLI from branch '{branch}'. Run 'dl' again to use it.")
+    except Exception as error:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        print(f"[FAIL] CLI update failed: {error}")
+
+
 def main():
     if len(sys.argv) < 2:
         interactive_menu()
         return
 
     args = sys.argv[1:]
+    if args[0] in ('update', 'self-update', '--update'):
+        _update_cli(args[1] if len(args) > 1 else None)
+        return
     if args[0] in ('--app-json', '--app-json-b64'):
         if len(args) < 2:
             print(json.dumps({"ok": False, "error": "Missing app request payload"}))

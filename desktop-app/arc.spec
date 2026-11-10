@@ -51,6 +51,12 @@ for package in ("yt_dlp", "pyrogram"):
 hidden = sorted(set(hidden))
 
 datas = list(ENGINE_DATA)
+font_path = HERE / "assets" / "Roboto-Variable.ttf"
+font_license = HERE / "assets" / "Roboto-OFL.txt"
+if font_path.is_file():
+    datas.append((str(font_path), "assets"))
+if font_license.is_file():
+    datas.append((str(font_license), "assets"))
 for package in ("yt_dlp",):
     try:
         datas += collect_data_files(package)

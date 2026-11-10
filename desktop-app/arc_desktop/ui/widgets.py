@@ -180,6 +180,8 @@ class AsyncImage(QWidget):
     a result has no poster.
     """
 
+    ready = Signal()
+
     _manager: Optional[QNetworkAccessManager] = None
     _cache: dict[str, QPixmap] = {}
 
@@ -214,13 +216,16 @@ class AsyncImage(QWidget):
         self._url = url
         if not url:
             self._show_placeholder()
+            self.ready.emit()
             return
         cached = self._cache.get(url)
         if cached is not None and not cached.isNull():
             self._apply(cached)
+            self.ready.emit()
             return
         if not url.startswith(("http://", "https://")):
             self._show_placeholder()
+            self.ready.emit()
             return
         try:
             request = QNetworkRequest(QUrl(url))
@@ -230,6 +235,7 @@ class AsyncImage(QWidget):
             reply.finished.connect(lambda r=reply: self._finished(r))
         except Exception:
             self._show_placeholder()
+            self.ready.emit()
 
     def _finished(self, reply: QNetworkReply) -> None:
         try:
@@ -251,6 +257,7 @@ class AsyncImage(QWidget):
         except Exception:
             self._show_placeholder()
         finally:
+            self.ready.emit()
             reply.deleteLater()
 
     def _apply(self, pixmap: QPixmap) -> None:

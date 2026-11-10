@@ -1525,7 +1525,8 @@ private fun ArcApp(
                                             target.title
                                         }
                                         val streamTarget = target.directStreamUrl.ifBlank { target.proxyUrl.ifBlank { resolvedUrl.ifEmpty { input } } }
-                                        if (streamTarget.isNotBlank() && !streamTarget.contains("127.0.0.1") && !resolveLoading) {
+                                        val needsFreshResolve = target.targetUrl.isNotBlank() && target.mediaType != "file"
+                                        if (!needsFreshResolve && streamTarget.isNotBlank() && !streamTarget.contains("127.0.0.1") && !resolveLoading) {
                                             streamLoading = true
                                             openStreamExternal(streamTarget, target.streamHeaders, displayTitle)
                                             scope.launch {
@@ -1553,7 +1554,7 @@ private fun ArcApp(
                                                 val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
                                                 val hMap = mutableMapOf<String, String>()
                                                 hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val playUrl = directUrl.ifBlank { proxyUrl }
+                                                val playUrl = proxyUrl.ifBlank { directUrl }
                                                 if (playUrl.isNotBlank()) {
                                                     target = target.copy(
                                                         directStreamUrl = directUrl,

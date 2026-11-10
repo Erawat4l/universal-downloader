@@ -245,7 +245,20 @@ dl                             # interactive menu
 ```
 
 If `~/bin` is not on your `PATH`, add it (`export PATH="$HOME/bin:$PATH"` in your shell profile; in fish,
-`fish_add_path ~/bin`).
+`fish_add_path ~/bin`). On a Git checkout, update the current branch with `dl update`. A standalone copied
+`dl.py` updates itself from the repository's latest `main` with the same command; pass a branch explicitly for a
+preview, for example `dl update arena/c48518ae-universal-downloader`.
+
+If an older copied `~/scripts/dl.py` treats `update` as a search term, it predates the updater. One time, refresh
+that copy from the checkout (after fetching the desired branch):
+
+```sh
+cd ~/universal-downloader && git pull --ff-only origin main
+cp dl.py ~/scripts/dl.py && chmod +x ~/scripts/dl.py
+# Restart the shell if it cached the old `dl` command.
+```
+
+Then `dl update` is available from that copy. A `dl` symlink pointing into the checkout needs only the `git pull`.
 
 ### Building the APK on Termux
 

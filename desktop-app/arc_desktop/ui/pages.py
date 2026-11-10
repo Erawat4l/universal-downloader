@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve
+
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-    QVBoxLayout, QWidget, QStackedWidget, QButtonGroup,
+    QVBoxLayout, QWidget, QStackedWidget, QButtonGroup, QGraphicsOpacityEffect,
 )
 
 from .. import theme
@@ -242,20 +243,49 @@ class SearchPage(QWidget):
         self._scroll.add_layout(self.results_host)
         self._scroll.add_stretch()
         self._cards: list[QWidget] = []
+        self._results_generation = 0
+        self._pending_posters = 0
+        self._poster_timeout = QTimer(self)
+        self._poster_timeout.setSingleShot(True)
+        self._poster_timeout.timeout.connect(self._reveal_cards)
+
+    def _reveal_cards(self) -> None:
+        self._poster_timeout.stop()
+        for index, widget in enumerate(self._cards):
+            opacity = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(opacity)
+            opacity.setOpacity(0.0)
+            widget.show()
+            animation = QPropertyAnimation(opacity, b"opacity", widget)
+            animation.setDuration(190 + min(index, 5) * 35)
+            animation.setStartValue(0.0)
+            animation.setEndValue(1.0)
+            animation.setEasingCurve(QEasingCurve.OutCubic)
+            animation.start()
+            widget._reveal_animation = animation
+        self.query_label.setText(f"\u201c{self._current_query}\u201d  \u00b7  {len(self._cards)} result(s)")
 
     def set_query(self, query: str, loading: bool) -> None:
         self.query_label.setText(f"\u201c{query}\u201d" + ("  \u00b7  searching..." if loading else ""))
         if loading:
+            self._results_generation += 1
+            self._poster_timeout.stop()
+            self._pending_posters = 0
             self.thinking.start("Search", "Searching media catalog")
             for old in self._cards:
                 old.deleteLater()
             self._cards.clear()
 
     def set_results(self, query: str, hits: list[dict]) -> None:
+        self._results_generation += 1
+        generation = self._results_generation
+        self._poster_timeout.stop()
         for old in self._cards:
             old.deleteLater()
         self._cards.clear()
-        self.query_label.setText(f"\u201c{query}\u201d  \u00b7  {len(hits)} result(s)")
+        self._current_query = query
+        self._pending_posters = 0
+        self.query_label.setText(f"\u201c{query}\u201d  \u00b7  preparing results...")
         if not hits:
             empty = EmptyState("No Results",
                                "Nothing matched. Try a shorter title, or the exact year.")
@@ -263,12 +293,24 @@ class SearchPage(QWidget):
             self._cards.append(empty)
             return
 
+        self._pending_posters = len(hits)
+        self._poster_timeout.start(12000)
+
+        def poster_ready() -> None:
+            if generation != self._results_generation:
+                return
+            self._pending_posters = max(0, self._pending_posters - 1)
+            if self._pending_posters == 0:
+                self._reveal_cards()
+
         for hit in hits:
             item, item_layout = card("vertical", 9)
+            item.hide()
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(11)
             poster = AsyncImage(44, 60)
+            poster.ready.connect(poster_ready)
             poster.set_url(str(hit.get("poster", "")))
             row.addWidget(poster)
             column = QVBoxLayout()

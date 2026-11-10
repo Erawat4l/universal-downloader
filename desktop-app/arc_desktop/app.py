@@ -58,7 +58,7 @@ def build_window(args: argparse.Namespace, store: Optional[Store] = None):
     writes to the real settings file in %APPDATA%.
     """
     _qt_high_dpi()
-    from PySide6.QtGui import QIcon
+    from PySide6.QtGui import QFontDatabase, QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
 
     from . import theme
@@ -70,6 +70,13 @@ def build_window(args: argparse.Namespace, store: Optional[Store] = None):
     application.setOrganizationName("Erawat")
     application.setDesktopFileName("arc-desktop")
     application.setWindowIcon(QIcon(_icon_path()))
+    font_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent.parent)) / "assets" / "Roboto-Variable.ttf"
+    if font_path.is_file():
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        if font_id >= 0:
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                theme.FONT_FAMILY = families[0]
     application.setStyleSheet(theme.build_stylesheet())
 
     if store is None:

@@ -534,6 +534,27 @@ def t_qt_names_exist():
     assert not problems, "\n        " + "\n        ".join(problems)
 
 
+@test("search results wait for poster readiness before the reveal animation")
+def t_search_posters_gate_results():
+    widgets = (DESKTOP / "arc_desktop" / "ui" / "widgets.py").read_text(encoding="utf-8")
+    pages = (DESKTOP / "arc_desktop" / "ui" / "pages.py").read_text(encoding="utf-8")
+    assert "ready = Signal()" in widgets
+    assert "self.ready.emit()" in widgets
+    assert "poster.ready.connect(poster_ready)" in pages
+    assert "item.hide()" in pages
+    assert "self._reveal_cards()" in pages and "QPropertyAnimation" in pages
+    assert "self._poster_timeout.start(12000)" in pages
+
+
+@test("Android streaming resolves the selected quality and prefers the header proxy")
+def t_android_re_resolves_stream_quality():
+    activity = REPO / "android-app" / "app" / "src" / "main" / "java" / "com" / "erawat" / "arc" / "MainActivity.kt"
+    source = activity.read_text(encoding="utf-8")
+    assert "val needsFreshResolve = target.targetUrl.isNotBlank()" in source
+    assert 'put("quality", if (selectedQuality.contains("Ask"' in source
+    assert "val playUrl = proxyUrl.ifBlank { directUrl }" in source
+
+
 # ============================================================== main
 def main() -> int:
     print("")

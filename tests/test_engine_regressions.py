@@ -951,7 +951,12 @@ def t_stream_headers():
 def t_ffmpeg_mux_fallback():
     source = ENGINE.read_text(encoding="utf-8")
     assert 'shutil.which("ffmpeg")' in source, "the ffmpeg mux fallback is missing"
-    assert "NO SOUND" in source, "the silent-file warning is missing"
+    assert "best[height<=" in source and "combined audio+video file" in source, (
+        "a progressive audio+video fallback is required when muxing fails"
+    )
+    assert "Video and audio could not be merged" not in source, (
+        "the engine must not report a silent video-only track as a successful download"
+    )
 
 
 @register

@@ -19,11 +19,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QSize, QPoint, QProcess
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QSize, QPoint, QProcess, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QStackedWidget, QVBoxLayout, QWidget, QGraphicsOpacityEffect,
 )
 
 from .. import __version__, theme
@@ -312,6 +312,22 @@ class MainWindow(QMainWindow):
         except Exception:
             return str(Path(self.download_dir()))
 
+    def _show_page(self, destination: QWidget) -> None:
+        """Switch pages with a short, restrained fade like the APK transitions."""
+        if self.pages.currentWidget() is destination:
+            return
+        self.pages.setCurrentWidget(destination)
+        effect = QGraphicsOpacityEffect(destination)
+        destination.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(170)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.start()
+        self._page_animation = animation
+
     def _select_nav(self, index: int) -> None:
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
@@ -323,21 +339,21 @@ class MainWindow(QMainWindow):
                 destination = self.home_page
             else:
                 destination = self.home_page
-            self.pages.setCurrentWidget(destination)
+            self._show_page(destination)
             self._home_context_page = destination
         elif index == 1:
-            self.pages.setCurrentWidget(self.activity_page)
+            self._show_page(self.activity_page)
             self._render_jobs()
         elif index == 2:
-            self.pages.setCurrentWidget(self.library_page)
+            self._show_page(self.library_page)
             self._refresh_library()
         else:
-            self.pages.setCurrentWidget(self.settings_page)
+            self._show_page(self.settings_page)
             self.settings_page.set_environment(self.bridge.environment())
 
     def _back_from_analysis(self) -> None:
         if self.results:
-            self.pages.setCurrentWidget(self.search_page)
+            self._show_page(self.search_page)
         else:
             self._select_nav(0)
 
@@ -370,7 +386,7 @@ class MainWindow(QMainWindow):
         self.current_query = query
         self.results = []
         self.home_page.set_input(query)
-        self.pages.setCurrentWidget(self.search_page)
+        self._show_page(self.search_page)
         self.search_page.set_query(query, True)
         self.set_status(f"Searching \u201c{query}\u201d...")
         self._begin_thinking(self.search_page.thinking, "Searching media catalog")
@@ -381,7 +397,7 @@ class MainWindow(QMainWindow):
         self._home_context_page = self.analysis_page
         self.analysis_url = url
         self.target = {}
-        self.pages.setCurrentWidget(self.analysis_page)
+        self._show_page(self.analysis_page)
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(url if len(url) < 90 else url[:87] + "\u2026")
         self.analysis_page.detail_label.setText("Resolving...")
@@ -410,7 +426,7 @@ class MainWindow(QMainWindow):
         self._home_context_page = self.analysis_page
         self.analysis_url = chosen
         self.target = {}
-        self.pages.setCurrentWidget(self.analysis_page)
+        self._show_page(self.analysis_page)
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(str(hit.get("title", "Resolving...")))
         self.analysis_page.poster.set_url(str(hit.get("poster", "")))
