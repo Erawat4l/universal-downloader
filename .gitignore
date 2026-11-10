@@ -1,0 +1,22 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+*.tmp
+downloads/
+*.part
+*.local.json
+credentials.local.json
+
+# Android build outputs and local machine settings
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
+android-app/.tools/
+android-app/python-vendor/**/build/
+*.egg-info/
+.idea/
+*.iml
+.kotlin/
