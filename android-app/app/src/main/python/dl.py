@@ -2198,9 +2198,9 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             except Exception as e:
                 print(f"[WARN] Format probe: {e}")
 
+            height_match = re.search(r"height<=(\d+)", format_spec)
             if needs_mux:
                 print("> Android standalone HD: Downloading video and audio streams for native hardware muxing...")
-                height_match = re.search(r"height<=(\d+)", format_spec)
                 h_str = f"[height<={height_match.group(1)}]" if height_match else ""
                 v_fmt = f"bestvideo{h_str}[ext=mp4]/bestvideo{h_str}/bestvideo"
                 a_fmt = "bestaudio[ext=m4a]/bestaudio"
@@ -2301,10 +2301,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                     if jid:
                         render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
                     return final_filename
-                elif os.path.exists(temp_v):
+                else:
                     # Never report a video-only track as a successful download.
-                    # If native/ffmpeg muxing is unavailable, fall back to the
-                    # best progressive (audio+video) format at the requested cap.
+                    # If the video or audio track was absent, or muxing failed,
+                    # fall back to a progressive audio+video format at the cap.
                     fallback_height = int(height_match.group(1)) if height_match else 720
                     fallback_template = os.path.join(stage_dir, f"{raw_title}_with_audio.%(ext)s")
                     fallback_format = (
@@ -2351,7 +2351,17 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                                 pass
                     return None
             else:
-                format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+                # A combined/progressive selector is essential on Android: its
+                # bundled engine has no FFmpeg postprocessor. Respect a requested
+                # height cap and never select a video-only stream here.
+                progressive_cap = int(height_match.group(1)) if height_match else None
+                if progressive_cap:
+                    format_spec = (
+                        f"best[height<={progressive_cap}][ext=mp4]/"
+                        f"best[height<={progressive_cap}]/best"
+                    )
+                else:
+                    format_spec = "best[ext=mp4]/best"
 
     if cache_dir:
         ytdl_stage = os.path.join(cache_dir, f"ytdl_raw_{jid}")

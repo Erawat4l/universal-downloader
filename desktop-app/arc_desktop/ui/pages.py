@@ -294,7 +294,7 @@ class SearchPage(QWidget):
             return
 
         self._pending_posters = len(hits)
-        self._poster_timeout.start(12000)
+        self._poster_timeout.start(3500)
 
         def poster_ready() -> None:
             if generation != self._results_generation:
@@ -311,7 +311,6 @@ class SearchPage(QWidget):
             row.setSpacing(11)
             poster = AsyncImage(44, 60)
             poster.ready.connect(poster_ready)
-            poster.set_url(str(hit.get("poster", "")))
             row.addWidget(poster)
             column = QVBoxLayout()
             column.setContentsMargins(0, 0, 0, 0)
@@ -358,6 +357,10 @@ class SearchPage(QWidget):
             item_layout.addWidget(open_button, 0, Qt.AlignRight)
             self.results_host.addWidget(item)
             self._cards.append(item)
+            # Start only after the card has been registered. Cached or empty
+            # posters emit ready synchronously, and must not reveal an incomplete
+            # card list before this item joins the layout.
+            poster.set_url(str(hit.get("poster", "")))
 
     def _first(self, hit: dict, audios: list) -> None:
         if audios:
