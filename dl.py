@@ -2185,7 +2185,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
             if q_match:
                 cap = int(q_match.group(1))
-                format_spec = f"best[height<={cap}][ext=mp4]/best[height<={cap}]"
+                # Last fallbacks remain single combined formats; this handles
+                # extractors whose format metadata omits height or reports no
+                # progressive MP4 variant at the exact requested cap.
+                format_spec = (
+                    f"best[height<={cap}][ext=mp4]/best[height<={cap}]/"
+                    "best[ext=mp4]/best"
+                )
             else:
                 format_spec = "best[ext=mp4]/best"
         print(f"> Android YouTube: downloading one audio+video format [{format_spec}]...")
@@ -2220,12 +2226,18 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             ydl_opts['external_downloader_args'] = {'aria2c': ['-s', '16', '-x', '16', '-k', '1M', '--console-log-level=warn']}
 
     max_attempts = 5
+    progressive_fallback_used = False
     for attempt in range(1, max_attempts + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if not info:
-                    raise Exception("yt-dlp could not extract video info. Content may be members-only or private.")
+                    if standalone and not is_audio_only and not progressive_fallback_used:
+                        progressive_fallback_used = True
+                        ydl_opts["format"] = "best[ext=mp4]/best"
+                        print("> The requested cap returned no format; retrying once with the best combined audio+video format.")
+                        continue
+                    raise Exception("yt-dlp could not extract video info or find a combined audio+video format.")
                 
                 # Check if result is a playlist
                 if info.get('_type') == 'playlist' or 'entries' in info or is_playlist:
@@ -2272,6 +2284,19 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 return None
             err_str = str(e)
             print(f"\n[FAIL] Download error encountered: {err_str}")
+
+            if standalone and not is_audio_only and "could not extract video info or find a combined" in err_str.lower():
+                print("[FAIL] YouTube exposed no combined audio/video format after the single fallback.")
+                return False
+
+            if standalone and not is_audio_only and "requested format is not available" in err_str.lower():
+                if not progressive_fallback_used:
+                    progressive_fallback_used = True
+                    ydl_opts["format"] = "best[ext=mp4]/best"
+                    print("> Requested height was unavailable; retrying once with YouTube's best single audio+video format.")
+                    continue
+                print("[FAIL] YouTube exposed no downloadable combined audio/video format for this video.")
+                return False
 
             if not check_network():
                 if not wait_for_network(job_id=jid):
