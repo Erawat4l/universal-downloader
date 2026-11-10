@@ -327,6 +327,7 @@ class ThinkingCard(QFrame):
         self._steps: list[str] = []
         self._logs = ""
         self._is_error = False
+        self._running = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 13, 14, 13)
@@ -413,6 +414,7 @@ class ThinkingCard(QFrame):
 
     # ------------------------------------------------------------------ state
     def start(self, action: str, live_step: str = "") -> None:
+        self._running = True
         self._steps = []
         self._logs = ""
         self._is_error = False
@@ -428,6 +430,8 @@ class ThinkingCard(QFrame):
         self.setVisible(True)
 
     def tick(self, elapsed_seconds: float, live_step: str = "") -> None:
+        if not self._running:
+            return
         if live_step:
             self.detail_label.setText(f"{live_step}   [{elapsed_seconds:.1f}s]")
         else:
@@ -435,6 +439,7 @@ class ThinkingCard(QFrame):
 
     def finish(self, action: str, duration_seconds: float, steps: list[str],
                logs: str = "", is_error: bool = False) -> None:
+        self._running = False
         self._steps = list(steps or [])
         self._logs = logs or ""
         self._is_error = bool(is_error)

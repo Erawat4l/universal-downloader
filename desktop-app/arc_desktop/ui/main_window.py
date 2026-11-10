@@ -13,15 +13,14 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QSize, QPoint, QProcess
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
     QPushButton, QStackedWidget, QVBoxLayout, QWidget,
@@ -35,7 +34,6 @@ from .pages import (
     SearchPage, SettingsPage, VIDEO_QUALITY_DEFAULTS,
 )
 from .widgets import Toast
-from ..theme import nav_icon_glyph
 
 POLL_INTERVAL_MS = 400          # same cadence as the APK's LaunchedEffect(jobs)
 THINK_TICK_MS = 350             # same cadence as the animated thinking dots
@@ -48,6 +46,55 @@ class _WorkerSignals(QWidget):
     """Cross-thread bridge: engine callbacks arrive on worker threads."""
 
     done = Signal(dict, str, str)   # response, job_id, action label
+
+
+def _nav_icon(name: str) -> QIcon:
+    """Small outline icons matching the APK tabs; drawn locally for font parity."""
+    def render(color: str) -> QPixmap:
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(color), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if name == "Home":
+            painter.drawPolyline(QPolygon([QPoint(3, 11), QPoint(12, 3), QPoint(21, 11)]))
+            painter.drawLine(6, 10, 6, 21)
+            painter.drawLine(18, 10, 18, 21)
+            painter.drawLine(6, 21, 18, 21)
+            painter.drawLine(10, 21, 10, 15)
+            painter.drawLine(14, 21, 14, 15)
+        elif name == "Activity":
+            painter.drawLine(12, 3, 12, 20)
+            painter.drawLine(6, 14, 12, 21)
+            painter.drawLine(18, 14, 12, 21)
+        elif name == "Download":
+            painter.drawLine(12, 3, 12, 15)
+            painter.drawLine(7, 10, 12, 15)
+            painter.drawLine(17, 10, 12, 15)
+            painter.drawLine(4, 17, 4, 21)
+            painter.drawLine(20, 17, 20, 21)
+            painter.drawLine(4, 21, 20, 21)
+        elif name == "Library":
+            painter.drawRoundedRect(4, 3, 16, 18, 2, 2)
+            painter.drawLine(8, 8, 16, 8)
+            painter.drawLine(8, 12, 16, 12)
+            painter.drawLine(8, 16, 16, 16)
+        else:  # Settings cog, using vector lines instead of a missing font glyph.
+            points = []
+            import math
+            for i in range(24):
+                radius = 10 if i % 3 else 7.5
+                angle = math.pi * 2 * i / 24 - math.pi / 2
+                points.append(QPoint(round(12 + radius * math.cos(angle)), round(12 + radius * math.sin(angle))))
+            painter.drawPolygon(QPolygon(points))
+            painter.drawEllipse(QPoint(12, 12), 3, 3)
+        painter.end()
+        return pixmap
+
+    icon = QIcon()
+    icon.addPixmap(render(theme.ARC_MUTED), QIcon.Normal, QIcon.Off)
+    icon.addPixmap(render(theme.ARC_BLACK), QIcon.Normal, QIcon.On)
+    return icon
 
 
 class MainWindow(QMainWindow):
@@ -71,10 +118,7 @@ class MainWindow(QMainWindow):
         self.current_query: str = ""
         self.download_scope: str = "episode"
         self._think_started_at: float = 0.0
-        self._pending_installations: dict[str, int] = {}
-        self._installer_timer = QTimer(self)
-        self._installer_timer.setInterval(5000)
-        self._installer_timer.timeout.connect(self._poll_installers)
+        self._installer_processes: dict[str, tuple[QProcess, list[str], str]] = {}
 
         self.signals = _WorkerSignals(self)
         self.signals.done.connect(self._on_engine_result)
@@ -111,6 +155,7 @@ class MainWindow(QMainWindow):
 
         self.toast = Toast(self)
         self._wire_signals()
+        self._home_context_page = self.home_page
         self._select_nav(0)
 
     def _engine_status_label(self) -> QLabel:
@@ -134,9 +179,10 @@ class MainWindow(QMainWindow):
         brand_layout = QHBoxLayout(brand)
         brand_layout.setContentsMargins(4, 0, 4, 0)
         brand_layout.setSpacing(10)
-        tile = QLabel("\u2193")
+        tile = QLabel()
         tile.setFixedSize(34, 34)
         tile.setAlignment(Qt.AlignCenter)
+        tile.setPixmap(_nav_icon("Download").pixmap(QSize(19, 19), QIcon.Normal, QIcon.On))
         tile.setStyleSheet(
             f"background-color: {theme.ARC_WHITE}; color: {theme.ARC_BLACK};"
             f" border-radius: 12px; font-size: 17px; font-weight: 800;"
@@ -158,7 +204,9 @@ class MainWindow(QMainWindow):
 
         self.nav_buttons: list[QPushButton] = []
         for index, (label_text, hint) in enumerate(NAV_ITEMS):
-            button = QPushButton(f"{nav_icon_glyph(label_text)}   {label_text}")
+            button = QPushButton(label_text)
+            button.setIcon(_nav_icon(label_text))
+            button.setIconSize(QSize(18, 18))
             button.setObjectName("NavButton")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
@@ -268,7 +316,15 @@ class MainWindow(QMainWindow):
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
         if index == 0:
-            self.pages.setCurrentWidget(self.home_page)
+            current = self.pages.currentWidget()
+            if current in (self.activity_page, self.library_page, self.settings_page):
+                destination = self._home_context_page
+            elif current is self._home_context_page and current is not self.home_page:
+                destination = self.home_page
+            else:
+                destination = self.home_page
+            self.pages.setCurrentWidget(destination)
+            self._home_context_page = destination
         elif index == 1:
             self.pages.setCurrentWidget(self.activity_page)
             self._render_jobs()
@@ -310,6 +366,7 @@ class MainWindow(QMainWindow):
         self.start_analysis(text)
 
     def start_search(self, query: str) -> None:
+        self._home_context_page = self.search_page
         self.current_query = query
         self.results = []
         self.home_page.set_input(query)
@@ -321,6 +378,7 @@ class MainWindow(QMainWindow):
                      f"Search: \u201c{query}\u201d")
 
     def start_analysis(self, url: str) -> None:
+        self._home_context_page = self.analysis_page
         self.analysis_url = url
         self.target = {}
         self.pages.setCurrentWidget(self.analysis_page)
@@ -349,6 +407,7 @@ class MainWindow(QMainWindow):
         if not chosen:
             self.notify("That result has no playable link.")
             return
+        self._home_context_page = self.analysis_page
         self.analysis_url = chosen
         self.target = {}
         self.pages.setCurrentWidget(self.analysis_page)
@@ -912,52 +971,63 @@ class MainWindow(QMainWindow):
 
     def install_accelerator(self, key: str) -> None:
         packages = {
-            "aria2c": ("aria2.aria2", "aria2"),
+            "aria2c": ("aria2.aria2", "aria2c"),
             "ffmpeg": ("Gyan.FFmpeg", "FFmpeg"),
             "vlc": ("VideoLAN.VLC", "VLC"),
         }
-        package = packages.get(key.lower())
-        if package is None:
+        key = key.lower()
+        package = packages.get(key)
+        if package is None or key in self._installer_processes:
             return
         package_id, display = package
         if sys.platform != "win32":
-            self.notify("Install buttons require Windows with winget; they are unavailable in Winlator.")
+            self.settings_page.set_installer_state(key, "Windows only", error=True)
+            self.notify("Windows package installers are unavailable in Winlator/Linux.")
             return
-        args = ["install", "--id", package_id, "--exact",
-                "--accept-source-agreements", "--accept-package-agreements"]
-        # Open a visible installer terminal: winget can request confirmation,
-        # and any failure is shown to the user instead of disappearing silently.
-        command = subprocess.list2cmdline(["winget", *args])
-        try:
-            process = subprocess.Popen(
-                ["cmd.exe", "/c", "start", f"Arc {display} installer", "cmd.exe", "/k", command],
-                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-            )
-        except Exception as error:
-            self.notify(f"Could not launch winget: {error}")
-            return
-        self._pending_installations[key.lower()] = 0
-        self._installer_timer.start()
-        self.notify(f"{display} installer opened in a terminal.")
 
-    def _poll_installers(self) -> None:
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        output: list[str] = []
+        process.readyReadStandardOutput.connect(
+            lambda p=process, out=output: out.append(bytes(p.readAllStandardOutput()).decode("utf-8", "replace")))
+        process.finished.connect(
+            lambda code, _status, k=key, p=process: self._installer_finished(k, p, code))
+        process.errorOccurred.connect(
+            lambda _error, k=key, p=process: self._installer_failed(k, p))
+        self._installer_processes[key] = (process, output, display)
+        self.settings_page.set_installer_state(key, "Installing…", busy=True)
+        process.start("winget", [
+            "install", "--id", package_id, "--exact", "--silent",
+            "--accept-source-agreements", "--accept-package-agreements",
+        ])
+
+    def _installer_finished(self, key: str, process: QProcess, exit_code: int) -> None:
+        entry = self._installer_processes.pop(key, None)
+        if entry is None:
+            return
+        _, output, display = entry
         environment = self.bridge.environment()
         self.settings_page.set_environment(environment)
-        accelerators = environment.get("accelerators", {}) or {}
-        for key, checks in list(self._pending_installations.items()):
-            installed = bool(environment.get("vlc")) if key == "vlc" else bool(accelerators.get(key))
-            if installed:
-                self._pending_installations.pop(key, None)
-                self.notify(f"{key} installed and detected.")
-                continue
-            checks += 1
-            if checks >= 120:
-                self._pending_installations.pop(key, None)
-                self.notify(f"{key} was not detected; check the installer terminal for errors.")
-            else:
-                self._pending_installations[key] = checks
-        if not self._pending_installations:
-            self._installer_timer.stop()
+        installed = bool(environment.get("vlc")) if key == "vlc" else bool(
+            (environment.get("accelerators", {}) or {}).get(key))
+        if exit_code == 0 and installed:
+            self.notify(f"{display} installed.")
+        else:
+            detail = " ".join("".join(output).split())[-180:]
+            status = "Install failed" + (f": {detail}" if detail else ".")
+            self.settings_page.set_installer_state(key, status, error=True)
+            self.notify(status)
+        process.deleteLater()
+
+    def _installer_failed(self, key: str, process: QProcess) -> None:
+        entry = self._installer_processes.pop(key, None)
+        if entry is None:
+            return
+        _, _output, display = entry
+        self.settings_page.set_installer_state(
+            key, "winget missing (Windows App Installer required)", error=True)
+        self.notify(f"Could not install {display}: winget is not available in this environment.")
+        process.deleteLater()
 
     def save_telegram_credentials(self, api_id: str, api_hash: str, session: str) -> None:
         self.store.update({"telegram_api_id": api_id, "telegram_api_hash": api_hash,

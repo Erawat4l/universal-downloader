@@ -136,6 +136,24 @@ def run_selftest(args: argparse.Namespace) -> int:
             window._select_nav(index)
             application.processEvents()
 
+        # Home returns to the last search page from Activity, then a second
+        # press returns to the empty Home screen.
+        window._home_context_page = window.search_page
+        window.pages.setCurrentWidget(window.activity_page)
+        window._select_nav(0)
+        if window.pages.currentWidget() is not window.search_page:
+            problems.append("Home did not restore the last search page")
+        window._select_nav(0)
+        if window.pages.currentWidget() is not window.home_page:
+            problems.append("second Home press did not return to the Home screen")
+
+        window.search_page.thinking.start("Search", "Searching")
+        window.search_page.thinking.finish("Search", 0.5, ["done"])
+        frozen_detail = window.search_page.thinking.detail_label.text()
+        window.search_page.thinking.tick(99.0, "late timer")
+        if window.search_page.thinking.detail_label.text() != frozen_detail:
+            problems.append("completed search timer continued updating")
+
         window.pages.setCurrentWidget(window.search_page)
         window.search_page.set_results("selftest", [
             {"title": "Selftest Movie", "source": "Test", "type": "movie", "year": "2024",

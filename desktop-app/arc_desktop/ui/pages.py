@@ -83,7 +83,7 @@ class HomePage(QWidget):
         header, header_layout = card("horizontal", 12, 0, "Card")
         header.setObjectName("")
         header.setStyleSheet("background: transparent; border: none;")
-        brand_tile = QLabel("\u2193")
+        brand_tile = QLabel("\u21E9")
         brand_tile.setFixedSize(42, 42)
         brand_tile.setAlignment(Qt.AlignCenter)
         brand_tile.setStyleSheet(
@@ -974,6 +974,8 @@ class SettingsPage(QWidget):
 
         self._scroll.add_stretch()
         self._accel_rows: list[QWidget] = []
+        self._install_buttons: dict[str, QPushButton] = {}
+        self._install_status: dict[str, QLabel] = {}
 
     # ------------------------------------------------------------------ slots
     def _group(self, title: str) -> QWidget:
@@ -999,6 +1001,8 @@ class SettingsPage(QWidget):
         for row in self._accel_rows:
             row.deleteLater()
         self._accel_rows.clear()
+        self._install_buttons.clear()
+        self._install_status.clear()
 
         parallel = int(environment.get("parallel_connections", 1))
         headline = QLabel(f"{parallel}\u00d7 connections")
@@ -1023,20 +1027,33 @@ class SettingsPage(QWidget):
             purpose_label.setObjectName("MetaDim")
             layout.addWidget(name_label)
             layout.addWidget(purpose_label, 1)
-            if path:
-                status = QLabel("Installed")
-                status.setObjectName("MetaDim")
-                layout.addWidget(status)
-            else:
+            status = QLabel("Installed" if path else "")
+            status.setObjectName("MetaDim")
+            layout.addWidget(status)
+            self._install_status[name.lower()] = status
+            if not path:
                 install = QPushButton("Install")
                 install.setObjectName("Ghost")
                 install.setCursor(Qt.PointingHandCursor)
                 install.clicked.connect(lambda _=False, key=name.lower(): self.install_requested.emit(key))
                 layout.addWidget(install)
+                self._install_buttons[name.lower()] = install
             self.accel_layout.addWidget(row)
             self._accel_rows.append(row)
 
         self.quality_note.setText("Used automatically when available.")
+
+    def set_installer_state(self, key: str, text: str, busy: bool = False, error: bool = False) -> None:
+        button = self._install_buttons.get(key.lower())
+        status = self._install_status.get(key.lower())
+        if button is not None:
+            button.setText("Installing…" if busy else "Install")
+            button.setEnabled(not busy)
+        if status is not None:
+            status.setText(text)
+            status.setStyleSheet(
+                f"color: {theme.ARC_ERROR if error else theme.ARC_WARNING}; font-size: 10px;"
+            )
 
     def set_telegram(self, api_id: str, api_hash: str, session: str) -> None:
         self.tg_id.setText(api_id or "")

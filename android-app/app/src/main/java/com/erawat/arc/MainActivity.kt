@@ -716,12 +716,17 @@ private fun ArcApp(
 
     fun openStreamExternal(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
         try {
-            val isDirectPlayable = streamUrl.contains("googlevideo.com") ||
-                                  streamUrl.contains("youtube.com") ||
-                                  streamUrl.contains("youtu.be") ||
-                                  streamUrl.startsWith("file://") ||
-                                  streamUrl.startsWith("/") ||
-                                  (!streamUrl.contains("hakunaymatata") && !streamUrl.contains("mzfi.me"))
+            val lowerStreamUrl = streamUrl.lowercase()
+            // Only sources known to be self-authenticating bypass the local
+            // header proxy. CDN links such as bcdn/okcdn often require Referer;
+            // handing those directly to VLC can start video without usable audio.
+            val isDirectPlayable = lowerStreamUrl.contains("googlevideo.com") ||
+                                  lowerStreamUrl.contains("youtube.com") ||
+                                  lowerStreamUrl.contains("youtu.be") ||
+                                  lowerStreamUrl.startsWith("file://") ||
+                                  lowerStreamUrl.startsWith("/") ||
+                                  lowerStreamUrl.contains("127.0.0.1") ||
+                                  lowerStreamUrl.contains("localhost")
 
             var playUrl = streamUrl
             if (!isDirectPlayable && !streamUrl.contains("127.0.0.1")) {
@@ -740,8 +745,12 @@ private fun ArcApp(
                 }
             }
             val uri = Uri.parse(playUrl)
+            val pathLower = uri.path.orEmpty().lowercase()
+            val streamMime = if (pathLower.endsWith(".mp3") || pathLower.endsWith(".m4a") ||
+                pathLower.endsWith(".aac") || pathLower.endsWith(".flac") ||
+                pathLower.endsWith(".ogg") || pathLower.endsWith(".wav")) "audio/*" else "video/*"
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "video/*")
+                setDataAndType(uri, streamMime)
                 putExtra("title", title.ifBlank { "Media Stream" })
                 putExtra("from_start", true)
                 putExtra("position", 0L)
