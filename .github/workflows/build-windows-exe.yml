@@ -67,23 +67,6 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m arc_desktop --selftest
 
-      - name: Confirm the APK engine copies still match the root
-        run: |
-          $pairs = @(
-            @("dl.py",  "android-app/app/src/main/python/dl.py"),
-            @("igl.py", "android-app/app/src/main/python/igl.py")
-          )
-          foreach ($pair in $pairs) {
-            $root = Get-FileHash $pair[0] -Algorithm SHA256
-            $copy = Get-FileHash $pair[1] -Algorithm SHA256
-            if ($root.Hash -ne $copy.Hash) {
-              Write-Host "::warning::$($pair[1]) is out of sync with $($pair[0])."
-              Write-Host "::warning::Run 'python android-app/tools/build_android.py' to re-sync before building the APK."
-            } else {
-              Write-Host "$($pair[1]) matches $($pair[0])"
-            }
-          }
-
   build:
     name: Freeze single-file exe
     needs: verify
@@ -176,7 +159,7 @@ jobs:
           cat > notes.md <<EOF
           ## Arc Desktop ${tag}
 
-          Windows build of the same engine as the Arc APK.
+          Windows build of the desktop engine and UI.
 
           | File | Use it when |
           |---|---|

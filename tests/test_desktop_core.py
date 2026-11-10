@@ -534,29 +534,22 @@ def t_qt_names_exist():
     assert not problems, "\n        " + "\n        ".join(problems)
 
 
-@test("search results wait for poster readiness before the reveal animation")
-def t_search_posters_gate_results():
-    widgets = (DESKTOP / "arc_desktop" / "ui" / "widgets.py").read_text(encoding="utf-8")
+@test("successful search results render immediately while posters load asynchronously")
+def t_search_results_visible_immediately():
     pages = (DESKTOP / "arc_desktop" / "ui" / "pages.py").read_text(encoding="utf-8")
-    assert "ready = Signal()" in widgets
-    assert "self.ready.emit()" in widgets
-    assert "poster.ready.connect(poster_ready)" in pages
-    assert "item.hide()" in pages
-    assert "self._reveal_cards()" in pages and "QPropertyAnimation" in pages
-    assert "self._poster_timeout.start(3500)" in pages
     assert "self.thinking.setVisible(not bool(hits))" in pages
     add_card = pages.index("self.results_host.addWidget(item)", pages.index("def set_results"))
+    show_card = pages.index("item.show()", add_card)
     start_poster = pages.index("poster.set_url(str(hit.get(\"poster\", \"\")))", add_card)
-    assert add_card < start_poster, "poster readiness can fire synchronously before the card joins the layout"
+    assert add_card < show_card < start_poster
+    assert "item.hide()" not in pages
 
 
-@test("Android streaming resolves the selected quality and prefers the header proxy")
-def t_android_re_resolves_stream_quality():
-    activity = REPO / "android-app" / "app" / "src" / "main" / "java" / "com" / "erawat" / "arc" / "MainActivity.kt"
-    source = activity.read_text(encoding="utf-8")
-    assert "val needsFreshResolve = target.targetUrl.isNotBlank()" in source
-    assert 'put("quality", if (selectedQuality.contains("Ask"' in source
-    assert "val playUrl = proxyUrl.ifBlank { directUrl }" in source
+@test("Android build keeps its checked-in engine instead of copying desktop dl.py")
+def t_android_engine_stays_independent():
+    builder = (REPO / "android-app" / "tools" / "build_android.py").read_text(encoding="utf-8")
+    assert "Using the checked-in Android engine" in builder
+    assert "shutil.copy2(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)" not in builder
 
 
 # ============================================================== main

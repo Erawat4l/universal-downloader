@@ -224,7 +224,7 @@ The builder will:
 - Verify Python 3.12, 3.13, or 3.14 and Java 17.
 - Configure the Android SDK path.
 - Use the Termux ARM64 `aapt2` package instead of an incompatible desktop `aapt2` binary.
-- Synchronize the root `dl.py` into the APK Python source directory.
+- Use the checked-in Android Python engine (separate from the desktop/CLI root `dl.py`).
 - Download Gradle and Chaquopy dependencies when needed.
 - Build a local debug APK.
 - Create the next numbered APK: `A4C 1.apk`, `A4C 2.apk`, and so on.

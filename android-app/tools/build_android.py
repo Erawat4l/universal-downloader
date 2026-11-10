@@ -251,7 +251,7 @@ def pin_wrapper_properties(wrapper_properties: Path) -> None:
             properties = re.sub(r"^networkTimeout=.*", timeout_line, properties, flags=re.MULTILINE)
             changed = True
     else:
-        properties = properties.rstrip("\n") + "\n" + timeout_line + "\n"
+        properties = properties.rstrip("\\n") + "\\n" + timeout_line + "\\n"
         changed = True
 
     if changed:
@@ -354,20 +354,11 @@ def configure_sdk_for_gradle(sdk: Path) -> None:
 
 
 def sync_python_engine() -> None:
-    """Package the same downloader engine used by the repository into the APK."""
-    if not PYTHON_ENGINE_SOURCE.exists():
-        raise BuildError(f"Bundled Python engine source is missing: {PYTHON_ENGINE_SOURCE}")
-    PYTHON_ENGINE_DEST.parent.mkdir(parents=True, exist_ok=True)
-    if not PYTHON_ENGINE_DEST.exists() or PYTHON_ENGINE_DEST.read_bytes() != PYTHON_ENGINE_SOURCE.read_bytes():
-        shutil.copy2(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)
-        say(f"Bundled Python engine synced from {PYTHON_ENGINE_SOURCE}")
-    else:
-        say("Bundled Python engine is up to date.")
-
-    if PYTHON_IGL_SOURCE.exists():
-        if not PYTHON_IGL_DEST.exists() or PYTHON_IGL_DEST.read_bytes() != PYTHON_IGL_SOURCE.read_bytes():
-            shutil.copy2(PYTHON_IGL_SOURCE, PYTHON_IGL_DEST)
-            say(f"Bundled IGL module synced from {PYTHON_IGL_SOURCE}")
+    """Keep the APK's checked-in engine independent from the desktop/CLI engine."""
+    missing = [path for path in (PYTHON_ENGINE_DEST, PYTHON_IGL_DEST) if not path.is_file()]
+    if missing:
+        raise BuildError("Bundled Android Python source is missing: " + ", ".join(map(str, missing)))
+    say("Using the checked-in Android engine; desktop/CLI engine is not copied into the APK.")
 
 
 def number_and_send_artifact(artifact: Path) -> Path:

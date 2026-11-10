@@ -14,10 +14,6 @@ import base64
 import io
 import contextlib
 import shutil
-import hashlib
-import json
-import time
-import signal
 import requests
 import html
 from bs4 import BeautifulSoup
@@ -26,193 +22,6 @@ import http.server
 import socketserver
 import threading
 import concurrent.futures
-
-
-# ---------------------------------------------------------------------------
-# Windowed-executable safety.
-#
-# A PyInstaller/Nuitka build started with --noconsole (the Arc desktop .exe) and
-# the Chaquopy runtime inside the APK both leave sys.stdin / sys.stdout /
-# sys.stderr as None. The engine calls sys.stdout.isatty(), sys.stdin.isatty()
-# and print() on almost every code path, which would raise
-# AttributeError: 'NoneType' object has no attribute 'isatty'.
-#
-# These shims keep the engine importable and runnable headless: isatty() is
-# False (so interactive prompts take their non-interactive branch instead of
-# crashing) and writes are captured rather than lost.
-# ---------------------------------------------------------------------------
-
-class _NullStream(io.StringIO):
-    """A stream that is never a TTY and never blocks on read."""
-
-    def isatty(self):
-        return False
-
-    def write(self, value):
-        try:
-            return super().write(value)
-        except Exception:
-            return 0
-
-    def flush(self):
-        try:
-            super().flush()
-        except Exception:
-            pass
-
-    def read(self, *args):
-        raise EOFError("no interactive input in this runtime")
-
-    def readline(self, *args):
-        raise EOFError("no interactive input in this runtime")
-
-    def fileno(self):
-        raise OSError("no real file descriptor in this runtime")
-
-
-for _name in ("stdin", "stdout", "stderr"):
-    if getattr(sys, _name, None) is None:
-        setattr(sys, _name, _NullStream())
-
-
-# ---------------------------------------------------------------------------
-# Thread-aware log capture
-#
-# run_app_json_request() used contextlib.redirect_stdout(), which swaps
-# sys.stdout for the WHOLE PROCESS. That was survivable on Android because the
-# app serialised every engine call, but it means any output produced while a
-# request is in flight - the host process's own logging, or a second concurrent
-# request - is silently swallowed into the first request's buffer. The desktop
-# app polls progress while downloads run, so the capture is now filtered by
-# thread instead: each request keeps only its own lines, and everything else
-# still reaches the real console.
-# ---------------------------------------------------------------------------
-_CAPTURE_REGISTRY = {}
-_CAPTURE_LOCK = threading.Lock()
-
-
-class _ThreadFilteredStream:
-    """A stdout/stderr proxy that routes writes to the right capture buffer."""
-
-    def __init__(self, real_stream):
-        self._real = real_stream
-
-    def _buffer_for_current_thread(self):
-        """The capture buffer registered for THIS thread, or None.
-
-        Deliberately strict: output from a thread that never registered goes to
-        the real console. An earlier revision absorbed foreign writes whenever a
-        single request was in flight, which silently swallowed the host
-        process's own logging (the desktop GUI prints diagnostics while a
-        download runs). Engine worker threads opt in via inherit_capture().
-        """
-        with _CAPTURE_LOCK:
-            return _CAPTURE_REGISTRY.get(threading.get_ident())
-
-    def write(self, data):
-        buffer = self._buffer_for_current_thread()
-        target = buffer if buffer is not None else self._real
-        try:
-            return target.write(data)
-        except Exception:
-            return 0
-
-    def flush(self):
-        buffer = self._buffer_for_current_thread()
-        target = buffer if buffer is not None else self._real
-        try:
-            target.flush()
-        except Exception:
-            pass
-
-    def isatty(self):
-        if self._buffer_for_current_thread() is not None:
-            return False
-        try:
-            return bool(self._real.isatty())
-        except Exception:
-            return False
-
-    def fileno(self):
-        return self._real.fileno()
-
-    def writable(self):
-        return True
-
-    @property
-    def encoding(self):
-        return getattr(self._real, "encoding", "utf-8")
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-
-class _capture_thread_logs:
-    """Context manager: capture this thread's prints into a StringIO buffer."""
-
-    def __init__(self):
-        self.buffer = io.StringIO()
-        self._token = None
-        self._previous = None
-
-    def __enter__(self):
-        self._token = threading.get_ident()
-        with _CAPTURE_LOCK:
-            self._previous = _CAPTURE_REGISTRY.get(self._token)
-            _CAPTURE_REGISTRY[self._token] = self.buffer
-        return self.buffer
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        with _CAPTURE_LOCK:
-            if self._previous is None:
-                _CAPTURE_REGISTRY.pop(self._token, None)
-            else:
-                _CAPTURE_REGISTRY[self._token] = self._previous
-        return False
-
-    def text(self):
-        try:
-            return self.buffer.getvalue()
-        except Exception:
-            return ""
-
-
-def inherit_capture(target):
-    """Wrap a callable so a spawned thread logs into its parent request's buffer.
-
-    Engine worker threads (episode prefetch, quality probing, OTT lookups) print
-    lines that belong to the request which spawned them. Capture is registered
-    per thread, so the child must opt in explicitly - otherwise that output would
-    escape to the host console and vanish from the app's execution trace.
-    Returns the callable unchanged when no capture is active (plain CLI use).
-    """
-    parent_buffer = _CAPTURE_REGISTRY.get(threading.get_ident())
-    if parent_buffer is None or not callable(target):
-        return target
-
-    def wrapped(*args, **kwargs):
-        token = threading.get_ident()
-        with _CAPTURE_LOCK:
-            previous = _CAPTURE_REGISTRY.get(token)
-            _CAPTURE_REGISTRY[token] = parent_buffer
-        try:
-            return target(*args, **kwargs)
-        finally:
-            with _CAPTURE_LOCK:
-                if previous is None:
-                    _CAPTURE_REGISTRY.pop(token, None)
-                else:
-                    _CAPTURE_REGISTRY[token] = previous
-
-    return wrapped
-
-
-_REAL_STDOUT = sys.stdout
-_REAL_STDERR = sys.stderr
-if not isinstance(sys.stdout, _ThreadFilteredStream):
-    sys.stdout = _ThreadFilteredStream(_REAL_STDOUT)
-if not isinstance(sys.stderr, _ThreadFilteredStream):
-    sys.stderr = _ThreadFilteredStream(_REAL_STDERR)
 try:
     import urllib3.util.connection as urllib3_conn
     urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
@@ -369,7 +178,7 @@ def print_adm_link(file_path):
     basename = os.path.basename(file_path)
     ext = os.path.splitext(basename)[1] or ".mp4"
     dir_name = os.path.dirname(file_path) or "/sdcard/Download"
-    
+
     short_name = None
     for i in range(1, 100):
         cand = f"v{i}{ext}"
@@ -401,7 +210,7 @@ def print_adm_link(file_path):
     except Exception:
         pass
     lan_url = f"http://{my_ip}:8080/{encoded}"
-    
+
     print("\n" + "="*65)
     print("  DIRECT LINK FOR ADM (ADVANCED DOWNLOAD MANAGER):")
     print("="*65)
@@ -720,68 +529,25 @@ def save_m3u8_stream_file(url, title, target_dir=None):
         pass
     return None
 
-_AES_GCM_BACKEND = None
-_AES_GCM_WARNED = False
-
-
-def _aes_gcm_decrypt(key, nonce, ciphertext, tag):
-    """AES-256-GCM decrypt using whichever backend this runtime provides.
-
-    The original code imported Cryptodome unconditionally and swallowed every
-    failure, and it also called hashlib.sha256() while hashlib was only imported
-    locally inside handle_netmirror - so it raised NameError on the first call
-    and returned None forever, on every platform. The vendored pyaes cannot help
-    here: it implements CTR/CBC/CFB/OFB/ECB but not GCM.
-
-    The desktop build installs pycryptodomex, so encrypted NetMirror streams
-    resolve there. Where no backend exists we now say so once instead of failing
-    silently.
-    """
-    global _AES_GCM_BACKEND, _AES_GCM_WARNED
-    if _AES_GCM_BACKEND is None:
-        try:
-            from Cryptodome.Cipher import AES as _CryptoAES
-            _AES_GCM_BACKEND = ("pycryptodomex", _CryptoAES)
-        except Exception:
-            try:
-                from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
-                _AES_GCM_BACKEND = ("cryptography", _AESGCM)
-            except Exception:
-                _AES_GCM_BACKEND = False
-    if _AES_GCM_BACKEND is False:
-        if not _AES_GCM_WARNED:
-            _AES_GCM_WARNED = True
-            print("[WARN] An encrypted stream needs an AES-GCM backend. Install one "
-                  "with: pip install pycryptodomex")
-        return None
-
-    name, backend = _AES_GCM_BACKEND
-    try:
-        if name == "pycryptodomex":
-            cipher = backend.new(key, backend.MODE_GCM, nonce=nonce)
-            return cipher.decrypt_and_verify(ciphertext, tag)
-        return backend(key).decrypt(nonce, ciphertext + tag, None)
-    except Exception:
-        return None
-
-
 def decrypt_netmirror_tv_url(encrypted_val):
-    """Decrypt the AES-GCM encrypted media URL from the NetMirror watchbox."""
+    """Decrypt AES-GCM encrypted media URL from NetMirror watchbox."""
     try:
-        clean_enc = str(encrypted_val).replace('&encrypt=true', '').strip()
+        from Cryptodome.Cipher import AES
+        clean_enc = encrypted_val.replace('&encrypt=true', '').strip()
         raw = base64.b64decode(clean_enc)
         if len(raw) < 28:
             return None
         iv = raw[:12]
         tag = raw[12:28]
         ciphertext = raw[28:]
-        for secret in (b'net###@@sss', b'NET_TV_SECRET_KEY'):
-            decrypted = _aes_gcm_decrypt(hashlib.sha256(secret).digest(), iv, ciphertext, tag)
-            if decrypted:
-                try:
-                    return decrypted.decode('utf-8')
-                except Exception:
-                    continue
+        for secret in [b'net###@@sss', b'NET_TV_SECRET_KEY']:
+            try:
+                key = hashlib.sha256(secret).digest()
+                cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+                decrypted = cipher.decrypt_and_verify(ciphertext, tag)
+                return decrypted.decode('utf-8')
+            except Exception:
+                continue
         return None
     except Exception:
         return None
@@ -833,73 +599,35 @@ def safe_move(src, dst):
 import time
 import socket
 
-NETWORK_PROBE_TIMEOUT = 1.5
-NETWORK_WAIT_MAX_SECONDS = 300
-
-def check_network(timeout=NETWORK_PROBE_TIMEOUT):
+def check_network():
     """Check internet connection by testing socket connections to reliable hosts."""
     for host, port in [("1.1.1.1", 53), ("8.8.8.8", 53), ("google.com", 80)]:
         try:
-            s = socket.create_connection((host, port), timeout=timeout)
+            s = socket.create_connection((host, port), timeout=3)
             s.close()
             return True
         except Exception:
             pass
     return False
 
-def wait_for_network(job_id=None, max_wait=NETWORK_WAIT_MAX_SECONDS):
-    """Block until connectivity returns, honouring cancel/pause, with a deadline.
-
-    Returns True when the network came back, False when the wait was abandoned
-    (the job was cancelled, or it was still offline after max_wait seconds).
-
-    The previous version was `while not check_network(): time.sleep(3)` - an
-    unbounded loop that inspected no job state. A dropped connection, a captive
-    portal, or any machine without a route to the probe hosts left the download
-    stuck forever, and neither Cancel nor Pause could release it. The status also
-    stayed "Downloading" the whole time, so the app looked frozen rather than
-    offline.
-    """
+def wait_for_network():
+    """If network is down, pause and wait until connectivity is restored."""
     if check_network():
-        return True
-
-    jid = str(job_id or get_current_job_id() or "")
+        return
     print("\n" + "!"*60)
     print(" [WARN] Network connection lost! Download paused.")
-    print(f" > Waiting up to {int(max_wait)}s for connectivity...")
+    print(" > Waiting for internet connection to recover...")
     print("!"*60, flush=True)
 
-    state = ACTIVE_DOWNLOAD_PROGRESS.get(jid) if jid else None
-    if isinstance(state, dict):
-        state["status"] = "Waiting for network"
-        state["speed"] = "--"
-        state["eta"] = "--"
-
-    started = time.time()
-    while True:
-        if jid and jid in CANCELLED_DOWNLOAD_JOBS:
-            print("\n[WARN] Cancelled while waiting for the network.")
-            return False
-        if jid and jid in PAUSED_DOWNLOAD_JOBS:
-            event = PAUSE_EVENTS.get(jid)
-            if event is not None:
-                event.wait(timeout=1.0)
-                continue
-        if check_network():
-            offline_for = int(time.time() - started)
-            print("\n" + "="*60)
-            print(f" [OK] Network connection restored (was offline for {offline_for}s)!")
-            print(" > Resuming download...")
-            print("="*60, flush=True)
-            if isinstance(state, dict):
-                state["status"] = "Downloading"
-            return True
-        if time.time() - started >= max_wait:
-            print(f"\n[FAIL] Still offline after {int(time.time() - started)}s.")
-            print(" > Giving up so this download can be retried instead of hanging.")
-            return False
+    down_start = time.time()
+    while not check_network():
         time.sleep(3)
 
+    down_duration = int(time.time() - down_start)
+    print("\n" + "="*60)
+    print(f" [OK] Network connection restored (was offline for {down_duration}s)!")
+    print(" > Resuming download...")
+    print("="*60, flush=True)
 
 PROGRESS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 PROGRESS_SPINNER_INDEX = 0
@@ -962,131 +690,6 @@ def cancel_download(job_id):
             ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Cancelled"
     return True
 
-def format_speed(speed):
-    """Human-readable transfer speed from bytes/second. Accepts None/0/str."""
-    try:
-        value = float(speed)
-    except (TypeError, ValueError):
-        return str(speed) if speed else "--"
-    if value <= 0:
-        return "--"
-    if value >= 1024 * 1024:
-        return f"{value / (1024 * 1024):.2f}MB/s"
-    if value >= 1024:
-        return f"{value / 1024:.1f}KB/s"
-    return f"{value:.0f}B/s"
-
-
-def format_eta(seconds):
-    """Human-readable remaining time from seconds. Accepts None/0/str."""
-    try:
-        value = int(float(seconds))
-    except (TypeError, ValueError):
-        return str(seconds) if seconds else "--"
-    if value <= 0:
-        return "--"
-    if value >= 3600:
-        hours, rest = divmod(value, 3600)
-        minutes, secs = divmod(rest, 60)
-        return f"{hours:d}:{minutes:02d}:{secs:02d}"
-    minutes, secs = divmod(value, 60)
-    return f"{minutes:02d}:{secs:02d}"
-
-
-QUALITY_ALIASES = {
-    '4k': ('4k', '2160p'), '2160p': ('4k', '2160p'), 'uhd': ('4k', '2160p'),
-    '2k': ('1440p',), '1440p': ('1440p',), 'qhd': ('1440p',),
-    '1080p': ('1080p',), 'fhd': ('1080p',), '720p': ('720p',),
-    '480p': ('480p',), '360p': ('360p',), '240p': ('240p',), '144p': ('144p',),
-}
-# Longest first so "2160p" wins over a stray "1080" match inside a size string.
-_QUALITY_TOKEN_RE = re.compile(r'(2160|1440|1080|720|480|360|240|144)\s*p|\b4k\b|\b2k\b|\buhd\b|\bqhd\b|\bfhd\b', re.I)
-_BEST_WORDS = ('best', 'auto', 'highest', 'default')
-
-
-QUALITY_RANK_TOKEN_RE = re.compile(r"\b(\d{3,4})\s*p?\b", re.IGNORECASE)
-
-
-def sort_quality_labels(labels):
-    """Sort front-end quality labels best-first, mirroring the APK's ranking.
-
-    MainActivity.kt does this in Kotlin (sortQualitiesDescending); the CLI never
-    needed it because its keys are already ordered. Both desktop and any future
-    front end can now share one implementation instead of re-deriving the table.
-
-    Ranking: 4k/2160 first, then descending resolution, then 'auto', then 'best'.
-    Labels with no recognisable number keep their relative order at the end.
-    """
-    if not labels:
-        return []
-
-    unique = []
-    seen = set()
-    for label in labels:
-        text = str(label).strip()
-        if text and text.lower() not in seen:
-            seen.add(text.lower())
-            unique.append(text)
-
-    def score(text):
-        lowered = text.lower()
-        if "4k" in lowered or "2160" in lowered or "uhd" in lowered:
-            return 4000
-        if "2k" in lowered or "1440" in lowered or "qhd" in lowered:
-            return 1440
-        match = QUALITY_RANK_TOKEN_RE.search(text)
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                return 0
-        if lowered.startswith("auto"):
-            return 50
-        if "best" in lowered or "highest" in lowered or "default" in lowered:
-            return 10
-        return 0
-
-    return sorted(unique, key=lambda text: (-score(text), text.lower()))
-
-
-def match_quality_key(requested, keys, infos=None):
-    """Resolve a quality string from any front end to one of the engine's keys.
-
-    The CLI sends bare keys ('1080p', '4k'). The Android app and the desktop app
-    send display labels ('1080p (Full HD)', '2160p (4K UHD)') and NetMirror hands
-    back CDN text ('1080P 2GB'). The old test was `quality_arg.lower() in k`, which
-    is backwards for every label form and silently fell through to the highest
-    quality. This accepts all of them. Returns None when nothing matches so the
-    caller keeps its own fallback. `keys` must already be sorted best-first.
-    """
-    if not requested or not keys:
-        return None
-    req = str(requested).strip().lower()
-    if any(w in req for w in _BEST_WORDS) and not _QUALITY_TOKEN_RE.search(req):
-        return keys[0]
-
-    infos = infos or {}
-    if req in keys:
-        return req
-    for key in keys:
-        label = str(infos.get(key, {}).get('label') or key).strip().lower()
-        if req == label:
-            return key
-
-    token = _QUALITY_TOKEN_RE.search(req)
-    if token:
-        raw = (token.group(1) or token.group(0)).strip().lower()
-        wanted = QUALITY_ALIASES.get(raw, QUALITY_ALIASES.get(f"{raw}p", (raw, raw + 'p')))
-        for candidate in wanted:
-            if candidate in keys:
-                return candidate
-        # A label such as "1080P (FULL HD)" also identifies the key directly.
-        for key in keys:
-            if any(candidate in key.lower() for candidate in wanted):
-                return key
-    return None
-
-
 def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--", job_id=None, downloaded_str=None):
     """Render a sleek, animated single-line progress bar guaranteed not to wrap or spam."""
     global PROGRESS_SPINNER_INDEX, CURRENT_DOWNLOAD_JOB_ID, ACTIVE_DOWNLOAD_PROGRESS
@@ -1096,7 +699,7 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
         pct = 0.0
 
     spd_clean = speed_str if ('s' in speed_str.lower() or speed_str.lower() in ('--', 'done', 'complete', 'paused')) else f"{speed_str}/s"
-    
+
     eta_val = str(eta_str or "--").strip()
     if eta_val.lower().startswith('eta'):
         eta_clean = eta_val[3:].strip()
@@ -1113,11 +716,6 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
         elif str(jid) in PAUSED_DOWNLOAD_JOBS or current_status == "Paused":
             status = "Paused"
         elif current_status == "Complete":
-            status = "Complete"
-        elif pct >= 100.0 or str(total_str).strip().lower() == "complete":
-            # The last frame of a finished transfer used to report "Downloading"
-            # at 100%, so a front end polling this dict showed a full bar that
-            # still claimed to be in progress until the request returned.
             status = "Complete"
         else:
             status = "Downloading"
@@ -1237,90 +835,9 @@ def _process_progress_line(line):
     sys.stdout.write(f"\r\033[K{line}\n")
     sys.stdout.flush()
 
-def run_command_with_clean_progress(cmd, job_id=None):
-    """Run subprocess while processing \\r and \\n into clean single-line progress updates.
-
-    This drives every external downloader (aria2c for direct files and torrents,
-    the yt-dlp binary for HLS). It previously never looked at the job-control
-    sets, so the app's Cancel button could not stop an aria2c transfer at all -
-    the subprocess ran to completion while the UI already said "Cancelled".
-    """
+def run_command_with_clean_progress(cmd):
+    """Run subprocess while processing \r and \n into clean single-line progress updates."""
     p = None
-    jid = str(job_id) if job_id else get_current_job_id()
-    jid = str(jid) if jid else None
-    # Mutable so the watchdog thread and the read loop share one flag.
-    state = {"suspended": False}
-    watchdog_stop = threading.Event()
-    watchdog = None
-
-    def _job_cancelled():
-        return bool(jid) and (jid in CANCELLED_DOWNLOAD_JOBS or
-                              ACTIVE_DOWNLOAD_PROGRESS.get(jid, {}).get("status") == "Cancelled")
-
-    def _job_paused():
-        return bool(jid) and (jid in PAUSED_DOWNLOAD_JOBS or
-                              ACTIVE_DOWNLOAD_PROGRESS.get(jid, {}).get("status") == "Paused")
-
-    def _suspend(proc):
-        """Best-effort pause. POSIX can SIGSTOP a child; Windows cannot."""
-        if hasattr(signal, "SIGSTOP"):
-            try:
-                os.kill(proc.pid, signal.SIGSTOP)
-                return True
-            except Exception:
-                return False
-        return False
-
-    def _resume(proc):
-        if hasattr(signal, "SIGCONT"):
-            try:
-                os.kill(proc.pid, signal.SIGCONT)
-                return True
-            except Exception:
-                return False
-        return False
-
-    def _watchdog():
-        """Enforce cancel/pause even while the read loop is blocked.
-
-        `p.stdout.read(1)` blocks until the child writes a byte. A quiet child -
-        aria2c during a stall, yt-dlp resolving a manifest, or any command that
-        only prints at the end - therefore froze the loop above, and its cancel
-        check never ran: the app said "Cancelled" while the process kept running
-        to completion. Polling from a second thread keeps job control responsive.
-
-        select() cannot wait on pipes under Windows, so a poller is the portable
-        answer rather than a non-blocking read.
-        """
-        while not watchdog_stop.wait(0.25):
-            try:
-                if p is None or p.poll() is not None:
-                    return
-                if _job_cancelled():
-                    try:
-                        if state["suspended"]:
-                            _resume(p)
-                            state["suspended"] = False
-                        p.terminate()
-                        try:
-                            p.wait(timeout=2)
-                        except Exception:
-                            p.kill()
-                    except Exception:
-                        pass
-                    return
-                if _job_paused():
-                    if not state["suspended"]:
-                        if _suspend(p):
-                            state["suspended"] = True
-                        elif jid:
-                            ACTIVE_DOWNLOAD_PROGRESS.setdefault(jid, {})["pause_note"] = "unsupported"
-                elif state["suspended"]:
-                    if _resume(p):
-                        state["suspended"] = False
-            except Exception:
-                return
-
     try:
         p = subprocess.Popen(
             cmd,
@@ -1330,45 +847,8 @@ def run_command_with_clean_progress(cmd, job_id=None):
             bufsize=1,
             universal_newlines=True
         )
-        if jid:
-            watchdog = threading.Thread(target=_watchdog, name=f"arc-jobctl-{jid[:8]}", daemon=True)
-            watchdog.start()
         buf = []
         while True:
-            if _job_cancelled():
-                try:
-                    if state["suspended"]:
-                        _resume(p)
-                        state["suspended"] = False
-                    p.terminate()
-                    p.wait(timeout=2)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-                sys.stdout.write("\n[STOP] Download cancelled by user.\n")
-                sys.stdout.flush()
-                return -1
-
-            if _job_paused():
-                if not state["suspended"]:
-                    state["suspended"] = _suspend(p)
-                    if not state["suspended"] and jid:
-                        # Nothing portable can freeze a Windows child process, so
-                        # report it instead of silently pretending to pause.
-                        ACTIVE_DOWNLOAD_PROGRESS.setdefault(jid, {})["pause_note"] = "unsupported"
-                if jid:
-                    evt = PAUSE_EVENTS.get(jid)
-                    if evt:
-                        evt.wait(timeout=0.5)
-                    else:
-                        time.sleep(0.5)
-                continue
-            elif state["suspended"]:
-                _resume(p)
-                state["suspended"] = False
-
             ch = p.stdout.read(1)
             if not ch:
                 if buf:
@@ -1380,25 +860,15 @@ def run_command_with_clean_progress(cmd, job_id=None):
                     buf = []
             else:
                 buf.append(ch)
-        if state["suspended"]:
-            _resume(p)
-            state["suspended"] = False
         p.wait()
-        if _job_cancelled():
-            sys.stdout.write("\n[STOP] Download cancelled by user.\n")
-            sys.stdout.flush()
-            return -1
         if p.returncode == 0:
-            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
+            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s")
         sys.stdout.write("\n")
         sys.stdout.flush()
         return p.returncode
     except KeyboardInterrupt:
         if p:
             try:
-                if state["suspended"]:
-                    _resume(p)
-                    state["suspended"] = False
                 p.terminate()
                 p.wait(timeout=1.5)
             except Exception:
@@ -1412,67 +882,11 @@ def run_command_with_clean_progress(cmd, job_id=None):
     except Exception as e:
         print(f"[FAIL] Process execution error: {e}")
         return 1
-    finally:
-        # Always stop the poller, and never leave a child suspended: a SIGSTOPed
-        # process whose parent walked away would linger forever.
-        watchdog_stop.set()
-        if p is not None:
-            try:
-                if state["suspended"]:
-                    _resume(p)
-                    state["suspended"] = False
-                if p.poll() is None and _job_cancelled():
-                    p.kill()
-            except Exception:
-                pass
-
-MAX_STREAM_RETRIES = 5
-RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 509, 520, 521, 522, 524}
-
-
-def _interruptible_sleep(seconds, job_id=None):
-    """Sleep while staying responsive to cancel and pause.
-
-    Returns False if the job was cancelled, True if the sleep completed. A plain
-    time.sleep() in a retry loop is why Cancel used to appear to do nothing: the
-    flag was only examined between chunks, never while backing off.
-    """
-    jid = str(job_id or get_current_job_id() or "")
-    deadline = time.time() + max(0.0, float(seconds))
-    while True:
-        if jid and jid in CANCELLED_DOWNLOAD_JOBS:
-            return False
-        if jid and jid in PAUSED_DOWNLOAD_JOBS:
-            event = PAUSE_EVENTS.get(jid)
-            if event is not None:
-                event.wait(timeout=0.5)
-                continue
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return True
-        time.sleep(min(0.25, remaining))
-
-
-def _is_retryable_stream_error(error):
-    """True when retrying could plausibly succeed.
-
-    4xx responses (other than timeouts and rate limits) mean the link itself is
-    refused - an expired CDN token, a deleted file, a missing Referer. Retrying
-    those forever only burns the user's time, which is what the old code did.
-    """
-    response = getattr(error, "response", None)
-    status = getattr(response, "status_code", None)
-    if status is None:
-        return True          # connection reset, DNS blip, timeout: worth a retry
-    if status in RETRYABLE_STATUS_CODES:
-        return True
-    return not (400 <= status < 500)
-
 
 def download_file_stream(url, filename, custom_headers=None, target_dir=None, cache_dir=None, job_id=None, batch_info=None):
     headers = get_stream_headers_for_url(url, {**HEADERS, **(custom_headers or {})})
     print(f"> Fetching: {url}")
-    
+
     dest_path = get_dest_path(filename, target_dir)
     jid = job_id or get_current_job_id()
 
@@ -1485,7 +899,6 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
 
     downloaded = 0
     total_bytes = 0
-    attempts = 0
     if os.path.exists(work_path):
         try:
             downloaded = os.path.getsize(work_path)
@@ -1497,15 +910,15 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
             req_headers = dict(headers)
             if downloaded > 0:
                 req_headers['Range'] = f'bytes={downloaded}-'
-            
+
             with requests.get(url, headers=req_headers, stream=True, timeout=30) as r:
                 if r.status_code == 416: # Range Not Satisfiable (already completed)
                     break
                 r.raise_for_status()
-                
+
                 content_type = r.headers.get('content-type', '').lower()
                 content_disp = r.headers.get('content-disposition', '')
-                
+
                 if downloaded == 0:
                     if 'filename=' in content_disp:
                         match = re.search(r'filename=["\']?([^"\';]+)["\']?', content_disp)
@@ -1541,42 +954,19 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                             return None
 
                         if jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
-                            # Hold on to `chunk` while paused and write it after
-                            # the resume. This branch used to `continue`, which
-                            # threw the chunk away: every paused download lost
-                            # exactly one 512 KB block and still reported
-                            # "[OK] Download complete!", producing a corrupt file
-                            # with no warning.
-                            while jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
-                                pct_val = (downloaded / total_bytes * 100) if total_bytes > 0 else 0.0
-                                if batch_info:
-                                    b_idx, b_tot = batch_info
-                                    pct_val = round(((b_idx - 1) / b_tot) * 100.0 + (pct_val / b_tot), 1)
-                                    tot_label = f"Ep {b_idx}/{b_tot} (Paused)"
-                                else:
-                                    tot_label = f"{downloaded / (1024*1024):.1f}/{total_bytes / (1024*1024):.1f}MB" if total_bytes > 0 else f"{downloaded / (1024*1024):.1f}MB"
-                                render_download_progress(pct_val, tot_label, "Paused", "--", job_id=jid)
-                                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                                    break
-                                evt = PAUSE_EVENTS.get(str(jid))
-                                if evt:
-                                    evt.wait(timeout=0.5)
-                                else:
-                                    time.sleep(0.5)
-
-                            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                                print("\n[STOP] Download cancelled by user.")
-                                try:
-                                    if os.path.exists(work_path):
-                                        os.remove(work_path)
-                                except Exception:
-                                    pass
-                                return None
-
-                            # The stall is not part of the transfer rate.
+                            pct_val = (downloaded / total_bytes * 100) if total_bytes > 0 else 0.0
+                            if batch_info:
+                                b_idx, b_tot = batch_info
+                                pct_val = round(((b_idx - 1) / b_tot) * 100.0 + (pct_val / b_tot), 1)
+                                tot_label = f"Ep {b_idx}/{b_tot} (Paused)"
+                            else:
+                                tot_label = f"{downloaded / (1024*1024):.1f}/{total_bytes / (1024*1024):.1f}MB" if total_bytes > 0 else f"{downloaded / (1024*1024):.1f}MB"
+                            render_download_progress(pct_val, tot_label, "Paused", "--", job_id=jid)
+                            evt = PAUSE_EVENTS.get(str(jid))
+                            if evt:
+                                evt.wait()
                             last_time = time.time()
-                            last_downloaded = downloaded
-                            smooth_speed = 0.0
+                            continue
 
                         if chunk:
                             f.write(chunk)
@@ -1610,57 +1000,13 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                                         render_download_progress(100.0, total_str="--", speed_str=speed_str, eta_str="--", job_id=jid, downloaded_str=f"{mb_done:.1f} MB")
                                 last_time = now
                                 last_downloaded = downloaded
-
-                # The stream ended. If the server told us how big the file is and
-                # we have fewer bytes than that, the transfer stopped early -
-                # re-enter the loop so the Range header resumes it instead of
-                # promoting a truncated file to the final name.
-                if total_bytes and downloaded < total_bytes:
-                    attempts += 1
-                    if attempts > MAX_STREAM_RETRIES:
-                        print(f"\n[FAIL] Transfer keeps stopping early at "
-                              f"{downloaded / (1024*1024):.1f} of {total_bytes / (1024*1024):.1f} MB.")
-                        return None
-                    print(f"\n[WARN] Stream ended early ({downloaded} of {total_bytes} bytes). "
-                          f"Resuming from where it stopped...", flush=True)
-                    if not _interruptible_sleep(1.0, jid):
-                        print("\n[STOP] Download cancelled.")
-                        return None
-                    continue
                 break
         except (requests.exceptions.RequestException, socket.error) as e:
-            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                print("\n[STOP] Download cancelled.")
-                return None
-
-            status_code = getattr(getattr(e, "response", None), "status_code", None)
-            if not _is_retryable_stream_error(e):
-                print(f"\n[FAIL] The server refused this link (HTTP {status_code}).")
-                print(" > It is expired, removed, or needs different headers - retrying will not help.")
-                print(" > The partial file is kept so a fresh link resumes where this stopped.")
-                return None
-
-            attempts += 1
-            if attempts > MAX_STREAM_RETRIES:
-                print(f"\n[FAIL] Giving up on {filename} after {MAX_STREAM_RETRIES} attempts: {e}")
-                return None
-
             if not check_network():
-                if not wait_for_network(job_id=jid):
-                    # Keep the .part fragment so a retry resumes rather than
-                    # restarting, and never promote a partial file to the final
-                    # destination name.
-                    print(f"[FAIL] Giving up on {filename}: network unavailable.")
-                    return None
-                attempts = 0        # connectivity is back: allow a full retry budget
-                continue
-
-            backoff = min(3 * attempts, 15)
-            hint = f"HTTP {status_code}" if status_code else "connection problem"
-            print(f"\n[WARN] Attempt {attempts}/{MAX_STREAM_RETRIES} failed ({hint}). Retrying in {backoff}s...", flush=True)
-            if not _interruptible_sleep(backoff, jid):
-                print("\n[STOP] Download cancelled.")
-                return None
+                wait_for_network()
+            else:
+                print(f"\n[WARN] Network hiccup: {e}. Retrying in 3s...", flush=True)
+                time.sleep(3)
 
     if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
         if os.path.exists(work_path):
@@ -1668,16 +1014,8 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
             except Exception: pass
         return None
 
-    # Move from temporary work path to destination path, but only when it is
-    # actually complete. A short file left in the cache can still be resumed;
-    # the same file renamed to its final name looks finished and is not.
+    # Move from temporary work path to destination path
     if os.path.exists(work_path):
-        final_size = os.path.getsize(work_path)
-        if total_bytes and final_size < total_bytes:
-            print(f"\n[FAIL] Incomplete download kept for resume: "
-                  f"{final_size} of {total_bytes} bytes.")
-            print(f" > Fragment: {work_path}")
-            return None
         safe_move(work_path, dest_path)
 
     sys.stdout.write("\n")
@@ -1719,30 +1057,30 @@ def handle_selfstudys(url, target_dir=None):
     res.raise_for_status()
     html = res.text
     soup = BeautifulSoup(html, 'html.parser')
-    
+
     raw_title = ""
     if soup.title and soup.title.string:
         raw_title = soup.title.string.strip()
     elif soup.find('h1'):
         raw_title = soup.find('h1').text.strip()
-    
+
     raw_title = re.sub(r'\s*\(Quick Revision Notes\)', '', raw_title, flags=re.IGNORECASE)
     raw_title = re.sub(r'\s*PDF\s*', '', raw_title, flags=re.IGNORECASE)
-    
+
     filename = clean_filename(raw_title, default_ext=".pdf")
-    
+
     pdf_match = re.search(r'https?://[^\s"\'\(\)]+sitepdfs[^\s"\'\(\)]+', html)
     if pdf_match:
         pdf_url = pdf_match.group(0)
         return download_file_stream(pdf_url, filename, target_dir=target_dir)
-        
+
     df_match = re.search(r'downloadFile\([\"\'\`]\s*([^\s\"\'\`]+)\s*[\"\'\`]\)', html)
     if df_match:
         pdf_url = df_match.group(1)
         if not pdf_url.startswith('http'):
             pdf_url = urllib.parse.urljoin('https://www.selfstudys.com', pdf_url)
         return download_file_stream(pdf_url, filename, target_dir=target_dir)
-        
+
     updf_match = re.search(r'https?://[^\s"\'\(\)]+uploads/pdf/[^\s"\'\(\)]+\.pdf', html)
     if updf_match:
         return download_file_stream(updf_match.group(0), filename, target_dir=target_dir)
@@ -1759,7 +1097,7 @@ def handle_studiestoday(url, target_dir=None):
     res.raise_for_status()
     html = res.text
     soup = BeautifulSoup(html, 'html.parser')
-    
+
     # Check if main page links to a viewfile.html page
     vf_link = soup.find('a', href=re.compile(r'/node/\d+/viewfile\.html'))
     if vf_link:
@@ -1773,14 +1111,14 @@ def handle_studiestoday(url, target_dir=None):
     raw_title = re.sub(r'^Views?\s+and\s+Download\s+PDF\s+file\s*:?\s*', '', raw_title, flags=re.IGNORECASE)
     raw_title = re.sub(r'^View\s+PDF\s+', '', raw_title, flags=re.IGNORECASE)
     raw_title = re.sub(r'\s*ICSE\s+Book\s+PDF$', '', raw_title, flags=re.IGNORECASE)
-    
+
     if raw_title.lower() in ("views and download pdf file", "studiestoday_doc", ""):
         h1 = soup.find('h1')
         if h1:
             raw_title = re.sub(r'^View\s+PDF\s+', '', h1.text.strip(), flags=re.IGNORECASE)
-            
+
     filename = clean_filename(raw_title, default_ext=".pdf")
-    
+
     # Check 1: PDFFlip source attribute or securefile path
     sec_match = re.search(r'source=["\']([^"\']*/securefile/[^"\']+)["\']', html, re.IGNORECASE)
     if sec_match:
@@ -1809,13 +1147,13 @@ def handle_studiestoday(url, target_dir=None):
     if pdf_match:
         pdf_url = urllib.parse.urljoin(url, pdf_match.group(1))
         return download_file_stream(pdf_url, filename, target_dir=target_dir)
-        
+
     # Check 5: iframe
     iframe = soup.find('iframe')
     if iframe and iframe.get('src'):
         pdf_url = urllib.parse.urljoin(url, iframe['src'])
         return download_file_stream(pdf_url, filename, target_dir=target_dir)
-        
+
     raise Exception("Could not find PDF download link on StudiesToday page.")
 
 class NetworkAwareLogger:
@@ -1825,13 +1163,13 @@ class NetworkAwareLogger:
         msg_l = msg.lower()
         if "retrying" in msg_l or "failed to resolve" in msg_l or "unreachable" in msg_l or "broken" in msg_l:
             if not check_network():
-                wait_for_network(job_id=get_current_job_id())
+                wait_for_network()
     def error(self, msg):
         print(f"[FAIL] {msg}", flush=True)
         msg_l = msg.lower()
         if "failed to resolve" in msg_l or "unreachable" in msg_l or "connection" in msg_l:
             if not check_network():
-                wait_for_network(job_id=get_current_job_id())
+                wait_for_network()
 
 def get_ytdlp_opts(custom_opts=None, cookie=None):
     opts = {}
@@ -1890,30 +1228,14 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
     return opts
 
 
-def download_hls_with_python(url, dest_path, headers=None, job_id=None):
-    """Download an HLS stream without requiring an external yt-dlp executable.
-
-    This is the path taken inside the APK (Chaquopy ships the yt_dlp module but
-    not the yt-dlp binary) and on any desktop without yt-dlp on PATH.
-    """
+def download_hls_with_python(url, dest_path, headers=None):
+    """Download an HLS stream without requiring an external yt-dlp executable."""
     if not HAS_YTDLP:
         return 1
-    jid = job_id or get_current_job_id()
     try:
         def progress_hook(d):
-            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+            if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
                 raise Exception("Download cancelled by user")
-            if jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
-                render_download_progress(0.0, "Paused", "Paused", "--", job_id=jid)
-                evt = PAUSE_EVENTS.get(str(jid))
-                while str(jid) in PAUSED_DOWNLOAD_JOBS:
-                    if str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                        raise Exception("Download cancelled by user")
-                    if evt:
-                        evt.wait(timeout=0.5)
-                    else:
-                        time.sleep(0.5)
-
             status = d.get('status')
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -1921,19 +1243,13 @@ def download_hls_with_python(url, dest_path, headers=None, job_id=None):
                 speed = d.get('speed') or 0
                 eta = d.get('eta') or 0
                 percent = (downloaded / total * 100) if total > 0 else 0.0
-                mb_done = downloaded / (1024 * 1024)
-                mb_total = total / (1024 * 1024) if total > 0 else 0.0
-                tot_str = f"{mb_done:.1f}/{mb_total:.1f}MB" if total > 0 else f"{mb_done:.1f}MB"
                 render_download_progress(
-                    percent,
-                    total_str=tot_str,
-                    speed_str=format_speed(speed),
-                    eta_str=format_eta(eta),
-                    job_id=jid,
-                    downloaded_str=f"{mb_done:.1f} MB",
+                    percent=percent,
+                    speed=format_speed(speed),
+                    eta=format_eta(eta),
+                    downloaded_bytes=downloaded,
+                    total_bytes=total,
                 )
-            elif status == 'finished':
-                render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
 
         options = get_ytdlp_opts({
             "format": "best",
@@ -2024,11 +1340,11 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     print(f"  Video: {title}")
     print("="*55)
     print(" Select Quality / Format:")
-    
+
     options = []
     # Option 1: Best Available
     options.append(('1', format_map['1'][0], 'Best Available (Auto - Highest Quality)', False))
-    
+
     # Map height options dynamically
     num = 2
     height_num_map = {}
@@ -2039,18 +1355,18 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
         elif h == 1080: label += " (Full HD)"
         elif h == 720: label += " (HD)"
         elif h == 480: label += " (SD)"
-        
+
         fmt_str = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
         options.append((str(num), fmt_str, label, False))
         height_num_map[str(num)] = fmt_str
         height_num_map[f"{h}p"] = fmt_str
         height_num_map[str(h)] = fmt_str
         num += 1
-        
+
     # Audio Option
     audio_num = str(num)
     options.append((audio_num, 'bestaudio/best', 'Audio Only (MP3/M4A)', True))
-    
+
     for opt_num, _, label, _ in options:
         print(f"   [{opt_num}] {label}")
     print("="*55)
@@ -2066,7 +1382,7 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     for opt_num, fmt_str, _, is_audio in options:
         if user_input == opt_num:
             return fmt_str, is_audio
-            
+
     if user_input.lower() in height_num_map:
         return height_num_map[user_input.lower()], False
 
@@ -2117,7 +1433,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
     out_dir = target_dir or DEFAULT_DIR
     os.makedirs(out_dir, exist_ok=True)
-    
+
     jid = job_id or get_current_job_id()
 
     def ytdlp_progress_hook(d):
@@ -2171,30 +1487,136 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             else:
                 render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
 
-    # The Android engine intentionally downloads a single YouTube format that
-    # already contains both audio and video. Chaquopy does not ship FFmpeg, so
-    # separate bestvideo+bestaudio downloads cannot be reliably merged there.
-    # Prefer the best progressive format under the user's requested cap; this
-    # can be lower-resolution than adaptive-only formats but stays one file and
-    # includes sound. Desktop/CLI keeps its normal yt-dlp merge behaviour.
-    if standalone and not is_playlist:
+    probe_info = {}
+    if is_playlist:
+        p_title = clean_filename(out_name or 'YouTube Playlist')
+        playlist_dir = os.path.join(out_dir, p_title)
+        os.makedirs(playlist_dir, exist_ok=True)
+        out_dir = playlist_dir
+        needs_mux = False
+    elif standalone:
         if is_audio_only:
             format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+            needs_mux = False
         else:
-            q_text = str(quality_arg or "").lower()
-            q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
-            if q_match:
-                cap = int(q_match.group(1))
-                # Last fallbacks remain single combined formats; this handles
-                # extractors whose format metadata omits height or reports no
-                # progressive MP4 variant at the exact requested cap.
-                format_spec = (
-                    f"best[height<={cap}][ext=mp4]/best[height<={cap}]/"
-                    "best[ext=mp4]/best"
-                )
+            needs_mux = False
+            try:
+                with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'skip_download': True}, cookie=cookie)) as ydl_p:
+                    probe_info = ydl_p.extract_info(url, download=False) or {}
+                if probe_info.get('_type') == 'playlist' or ('entries' in probe_info and len(probe_info.get('entries') or []) > 1):
+                    is_playlist = True
+                p_formats = probe_info.get('formats', [])
+                has_prog = any(f.get('vcodec') != 'none' and f.get('acodec') != 'none' for f in p_formats)
+                q_clean = (quality_arg or '').lower()
+                wants_hd = any(h in q_clean for h in ['1080', '1440', '2160', '4k', 'best'])
+                if not is_playlist and (not has_prog or wants_hd):
+                    needs_mux = True
+            except Exception as e:
+                print(f"[WARN] Format probe: {e}")
+
+            if needs_mux:
+                print("> Android standalone HD: Downloading video and audio streams for native hardware muxing...")
+                height_match = re.search(r"height<=(\d+)", format_spec)
+                h_str = f"[height<={height_match.group(1)}]" if height_match else ""
+                v_fmt = f"bestvideo{h_str}[ext=mp4]/bestvideo{h_str}/bestvideo"
+                a_fmt = "bestaudio[ext=m4a]/bestaudio"
+
+                raw_title = clean_filename(probe_info.get('title', 'video')) if probe_info else f"video_{int(time.time())}"
+                final_filename = os.path.join(out_dir, f"{raw_title}.mp4")
+
+                if cache_dir:
+                    stage_dir = os.path.join(cache_dir, f"ytdl_{jid}")
+                    os.makedirs(stage_dir, exist_ok=True)
+                else:
+                    stage_dir = out_dir
+
+                temp_v = os.path.join(stage_dir, f"{raw_title}_temp_v.mp4")
+                temp_a = os.path.join(stage_dir, f"{raw_title}_temp_a.m4a")
+                staged_final = os.path.join(stage_dir, f"{raw_title}.mp4") if cache_dir else final_filename
+
+                # 1. Download video track
+                print(f"> Fetching video track [{v_fmt}]...")
+                ydl_v_opts = get_ytdlp_opts({
+                    'format': v_fmt,
+                    'outtmpl': temp_v,
+                    'quiet': False,
+                    'no_warnings': True,
+                    'progress_hooks': [ytdlp_progress_hook],
+                }, cookie=cookie)
+                try:
+                    with yt_dlp.YoutubeDL(ydl_v_opts) as ydl_v:
+                        ydl_v.download([url])
+                except Exception as ve:
+                    print(f"[WARN] Video stream fetch: {ve}")
+
+                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                    if cache_dir and stage_dir != out_dir:
+                        shutil.rmtree(stage_dir, ignore_errors=True)
+                    else:
+                        for tf in (temp_v, temp_a):
+                            if os.path.exists(tf): os.remove(tf)
+                    return None
+
+                # 2. Download audio track
+                print(f"> Fetching audio track [{a_fmt}]...")
+                ydl_a_opts = get_ytdlp_opts({
+                    'format': a_fmt,
+                    'outtmpl': temp_a,
+                    'quiet': False,
+                    'no_warnings': True,
+                    'progress_hooks': [ytdlp_progress_hook],
+                }, cookie=cookie)
+                try:
+                    with yt_dlp.YoutubeDL(ydl_a_opts) as ydl_a:
+                        ydl_a.download([url])
+                except Exception as ae:
+                    print(f"[WARN] Audio stream fetch: {ae}")
+
+                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                    if cache_dir and stage_dir != out_dir:
+                        shutil.rmtree(stage_dir, ignore_errors=True)
+                    else:
+                        for tf in (temp_v, temp_a):
+                            if os.path.exists(tf): os.remove(tf)
+                    return None
+
+                # 3. Native hardware muxing
+                mux_ok = False
+                if os.path.exists(temp_v) and os.path.exists(temp_a):
+                    try:
+                        from com.erawat.arc import EmbeddedEngine
+                        print("> Combining video and audio tracks natively...")
+                        mux_ok = EmbeddedEngine.mux(temp_v, temp_a, staged_final)
+                    except Exception as me:
+                        print(f"[WARN] Native mux: {me}")
+
+                if mux_ok and os.path.exists(staged_final):
+                    if cache_dir and staged_final != final_filename:
+                        safe_move(staged_final, final_filename)
+                        shutil.rmtree(stage_dir, ignore_errors=True)
+                    else:
+                        for tf in (temp_v, temp_a):
+                            if os.path.exists(tf):
+                                try: os.remove(tf)
+                                except Exception: pass
+                    print(f"[OK] Downloaded and merged: {final_filename}")
+                    if jid:
+                        render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                    return final_filename
+                elif os.path.exists(temp_v):
+                    if cache_dir and stage_dir != out_dir:
+                        safe_move(temp_v, final_filename)
+                        shutil.rmtree(stage_dir, ignore_errors=True)
+                    else:
+                        safe_move(temp_v, final_filename)
+                        if os.path.exists(temp_a):
+                            try: os.remove(temp_a)
+                            except Exception: pass
+                    if jid:
+                        render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                    return final_filename
             else:
-                format_spec = "best[ext=mp4]/best"
-        print(f"> Android YouTube: downloading one audio+video format [{format_spec}]...")
+                format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
 
     if cache_dir:
         ytdl_stage = os.path.join(cache_dir, f"ytdl_raw_{jid}")
@@ -2212,7 +1634,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'no_warnings': True,
         'progress_hooks': [ytdlp_progress_hook],
     }, cookie=cookie)
-    
+
     if is_audio_only and not standalone:
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
@@ -2226,19 +1648,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             ydl_opts['external_downloader_args'] = {'aria2c': ['-s', '16', '-x', '16', '-k', '1M', '--console-log-level=warn']}
 
     max_attempts = 5
-    progressive_fallback_used = False
     for attempt in range(1, max_attempts + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if not info:
-                    if standalone and not is_audio_only and not progressive_fallback_used:
-                        progressive_fallback_used = True
-                        ydl_opts["format"] = "best[ext=mp4]/best"
-                        print("> The requested cap returned no format; retrying once with the best combined audio+video format.")
-                        continue
-                    raise Exception("yt-dlp could not extract video info or find a combined audio+video format.")
-                
+                    raise Exception("yt-dlp could not extract video info. Content may be members-only or private.")
+
                 # Check if result is a playlist
                 if info.get('_type') == 'playlist' or 'entries' in info or is_playlist:
                     filename = out_dir
@@ -2285,23 +1701,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             err_str = str(e)
             print(f"\n[FAIL] Download error encountered: {err_str}")
 
-            if standalone and not is_audio_only and "could not extract video info or find a combined" in err_str.lower():
-                print("[FAIL] YouTube exposed no combined audio/video format after the single fallback.")
-                return False
-
-            if standalone and not is_audio_only and "requested format is not available" in err_str.lower():
-                if not progressive_fallback_used:
-                    progressive_fallback_used = True
-                    ydl_opts["format"] = "best[ext=mp4]/best"
-                    print("> Requested height was unavailable; retrying once with YouTube's best single audio+video format.")
-                    continue
-                print("[FAIL] YouTube exposed no downloadable combined audio/video format for this video.")
-                return False
-
             if not check_network():
-                if not wait_for_network(job_id=jid):
-                    print("[FAIL] Giving up: network unavailable.")
-                    return None
+                wait_for_network()
                 continue
 
             if "Conversion failed" in err_str or "Postprocessing" in err_str or "obu_forbidden_bit" in err_str or "Invalid data" in err_str:
@@ -2335,10 +1736,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
     print("> Detected Studocu link...")
     headers = {**HEADERS, **(custom_headers or {})}
-    
+
     parsed = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(parsed.query)
-    
+
     filename = out_name
     if not filename and 'filename' in qs:
         filename = clean_filename(qs['filename'][0], default_ext=".pdf")
@@ -2350,7 +1751,7 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
             filename = clean_filename(path_parts[-1], default_ext=".pdf")
         else:
             filename = "studocu_document.pdf"
-            
+
     cookie = os.environ.get("STUDOCU_COOKIE", "")
     if cookie and 'Cookie' not in headers:
         headers['Cookie'] = cookie
@@ -2366,6 +1767,31 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
             print("   or set STUDOCU_COOKIE=\"...\" in your shell.\n")
             return None
         raise e
+
+def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
+    print("> Detected Telegram link...")
+    parsed = urllib.parse.urlparse(url)
+    path_parts = [p for p in parsed.path.split('/') if p]
+
+    chat_id = None
+    msg_id = None
+
+    if len(path_parts) >= 2:
+        if path_parts[0] == 's':
+            chat_id = path_parts[1]
+            if len(path_parts) >= 3 and path_parts[2].isdigit():
+                msg_id = int(path_parts[2])
+        elif path_parts[0] == 'c' and len(path_parts) >= 3:
+            try:
+                chat_id = int(f"-100{path_parts[1]}")
+            except ValueError:
+                chat_id = path_parts[1]
+            if path_parts[2].isdigit():
+                msg_id = int(path_parts[2])
+        else:
+            chat_id = path_parts[0]
+            if path_parts[1].isdigit():
+                msg_id = int(path_parts[1])
 
 def _get_fallback_tg_creds():
     api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
@@ -2387,32 +1813,6 @@ def _get_fallback_tg_creds():
                 except Exception:
                     pass
     return api_id, api_hash, session
-
-def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
-    print("> Detected Telegram link...")
-    parsed = urllib.parse.urlparse(url)
-    path_parts = [p for p in parsed.path.split('/') if p]
-    
-    chat_id = None
-    msg_id = None
-    
-    if len(path_parts) >= 2:
-        if path_parts[0] == 's':
-            chat_id = path_parts[1]
-            if len(path_parts) >= 3 and path_parts[2].isdigit():
-                msg_id = int(path_parts[2])
-        elif path_parts[0] == 'c' and len(path_parts) >= 3:
-            try:
-                chat_id = int(f"-100{path_parts[1]}")
-            except ValueError:
-                chat_id = path_parts[1]
-            if path_parts[2].isdigit():
-                msg_id = int(path_parts[2])
-        else:
-            chat_id = path_parts[0]
-            if path_parts[1].isdigit():
-                msg_id = int(path_parts[1])
-
 
     def load_tg_creds():
         fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
@@ -2593,10 +1993,10 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         action_mode = 'stream_and_download'
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split('/') if p]
-    
+
     media_type = 'movie'
     media_id = None
-    
+
     for p in reversed(parts):
         nums = re.findall(r'\d+', p)
         if nums:
@@ -2608,7 +2008,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         media_type = 'tv'
     elif 'movie' in lower_parts or 'm' in lower_parts:
         media_type = 'movie'
-        
+
     if not media_id:
         raise Exception("Could not parse NetMirror media ID from URL.")
 
@@ -2648,13 +2048,13 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             break
     if not results:
         raise Exception(f"No metadata found on NetMirror for ID {media_id}")
-        
+
     meta = results[0]
     title = (meta.get('title') or meta.get('name') or f"netmirror_{media_id}").strip()
     year = meta.get('release_date', '').split(',')[-1].strip() if meta.get('release_date') else '2024'
     embed_json = meta.get('embed_json') or []
     season_list = meta.get('season') or []
-    
+
     api_media_type = str(meta.get('media_type') or meta.get('type') or '').lower().strip()
     ep_count = sum(int(s.get('ep', 1)) for s in season_list) if season_list else (len(embed_json) if embed_json else 0)
     has_seasons = bool(season_list and (len(season_list) > 1 or int(season_list[0].get('ep', 1)) > 1 or int(season_list[0].get('se', 1)) > 1))
@@ -2744,7 +2144,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 return None
 
         next_prefetch_future = prefetch_executor.submit(
-            inherit_capture(prefetch_single_ep), episodes_to_download[0][0], episodes_to_download[0][1]
+            prefetch_single_ep, episodes_to_download[0][0], episodes_to_download[0][1]
         ) if episodes_to_download else None
 
         is_batch_cancelled = False
@@ -2766,8 +2166,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
             if idx < total_items:
                 next_s, next_ep = episodes_to_download[idx]
-                next_prefetch_future = prefetch_executor.submit(
-                    inherit_capture(prefetch_single_ep), next_s, next_ep)
+                next_prefetch_future = prefetch_executor.submit(prefetch_single_ep, next_s, next_ep)
             else:
                 next_prefetch_future = None
 
@@ -2838,7 +2237,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         # Resolve stream via vidsync / NetMirror external & watchbox server APIs
         kind_label = f"series episode S{se_val}E{ep_val}" if is_tv_series else "movie"
         print(f"\n> Resolving direct stream for {kind_label}: {display_title}")
-        
+
         target_lang = None
         title_lower = title.lower()
         if '[hindi]' in title_lower or 'hindi' in title_lower:
@@ -2914,7 +2313,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 'tv': tv_val, 'token': '', 'warp': 'false', '_': str(int(time.time() * 1000))
             }
             wb_query = urllib.parse.urlencode(wb_params)
-            
+
             for dom in ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']:
                 try:
                     wb_url = f"{dom}/play/watchbox.php?{wb_query}"
@@ -2976,54 +2375,32 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 sys.stdout.flush()
 
                 valid_qualities = {}
-                probe_health = {}
                 q_order = {'4k': 6, '2160p': 6, '1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'auto': 1}
-
                 def _probe(item):
-                    """HEAD each candidate and classify it as ok / dead / unknown.
-
-                    Previously this returned the item unchanged on every path, so
-                    nothing was ever filtered and 429 counted as healthy while the
-                    UI still printed "[OK] Verified (status 200)".
-
-                    Many CDNs answer HEAD with 403/405 while serving GET normally,
-                    so only a definitive 404/410 is treated as dead. Anything else
-                    stays 'unknown' and is still offered - hiding a working quality
-                    would be worse than listing an unverified one.
-                    """
                     q_k, q_info = item
                     chk_h = get_stream_headers_for_url(q_info['url'])
                     try:
-                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5, allow_redirects=True)
-                        code = chk.status_code
-                        if code in (200, 206, 301, 302):
-                            return q_k, q_info, 'ok'
-                        if code in (404, 410):
-                            return q_k, q_info, 'dead'
-                        return q_k, q_info, 'unknown'
+                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5)
+                        if chk.status_code in (200, 206, 302, 301, 429):
+                            return q_k, q_info
                     except Exception:
-                        return q_k, q_info, 'unknown'
+                        pass
+                    return q_k, q_info
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(qualities_dict) or 1)) as ex:
-                    for pres in ex.map(inherit_capture(_probe), list(qualities_dict.items())):
-                        q_k, q_info, health = pres
-                        probe_health[q_k] = health
-                        if health != 'dead':
-                            valid_qualities[q_k] = q_info
+                    for pres in ex.map(_probe, list(qualities_dict.items())):
+                        if pres:
+                            valid_qualities[pres[0]] = pres[1]
 
                 if valid_qualities:
-                    ok_count = sum(1 for v in probe_health.values() if v == 'ok')
-                    dead_count = sum(1 for v in probe_health.values() if v == 'dead')
-                    if ok_count:
-                        print(f"[OK] {ok_count} verified live" + (f", {dead_count} dead link(s) dropped" if dead_count else ""))
-                    elif dead_count:
-                        print(f"[WARN] {dead_count} dead link(s) dropped, {len(valid_qualities)} unverified")
-                    else:
-                        print(f"[WARN] CDN refused HEAD checks; {len(valid_qualities)} candidate(s) kept")
+                    print("[OK] Verified (status 200)")
                     sorted_q = sorted(valid_qualities.keys(), key=lambda q: q_order.get(q, 0), reverse=True)
                     chosen_q_key = None
                     if quality_arg:
-                        chosen_q_key = match_quality_key(quality_arg, sorted_q, valid_qualities)
+                        for k in sorted_q:
+                            if quality_arg.lower() in k:
+                                chosen_q_key = k
+                                break
                     if not chosen_q_key:
                         if action_mode not in ('direct_link_only', 'direct') and len(sorted_q) > 1 and sys.stdin.isatty():
                             print("\n" + "="*65)
@@ -3148,7 +2525,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         }
 
         query_str = urllib.parse.urlencode(params)
-        
+
         # Try servers in order: dv.watch22.shop -> webvp.watch21.shop -> bet.watch22.shop
         domains = ['https://dv.watch22.shop', 'https://webvp.watch21.shop', 'https://bet.watch22.shop']
         player_html = ""
@@ -3198,7 +2575,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         if stream_headers.get('Referer'):
             print(f" [REFERER] {stream_headers['Referer']}")
         print("="*65 + "\n")
-    
+
     # Save .m3u8 stream shortcut ONLY if action_mode is stream or stream_and_download
     if action_mode in ('stream_only', 'stream', 'stream_and_download'):
         save_m3u8_stream_file(direct_stream_url, clean_name, target_dir=target_dir)
@@ -3303,9 +2680,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             for hk, hv in stream_headers.items():
                 cmd.extend(['--add-header', f'{hk}:{hv}'])
             if shutil.which('yt-dlp'):
-                ret = run_command_with_clean_progress(cmd, job_id=jid)
+                ret = run_command_with_clean_progress(cmd)
             else:
-                ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers, job_id=jid)
+                ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers)
             if ret == -1:
                 print("[WARN] Download cancelled.")
                 return None
@@ -3335,7 +2712,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             for hk, hv in stream_headers.items():
                 cmd.append(f'--header={hk}: {hv}')
             cmd.append(direct_stream_url)
-            ret = run_command_with_clean_progress(cmd, job_id=jid)
+            ret = run_command_with_clean_progress(cmd)
             if ret == -1:
                 print("[WARN] Download cancelled.")
                 return None
@@ -3356,11 +2733,11 @@ def handle_generic(url, out_name=None, custom_headers=None, target_dir=None):
     try:
         res = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
         content_type = res.headers.get('content-type', '').lower()
-        
+
         if 'text/html' in content_type:
             res_get = requests.get(url, headers=headers, timeout=15)
             soup = BeautifulSoup(res_get.text, 'html.parser')
-            
+
             pdf_link = soup.find('a', href=re.compile(r'\.pdf(\?|$)', re.IGNORECASE))
             if pdf_link:
                 target_url = urllib.parse.urljoin(url, pdf_link['href'])
@@ -3368,13 +2745,13 @@ def handle_generic(url, out_name=None, custom_headers=None, target_dir=None):
                 return download_file_stream(target_url, clean_filename(title, ".pdf"), custom_headers=custom_headers, target_dir=target_dir)
     except Exception:
         pass
-            
+
     parsed = urllib.parse.urlparse(url)
     base = os.path.basename(parsed.path)
     if not base or '.' not in base:
         base = out_name or "downloaded_file"
     filename = clean_filename(out_name or base)
-    
+
     return download_file_stream(url, filename, custom_headers=custom_headers, target_dir=target_dir)
 
 import json
@@ -3418,7 +2795,7 @@ class ProcessMonitor:
             old_settings = termios.tcgetattr(fd)
         except Exception:
             return
-            
+
         try:
             tty.setcbreak(fd)
             while self.running:
@@ -3458,7 +2835,7 @@ def log_unsupported_url(url, error_msg=""):
                 data = json.load(f)
         except Exception:
             data = []
-    
+
     entry = {
         "url": url,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3519,7 +2896,7 @@ def search_netmirror(query):
             'Referer': 'https://mzfi.me/',
             'Origin': 'https://netmirror.center'
         })
-        
+
         norm_q = ' '.join(query.strip().split())
         queries_to_try = []
         def add_q(val):
@@ -3580,11 +2957,11 @@ def search_netmirror(query):
             is_hindi = bool(re.search(r'\[hindi|\bhindi\b|\bdual\b|\bmulti[\s\-]audio\b', t_lower))
             is_direct = (clean_t == q_lower)
             starts_with_q = clean_t.startswith(q_lower)
-            
+
             for lang in ['hindi', 'tamil', 'telugu', 'bengali', 'malayalam', 'english', 'indonesian']:
                 if lang in q_lower and lang in t_lower:
                     return (0, -it['num_year'], len(t_lower))
-                    
+
             if is_direct and not has_brackets:
                 return (1, -it['num_year'])
             if is_direct and is_hindi:
@@ -3821,7 +3198,7 @@ def group_and_deduplicate_results(results):
                 yr = int(str(it['year']).split(',')[-1].strip()[:4])
             except Exception:
                 yr = 0
-                
+
         # Detect audio
         t_lower = t.lower()
         cn = str(it.get('cn') or it.get('country') or '').lower().strip()
@@ -3871,7 +3248,7 @@ def group_and_deduplicate_results(results):
 
     # Fetch OTT providers in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        f_map = {ex.submit(inherit_capture(get_ott_providers_for_title), g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
+        f_map = {ex.submit(get_ott_providers_for_title, g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
         for f in concurrent.futures.as_completed(f_map):
             k = f_map[f]
             groups[k]['otts'] = f.result() or []
@@ -3931,7 +3308,7 @@ def prompt_results_list(results, query, target_dir=None):
                 print(f"> Selected Audio: {chosen_lang}")
             else:
                 chosen_url = list(audios.values())[0]['url']
-                
+
             print(f"\n> Selected: {selected_group['title']}")
             prompt_action_mode_and_run(chosen_url, query_context=query, all_results=sorted_groups, target_dir=target_dir)
             return
@@ -4129,7 +3506,7 @@ def generate_adm_links_for_url(url):
         print("="*65)
 
     format_spec, is_audio = prompt_video_quality(url)
-    
+
     if is_audio:
         stream_format = 'bestaudio/best'
     else:
@@ -4139,30 +3516,30 @@ def generate_adm_links_for_url(url):
     if not HAS_YTDLP:
         print("[FAIL] yt-dlp is required for extracting stream links.")
         return
-        
+
     try:
         ydl_opts = get_ytdlp_opts({'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist'})
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
+
         if not info:
             print("[FAIL] Could not extract link metadata.")
             return
 
         entries = info.get('entries', []) if isinstance(info, dict) else []
         adm_links = []
-        
+
         if entries:
             pl_title = info.get('title', 'Playlist')
             print("\n" + "="*65)
             print(f"  Playlist / Batch Detected: {pl_title} ({len(entries)} items)")
             print("="*65)
-            
+
             for idx, entry in enumerate(entries, 1):
                 if not entry: continue
                 v_title = entry.get('title', f'Item {idx}')
                 v_url = entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
-                
+
                 try:
                     with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'format': stream_format})) as v_ydl:
                         v_info = v_ydl.extract_info(v_url, download=False)
@@ -4207,7 +3584,7 @@ def generate_adm_links_for_url(url):
                 all_urls_str = "\n".join([stream for _, _, stream in adm_links])
                 with open(txt_path, "w") as f:
                     f.write(all_urls_str + "\n")
-                
+
                 start_local_http_server()
                 single_hosted_url = "http://localhost:8080/adm_playlist_links.txt"
                 my_ip = "127.0.0.1"
@@ -4229,9 +3606,9 @@ def generate_adm_links_for_url(url):
                 clipboard_target = adm_links[0][2]
                 print("="*65)
                 print(f"  Direct Stream Link for ADM / VLC: {clipboard_target}")
-            
+
             print("="*65 + "\n")
-            
+
     except Exception as e:
         print(f"[FAIL] Error extracting direct links: {e}")
 
@@ -4245,7 +3622,7 @@ def interactive_menu():
         except (KeyboardInterrupt, EOFError):
             print("\nExiting...")
             sys.exit(0)
-            
+
         if not user_input:
             continue
         if user_input.lower() in ('q', 'quit', 'exit'):
@@ -4302,17 +3679,9 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None,
             PROCESS_MONITOR.set_status("Completed (Bypassed)")
             return bypassed_path
 
-        if url_lower.startswith('magnet:') or url_lower.endswith('.torrent'):
-            PROCESS_MONITOR.set_status("Downloading via BitTorrent...")
-            if not shutil.which("aria2c"):
-                raise Exception("Torrent downloads need aria2c. Install it (pkg install aria2 / apt install aria2 / winget install aria2.aria2) and retry.")
-            dn = re.search(r"[?&]dn=([^&]+)", url)
-            torrent_title = out_name or (urllib.parse.unquote(dn.group(1)).replace("+", " ") if dn else "Torrent media")
-            return download_torrent(url, title=torrent_title, target_dir=target_dir, job_id=get_current_job_id())
-        elif any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
+        if any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
             PROCESS_MONITOR.set_status("Bypassing NetMirror Stream...")
-            return handle_netmirror(url, out_name=out_name, target_dir=target_dir, quality_arg=quality_arg,
-                                    **{k: v for k, v in kwargs.items() if k in ('action_mode', 'target_season', 'target_episode', 'download_scope', 'job_id', 'cache_dir')})
+            return handle_netmirror(url, out_name=out_name, target_dir=target_dir, quality_arg=quality_arg)
         elif any(tg_domain in url_lower for tg_domain in ['t.me/', 'telegram.me/', 'telegram.dog/']):
             PROCESS_MONITOR.set_status("Downloading Telegram Media...")
             return handle_telegram(url, out_name=out_name, target_dir=target_dir)
@@ -4330,7 +3699,7 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None,
             video_path = handle_youtube_or_video(url, target_dir=target_dir, quality_arg=quality_arg, cookie=cookie, standalone=standalone)
             if video_path:
                 return video_path
-        
+
         PROCESS_MONITOR.set_status("Generic Stream Download...")
         res = handle_generic(url, out_name=out_name, custom_headers=custom_headers, target_dir=target_dir)
         if res:
@@ -4529,11 +3898,11 @@ def app_igl_resolve(target_id, quality="best"):
                 break
     if not match_ep:
         raise Exception(f"IGL Episode '{clean_id}' not found.")
-    
+
     info = igl.resolve_stream_info(match_ep, base_url, target_quality=quality)
     if not info or not info.get('stream_url'):
         raise Exception("Could not resolve streaming link for this episode.")
-    
+
     stream_url = info['stream_url']
     headers = {}
     if info.get('type') != 'youtube':
@@ -4587,7 +3956,7 @@ def fetch_torrent_tiers(title, is_series=False, season=None, episode=None):
         url = f"https://torrentio.strem.fun/stream/series/{imdb_id}:{season}:{episode}.json"
     else:
         url = f"https://torrentio.strem.fun/stream/movie/{imdb_id}.json"
-        
+
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         if resp.status_code != 200:
@@ -4638,7 +4007,7 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
     target_dir = target_dir or DEFAULT_DIR
     os.makedirs(target_dir, exist_ok=True)
     clean_title = clean_filename(title)
-    
+
     print("="*65)
     print(" [BITTORRENT] IN-APP ACCELERATED DOWNLOAD")
     print("="*65)
@@ -4669,7 +4038,7 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
         cmd.append(f"--select-file={file_idx}")
     cmd.append(magnet_url)
 
-    ret = run_command_with_clean_progress(cmd, job_id=jid)
+    ret = run_command_with_clean_progress(cmd)
     if ret == -1:
         print("[WARN] Torrent download cancelled.")
         return None
@@ -4691,7 +4060,7 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
                     pass
         if dest_file:
             break
-            
+
     if dest_file:
         sync_to_sdcard_if_needed(dest_file)
         render_download_progress(100.0, total_str="Complete", speed_str="--", eta_str="0s", job_id=jid)
@@ -4703,7 +4072,7 @@ def app_search(query, platform="netmirror"):
     if not query or not str(query).strip():
         raise Exception("Search query is empty")
     print(f"> Query: '{query}'")
-    
+
     # Check IGL catalog matches with smart query filtering
     igl_matches = search_igl_episodes(query)
 
@@ -4741,40 +4110,6 @@ def app_search(query, platform="netmirror"):
         })
     print(f"[OK] Grouped into {len(results) + len(igl_matches)} distinct title(s).")
     return {"platform": "catalog", "results": igl_matches + results}
-
-
-def select_progressive_youtube_format(formats, quality="best"):
-    """Pick one YouTube format with both audio and video under the requested cap.
-
-    Direct video-only URLs have no sound in an external player unless we mux a
-    separate audio stream, so streaming deliberately excludes them.
-    """
-    q = str(quality or "best").lower()
-    cap = None
-    if "4k" in q or "2160" in q:
-        cap = 2160
-    elif "2k" in q or "1440" in q:
-        cap = 1440
-    else:
-        match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q)
-        if match:
-            cap = int(match.group(1))
-    candidates = []
-    for fmt in formats or []:
-        if not isinstance(fmt, dict) or not fmt.get("url"):
-            continue
-        if fmt.get("vcodec") in (None, "none") or fmt.get("acodec") in (None, "none"):
-            continue
-        height = fmt.get("height") or 0
-        try:
-            height = int(height)
-        except (TypeError, ValueError):
-            height = 0
-        if cap and height > cap:
-            continue
-        candidates.append((height, fmt.get("tbr") or 0, fmt))
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return candidates[-1][2] if candidates else None
 
 
 def app_resolve(url, quality="best", season=None, episode=None):
@@ -4854,7 +4189,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
     if any(host in lower for host in ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "facebook.com", "instagram.com"]):
         if not HAS_YTDLP:
             raise Exception("yt-dlp is not available")
-        
+
         is_playlist = ("/playlist" in lower or "list=" in lower)
         if is_playlist:
             print("> Detecting playlist entries...")
@@ -4907,20 +4242,53 @@ def app_resolve(url, quality="best", season=None, episode=None):
         })
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
-        
+
+        stream_url = None
         formats = info.get("formats", []) or []
-        selected_stream = select_progressive_youtube_format(formats, clean_quality)
-        if selected_stream:
-            stream_url = selected_stream["url"]
-            selected_height = selected_stream.get("height") or 0
-            print(f"> Selected one-file audio+video stream: {selected_height}p")
-        else:
-            # Never give VLC a video-only googlevideo URL: it has no audio track.
-            # VLC's YouTube resolver can play the original page with audio, though
-            # that resolver may choose its own quality when no progressive format exists.
+
+        # 1. Progressive streams (combined video + audio)
+        progressive = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")]
+        if progressive:
+            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+            stream_url = progressive_sorted[0].get("url")
+
+        # 2. Combined HLS stream or best playable format
+        if not stream_url:
+            for f in reversed(formats):
+                url_str = f.get("url", "")
+                if f.get("vcodec") != "none" and ("m3u8" in url_str or f.get("protocol") == "m3u8_native"):
+                    stream_url = url_str
+                    break
+
+        # 3. Direct video stream or format url
+        if not stream_url:
+            for f in reversed(formats):
+                if f.get("vcodec") != "none" and f.get("url"):
+                    stream_url = f.get("url")
+                    break
+
+        if not stream_url and info.get("url"):
+            stream_url = info.get("url")
+
+        # 4. Fallback to web watch url for external players (VLC has built-in YouTube playback)
+        if not stream_url:
             stream_url = url
-            selected_height = 0
-            print("> No combined stream matched; handing the YouTube page to the player for audio/video playback.")
+
+        # 4. Fallback to format url
+        if not stream_url and info.get("requested_formats"):
+            for rf in info["requested_formats"]:
+                if rf.get("vcodec") != "none" and rf.get("url"):
+                    stream_url = rf.get("url")
+                    break
+
+        if not stream_url and formats:
+            for f in reversed(formats):
+                if f.get("vcodec") != "none" and f.get("url"):
+                    stream_url = f.get("url")
+                    break
+
+        if not stream_url:
+            raise Exception("No direct stream could be extracted from video source")
 
         # Extract REAL video quality tiers in descending order (exclude storyboard/thumbnails like sb0)
         tiers = set()
@@ -5127,40 +4495,8 @@ def app_download(payload):
         except Exception as e:
             print(f"[WARN] DDL bypass during download: {e}")
 
-    # Priority 0.5: BitTorrent magnet links.
-    #
-    # app_resolve() already answers a magnet with torrent_sources and
-    # can_stream=false, but app_download() had no matching branch, so the magnet
-    # fell through to "Priority 5: direct file" and download_file_stream() was
-    # handed the literal string "magnet:?xt=urn:btih:...". download_torrent() and
-    # fetch_torrent_tiers() were written but never called from anywhere.
-    if lower.startswith("magnet:") or stream_lower.startswith("magnet:"):
-        magnet = url if lower.startswith("magnet:") else stream_url
-        if not shutil.which("aria2c"):
-            raise Exception(
-                "Torrent downloads need aria2c. Install it (winget install aria2.aria2 on "
-                "Windows, pkg install aria2 on Termux, apt install aria2 on Debian) and retry."
-            )
-        torrent_title = title
-        if torrent_title in ("", "download"):
-            dn = re.search(r"[?&]dn=([^&]+)", magnet)
-            torrent_title = urllib.parse.unquote(dn.group(1)).replace("+", " ") if dn else "Torrent media"
-        file_idx = payload.get("file_idx")
-        if file_idx is None:
-            for source in (payload.get("torrent_sources") or {}).values():
-                if isinstance(source, dict) and source.get("file_idx") is not None:
-                    file_idx = source.get("file_idx")
-                    break
-        path = download_torrent(
-            magnet,
-            title=torrent_title,
-            target_dir=target_dir,
-            file_idx=file_idx,
-            job_id=CURRENT_DOWNLOAD_JOB_ID,
-        )
-
     # Priority 1: India's Got Latent
-    elif lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
+    if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
         igl_res = app_igl_resolve(url, quality=quality)
         clean_name = out_name or clean_filename(title, default_ext=".mp4")
         if not clean_name.lower().endswith(".mp4"):
@@ -5181,7 +4517,7 @@ def app_download(payload):
 
         if ".m3u8" in stream_url.lower() or "m3u8" in str(s_headers.get("Accept", "")).lower():
             print(f"> Downloading HLS stream via in-process engine: {stream_url[:70]}...")
-            ret = download_hls_with_python(stream_url, dest_path, s_headers, job_id=CURRENT_DOWNLOAD_JOB_ID)
+            ret = download_hls_with_python(stream_url, dest_path, s_headers)
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 path = dest_path
             else:
@@ -5241,7 +4577,7 @@ def app_download(payload):
 
         if ".m3u8" in target_direct.lower() or "m3u8" in str(s_headers.get("Accept", "")).lower():
             print(f"> Downloading HLS video stream via in-process engine: {target_direct[:70]}...")
-            ret = download_hls_with_python(target_direct, dest_path, s_headers, job_id=CURRENT_DOWNLOAD_JOB_ID)
+            ret = download_hls_with_python(target_direct, dest_path, s_headers)
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 path = dest_path
             else:
@@ -5359,9 +4695,9 @@ def run_app_json_request(payload):
         cancel_download(payload.get("job_id"))
         return {"ok": True, "cancelled": payload.get("job_id")}
 
-    capture = _capture_thread_logs()
+    output = io.StringIO()
     try:
-        with capture:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             if action == "search":
                 result = app_search(payload.get("query", ""), payload.get("platform", "netmirror"))
             elif action == "resolve":
@@ -5384,11 +4720,11 @@ def run_app_json_request(payload):
                 result = {"ok": True, "proxy_url": proxy_url}
             else:
                 raise Exception("Unknown app action. Use capabilities, search, resolve, download, progress, or cancel.")
-        
-        clean_logs = sanitize_app_logs(capture.text())
+
+        clean_logs = sanitize_app_logs(output.getvalue())
         return {"ok": True, "action": action, "result": result, "logs": clean_logs[-12000:]}
     except Exception as error:
-        clean_logs = sanitize_app_logs(capture.text())
+        clean_logs = sanitize_app_logs(output.getvalue())
         return {"ok": False, "action": action, "error": str(error), "logs": clean_logs[-12000:]}
 
 
@@ -5401,70 +4737,12 @@ def run_app_json_request_json(raw_payload):
         return json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
 
 
-def _update_cli(branch_override=None):
-    """Update the active Git checkout or a copied standalone dl.py in place."""
-    script_path = os.path.abspath(__file__)
-    script_dir = os.path.dirname(script_path)
-    try:
-        root = subprocess.check_output(
-            ["git", "-C", script_dir, "rev-parse", "--show-toplevel"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        root = ""
-
-    if root:
-        try:
-            branch = branch_override or subprocess.check_output(
-                ["git", "-C", root, "branch", "--show-current"],
-                text=True, stderr=subprocess.PIPE,
-            ).strip()
-            if not branch:
-                raise RuntimeError("Current branch could not be detected.")
-            print(f"> Updating CLI checkout on branch '{branch}'...")
-            subprocess.run(["git", "-C", root, "pull", "--ff-only", "origin", branch], check=True)
-            print("[OK] CLI checkout update complete.")
-            return
-        except Exception as error:
-            print(f"[FAIL] Git checkout update failed: {error}")
-            return
-
-    # Termux users often install a single script in ~/scripts/dl.py rather than
-    # running it from the cloned repository. In that case update the script
-    # itself. An explicit branch is supported for testing/preview branches.
-    branch = branch_override or os.environ.get("ARC_UPDATE_BRANCH", "main")
-    url = f"https://raw.githubusercontent.com/Erawat4l/universal-downloader/{urllib.parse.quote(branch, safe='/')}/dl.py"
-    temp_path = script_path + ".update.tmp"
-    try:
-        from urllib.request import Request, urlopen
-        request = Request(url, headers={"User-Agent": "Arc-Universal-Downloader-Updater"})
-        with urlopen(request, timeout=25) as response:
-            updated = response.read()
-        if not updated.startswith(b"#!/usr/bin/env python") or len(updated) < 10000:
-            raise RuntimeError("The downloaded file did not look like a valid dl.py.")
-        with open(temp_path, "wb") as output:
-            output.write(updated)
-        os.chmod(temp_path, os.stat(script_path).st_mode)
-        os.replace(temp_path, script_path)
-        print(f"[OK] Updated standalone CLI from branch '{branch}'. Run 'dl' again to use it.")
-    except Exception as error:
-        try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except OSError:
-            pass
-        print(f"[FAIL] CLI update failed: {error}")
-
-
 def main():
     if len(sys.argv) < 2:
         interactive_menu()
         return
 
     args = sys.argv[1:]
-    if args[0] in ('update', 'self-update', '--update'):
-        _update_cli(args[1] if len(args) > 1 else None)
-        return
     if args[0] in ('--app-json', '--app-json-b64'):
         if len(args) < 2:
             print(json.dumps({"ok": False, "error": "Missing app request payload"}))
@@ -5487,7 +4765,7 @@ def main():
     target_dir = None
     cookie = None
     quality_arg = None
-    
+
     if '-q' in args:
         idx = args.index('-q')
         if idx + 1 < len(args):
@@ -5526,7 +4804,7 @@ def main():
         if idx + 1 < len(args):
             cookie = args[idx + 1]
             args = args[:idx] + args[idx + 2:]
-            
+
     for raw_url in args:
         url = "".join(raw_url.split()) if raw_url.startswith(('http://', 'https://')) else raw_url
         if url.startswith('http://') or url.startswith('https://') or url.startswith('magnet:'):

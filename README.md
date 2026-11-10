@@ -7,8 +7,8 @@
 **The high-speed stream bypasser, 4K media downloader, and offline video hub — from terminal to native Android.**
 
 One engine (`dl.py`), three front ends: the **`dl`** command-line tool for Termux, Linux, macOS and Windows,
-**Arc**, a native Android app (`com.erawat.arc`) that carries the same engine inside the APK, and
-**Arc Desktop**, a Windows `.exe` that carries the same engine inside a Qt window.
+**Arc**, a native Android app (`com.erawat.arc`) with its checked-in Android engine, and
+**Arc Desktop**, a Windows `.exe` that uses the repository's root engine inside a Qt window.
 No companion apps, no terminal, no root.
 
 [![Python](https://img.shields.io/badge/python-3.12%20%E2%80%93%203.14-3776ab?logo=python&logoColor=white)](#install--setup)
@@ -136,16 +136,14 @@ free space before choosing it.
 
 ## Arc Desktop (Windows app)
 
-A native Windows program with the same monochrome UI as the APK, built on PySide6 (Qt) and driving the same
+A native Windows program with the same monochrome UI as the APK, built on PySide6 (Qt) and driving the root
 `dl.py` in-process. See [`desktop-app/README.md`](desktop-app/README.md) for the full detail.
 
-- **Same engine, loaded not copied.** `desktop-app/arc_desktop/engine_bridge.py` imports the repository's root
-  `dl.py` at runtime and calls the same `run_app_json_request()` machine interface the APK uses
-  (`search`, `resolve`, `download`, `progress`, `cancel`, `telegram_check`, `stream_proxy`). There is no second
-  copy of the engine to drift out of sync.
-- **Genuinely faster than the APK.** Android cannot ship `aria2c` or `ffmpeg`, so every download there falls
-  back to the single-connection Python loop. On Windows the same code takes `aria2c -x16 -s16` (16 parallel
-  connections) and merges HD video+audio with real ffmpeg. Settings → Accelerators shows what your machine has.
+- **Desktop engine.** `desktop-app/arc_desktop/engine_bridge.py` imports the repository root `dl.py` and calls
+  its `run_app_json_request()` interface. The APK keeps its checked-in Python engine separately; building the
+  APK no longer overwrites it from the desktop/CLI engine.
+- **Windows accelerators.** Settings → Accelerators shows optional tools available on your machine, including
+  aria2c and FFmpeg.
 - **Also decrypts what the APK cannot.** `pycryptodomex` unlocks the AES-GCM NetMirror streams that have no
   crypto backend on Android.
 - **Tabs.** Home (paste a link or type a title) · Activity (live percent, speed, ETA, pause/resume/cancel,
@@ -272,7 +270,7 @@ python3 tools/build_android.py
 ```
 
 The builder finds or installs the Android SDK, picks the highest supported Python (**3.14**, then 3.13, then
-3.12) for Chaquopy, syncs the repository's `dl.py` into the app, runs Gradle, and writes the debug APK to
+3.12) for Chaquopy, uses the checked-in Android engine, runs Gradle, and writes the debug APK to
 `app/build/outputs/apk/debug/`. It then makes a **numbered copy**: `ARC 1.apk`, `ARC 2.apk` and so on, one higher
 than the largest number already in the build folder or `/sdcard/Download`. If `tt` is on your `PATH` the numbered
 APK is sent with `tt send 2 <apk>`; if that fails, the local APK is kept.
@@ -577,7 +575,7 @@ universal-downloader/
         └── src/main/
             ├── AndroidManifest.xml
             ├── python/
-            │   ├── dl.py     # copy of the root dl.py (synced by the builder at build time)
+            │   ├── dl.py     # checked-in Android engine (separate from root dl.py)
             │   └── igl.py
             ├── java/com/erawat/arc/
             │   ├── MainActivity.kt          # Compose UI, theme, ClaudeThinkingCard
@@ -588,14 +586,15 @@ universal-downloader/
             └── res/                         # themes, strings, file provider paths, launcher icon
 ```
 
-The app's copy of `dl.py` is overwritten from the root file on every build, so **edit the root `dl.py`** and
-rebuild; never edit the copy under `android-app/app/src/main/python/`. The Windows app needs no copy at all:
-it imports the root file directly, and `arc.spec` bundles it as data.
+The Android APK uses its checked-in engine under `android-app/app/src/main/python/`. The Windows app and CLI use
+the root `dl.py`; editing it does not overwrite the APK engine. The Windows app imports the root file directly,
+and `arc.spec` bundles it as data.
 
 ```text
-                        ┌── dl  (CLI)          runs dl.py directly
-   dl.py  ──────────────┼── Arc  (APK)         Chaquopy -> run_app_json_request()
-   single source        └── Arc.exe (Windows)  PySide6  -> run_app_json_request()
+                        ┌── dl  (CLI)          runs root dl.py directly
+   root dl.py ──────────┴── Arc.exe (Windows)  PySide6 -> run_app_json_request()
+
+   Android app uses its checked-in engine under android-app/app/src/main/python/
 ```
 
 ---

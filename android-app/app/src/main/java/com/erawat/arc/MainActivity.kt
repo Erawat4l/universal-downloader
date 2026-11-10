@@ -263,30 +263,6 @@ private data class MediaTarget(
     val selectedAudioLang: String = "",
 )
 
-private fun directFileDisplayName(rawName: String): String {
-    val name = rawName.substringAfterLast('/').ifBlank { "Direct download" }
-    val ext = name.substringAfterLast('.', "").takeIf { it.matches(Regex("[A-Za-z0-9]{1,8}")) }
-    val stem = if (ext != null) name.dropLast(ext.length + 1) else name
-    // Some CDNs expose an opaque SHA/hash as the URL filename. Don't present a
-    // 64-character digest as if it were a meaningful media title.
-    if (stem.length >= 32 && stem.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
-        return if (ext != null) "Direct file.$ext" else "Direct download"
-    }
-    return name
-}
-
-private fun looksLikeDirectFileUrl(raw: String): Boolean {
-    val path = runCatching { Uri.parse(raw).path.orEmpty() }.getOrDefault("").lowercase()
-    val extension = path.substringAfterLast('.', "")
-    // HLS/DASH manifests are streams, not ordinary downloadable files.
-    if (extension in setOf("m3u8", "mpd")) return false
-    return extension in setOf(
-        "mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp", "ts", "mp3", "m4a", "aac", "ogg", "opus", "wav", "flac",
-        "pdf", "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "apk", "exe", "dmg", "iso", "doc", "docx", "xls", "xlsx",
-        "ppt", "pptx", "txt", "csv", "json", "xml", "jpg", "jpeg", "png", "gif", "webp", "svg", "epub"
-    )
-}
-
 private fun cleanShowTitle(raw: String): String {
     return raw
         .replace(Regex("""[\s\-_]+S\d+(-S\d+)?(\s*E\d+)?.*""", RegexOption.IGNORE_CASE), "")
@@ -716,17 +692,12 @@ private fun ArcApp(
 
     fun openStreamExternal(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
         try {
-            val lowerStreamUrl = streamUrl.lowercase()
-            // Only sources known to be self-authenticating bypass the local
-            // header proxy. CDN links such as bcdn/okcdn often require Referer;
-            // handing those directly to VLC can start video without usable audio.
-            val isDirectPlayable = lowerStreamUrl.contains("googlevideo.com") ||
-                                  lowerStreamUrl.contains("youtube.com") ||
-                                  lowerStreamUrl.contains("youtu.be") ||
-                                  lowerStreamUrl.startsWith("file://") ||
-                                  lowerStreamUrl.startsWith("/") ||
-                                  lowerStreamUrl.contains("127.0.0.1") ||
-                                  lowerStreamUrl.contains("localhost")
+            val isDirectPlayable = streamUrl.contains("googlevideo.com") ||
+                                  streamUrl.contains("youtube.com") ||
+                                  streamUrl.contains("youtu.be") ||
+                                  streamUrl.startsWith("file://") ||
+                                  streamUrl.startsWith("/") ||
+                                  (!streamUrl.contains("hakunaymatata") && !streamUrl.contains("mzfi.me"))
 
             var playUrl = streamUrl
             if (!isDirectPlayable && !streamUrl.contains("127.0.0.1")) {
@@ -745,12 +716,8 @@ private fun ArcApp(
                 }
             }
             val uri = Uri.parse(playUrl)
-            val pathLower = uri.path.orEmpty().lowercase()
-            val streamMime = if (pathLower.endsWith(".mp3") || pathLower.endsWith(".m4a") ||
-                pathLower.endsWith(".aac") || pathLower.endsWith(".flac") ||
-                pathLower.endsWith(".ogg") || pathLower.endsWith(".wav")) "audio/*" else "video/*"
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, streamMime)
+                setDataAndType(uri, "video/*")
                 putExtra("title", title.ifBlank { "Media Stream" })
                 putExtra("from_start", true)
                 putExtra("position", 0L)
@@ -1042,9 +1009,8 @@ private fun ArcApp(
                     return
                 }
 
-                val actualFileName = path.substringAfterLast('/').substringAfterLast('\\').ifBlank { job?.title ?: "Download" }
-                val jobTitle = actualFileName
-                jobs = jobs.map { if (it.id == result.jobId) it.copy(title = actualFileName, detail = if (it.detail == "File") "File" else it.detail, status = "Complete", path = path, progress = 100f) else it }
+                val jobTitle = job?.title?.ifBlank { "Download" } ?: "Download"
+                jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path, progress = 100f) else it }
                 message("Download complete: $jobTitle")
                 postNotification(jobTitle, path)
             }
@@ -1103,8 +1069,7 @@ private fun ArcApp(
             clean.startsWith("telegram.me/", ignoreCase = true) ||
             clean.startsWith("magnet:", ignoreCase = true)
         if (isDirectUrl) {
-            val isDirectFile = looksLikeDirectFileUrl(clean)
-            resolveLoading = !isDirectFile
+            resolveLoading = true
             val isSameShow = clean.equals(target.targetUrl, ignoreCase = true) ||
                              (target.title.isNotBlank() && titleOverride != null && cleanShowTitle(target.title).equals(cleanShowTitle(titleOverride), ignoreCase = true))
 
@@ -1137,44 +1102,14 @@ private fun ArcApp(
                     playlistEntries = emptyList(),
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
-                    canStream = !isDirectFile,
-                    mediaType = if (isDirectFile) "file" else "video",
+                    canStream = true,
+                    mediaType = "video",
                     audioTracks = audioChoices,
                     selectedAudioLang = selectedAudioLang,
                 )
             }
             overlay = "analysis"
             homeOverlay = "analysis"
-            if (isDirectFile) {
-                val fileName = directFileDisplayName(clean.substringBefore('?').substringBefore('#').substringAfterLast('/'))
-                target = target.copy(
-                    title = titleOverride ?: fileName,
-                    source = "Direct file",
-                    detail = "Direct File",
-                    size = "",
-                    description = clean,
-                    targetUrl = clean,
-                    directStreamUrl = clean,
-                    proxyUrl = "",
-                    availableQualities = emptyList(),
-                    qualityUrls = emptyMap(),
-                    streamHeaders = emptyMap(),
-                    isSeries = false,
-                    isPlaylist = false,
-                    canStream = false,
-                    mediaType = "file",
-                )
-                currentTrace = CliTrace(
-                    action = "Direct file",
-                    target = target.title,
-                    durationSeconds = 0f,
-                    steps = listOf("Direct download link detected", "[OK] Ready to download as a file"),
-                    stdoutLogs = "No stream resolution needed.",
-                    status = "Completed",
-                    isError = false,
-                )
-                return
-            }
             submit(
                 JSONObject().apply {
                     put("action", "resolve")
@@ -1243,7 +1178,7 @@ private fun ArcApp(
             id = java.util.UUID.randomUUID().toString(),
             title = finalTitle,
             source = target.source.ifBlank { "Stream" },
-            detail = if (target.mediaType == "file" || !target.canStream) "File" else "${if (isAudio) "Audio" else selectedQuality}${if (isAudio) " · Audio" else " · Video"}",
+            detail = "${if (isAudio) "Audio" else selectedQuality}${if (isAudio) " · Audio" else " · Video"}",
             status = "Downloading",
             speed = "Connecting...",
             downloaded = "Starting...",
@@ -1525,8 +1460,7 @@ private fun ArcApp(
                                             target.title
                                         }
                                         val streamTarget = target.directStreamUrl.ifBlank { target.proxyUrl.ifBlank { resolvedUrl.ifEmpty { input } } }
-                                        val needsFreshResolve = target.targetUrl.isNotBlank() && target.mediaType != "file"
-                                        if (!needsFreshResolve && streamTarget.isNotBlank() && !streamTarget.contains("127.0.0.1") && !resolveLoading) {
+                                        if (streamTarget.isNotBlank() && !streamTarget.contains("127.0.0.1") && !resolveLoading) {
                                             streamLoading = true
                                             openStreamExternal(streamTarget, target.streamHeaders, displayTitle)
                                             scope.launch {
@@ -1554,7 +1488,7 @@ private fun ArcApp(
                                                 val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
                                                 val hMap = mutableMapOf<String, String>()
                                                 hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val playUrl = proxyUrl.ifBlank { directUrl }
+                                                val playUrl = directUrl.ifBlank { proxyUrl }
                                                 if (playUrl.isNotBlank()) {
                                                     target = target.copy(
                                                         directStreamUrl = directUrl,
@@ -3518,12 +3452,14 @@ private fun GitHubCard(update: UpdateInfo, onCheck: () -> Unit, onOpenRelease: (
         update.loading -> "Checking updates..."
         update.error.isNotBlank() -> "Update check unavailable"
         update.appUpdateAvailable -> "App update ready"
+        update.sourceUpdateAvailable -> "Source update found"
         else -> "Up to date"
     }
     val body = when {
         update.loading -> "Checking GitHub for updates."
         update.error.isNotBlank() -> "Could not reach repository."
         update.appUpdateAvailable -> "Release ${update.releaseTag.ifBlank { "Latest" }} includes a new APK."
+        update.sourceUpdateAvailable -> "New commits available on repository."
         else -> "You are on the latest version."
     }
     Card(colors = CardDefaults.cardColors(containerColor = ArcSurface), shape = RoundedCornerShape(20.dp)) {

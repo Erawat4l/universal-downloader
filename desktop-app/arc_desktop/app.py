@@ -171,6 +171,10 @@ def run_selftest(args: argparse.Namespace) -> int:
              "providers": [], "poster": "", "url": "https://example.invalid/tv/2", "audios": []},
         ])
         application.processEvents()
+        if len(window.search_page._cards) != 2:
+            problems.append(f"search cards missing: expected 2, got {len(window.search_page._cards)}")
+        elif any(card.isHidden() for card in window.search_page._cards):
+            problems.append("successful search results were hidden instead of shown")
 
         window.target = window._normalize_target({
             "title": "Selftest Show S01E02", "source": "Test", "is_series": True,
