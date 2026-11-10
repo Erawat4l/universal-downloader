@@ -286,6 +286,10 @@ class SearchPage(QWidget):
         self._current_query = query
         self._pending_posters = 0
         self.query_label.setText(f"\u201c{query}\u201d  \u00b7  preparing results...")
+        # Successful search results are the primary content. The trace card's
+        # collapsed Details row used to occupy the top of the viewport and make
+        # users think the search returned nothing; keep it only for empty/error results.
+        self.thinking.setVisible(not bool(hits))
         if not hits:
             empty = EmptyState("No Results",
                                "Nothing matched. Try a shorter title, or the exact year.")

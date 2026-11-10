@@ -544,6 +544,7 @@ def t_search_posters_gate_results():
     assert "item.hide()" in pages
     assert "self._reveal_cards()" in pages and "QPropertyAnimation" in pages
     assert "self._poster_timeout.start(3500)" in pages
+    assert "self.thinking.setVisible(not bool(hits))" in pages
     add_card = pages.index("self.results_host.addWidget(item)", pages.index("def set_results"))
     start_poster = pages.index("poster.set_url(str(hit.get(\"poster\", \"\")))", add_card)
     assert add_card < start_poster, "poster readiness can fire synchronously before the card joins the layout"

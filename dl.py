@@ -2171,197 +2171,24 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             else:
                 render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
 
-    probe_info = {}
-    if is_playlist:
-        p_title = clean_filename(out_name or 'YouTube Playlist')
-        playlist_dir = os.path.join(out_dir, p_title)
-        os.makedirs(playlist_dir, exist_ok=True)
-        out_dir = playlist_dir
-        needs_mux = False
-    elif standalone:
+    # The Android engine intentionally downloads a single YouTube format that
+    # already contains both audio and video. Chaquopy does not ship FFmpeg, so
+    # separate bestvideo+bestaudio downloads cannot be reliably merged there.
+    # Prefer the best progressive format under the user's requested cap; this
+    # can be lower-resolution than adaptive-only formats but stays one file and
+    # includes sound. Desktop/CLI keeps its normal yt-dlp merge behaviour.
+    if standalone and not is_playlist:
         if is_audio_only:
             format_spec = "bestaudio[ext=m4a]/bestaudio/best"
-            needs_mux = False
         else:
-            needs_mux = False
-            try:
-                with yt_dlp.YoutubeDL(get_ytdlp_opts({'quiet': True, 'skip_download': True}, cookie=cookie)) as ydl_p:
-                    probe_info = ydl_p.extract_info(url, download=False) or {}
-                if probe_info.get('_type') == 'playlist' or ('entries' in probe_info and len(probe_info.get('entries') or []) > 1):
-                    is_playlist = True
-                p_formats = probe_info.get('formats', [])
-                has_prog = any(f.get('vcodec') != 'none' and f.get('acodec') != 'none' for f in p_formats)
-                q_clean = (quality_arg or '').lower()
-                wants_hd = any(h in q_clean for h in ['1080', '1440', '2160', '4k', 'best'])
-                if not is_playlist and (not has_prog or wants_hd):
-                    needs_mux = True
-            except Exception as e:
-                print(f"[WARN] Format probe: {e}")
-
-            height_match = re.search(r"height<=(\d+)", format_spec)
-            if needs_mux:
-                print("> Android standalone HD: Downloading video and audio streams for native hardware muxing...")
-                h_str = f"[height<={height_match.group(1)}]" if height_match else ""
-                v_fmt = f"bestvideo{h_str}[ext=mp4]/bestvideo{h_str}/bestvideo"
-                a_fmt = "bestaudio[ext=m4a]/bestaudio"
-                
-                raw_title = clean_filename(probe_info.get('title', 'video')) if probe_info else f"video_{int(time.time())}"
-                final_filename = os.path.join(out_dir, f"{raw_title}.mp4")
-
-                if cache_dir:
-                    stage_dir = os.path.join(cache_dir, f"ytdl_{jid}")
-                    os.makedirs(stage_dir, exist_ok=True)
-                else:
-                    stage_dir = out_dir
-
-                temp_v = os.path.join(stage_dir, f"{raw_title}_temp_v.mp4")
-                temp_a = os.path.join(stage_dir, f"{raw_title}_temp_a.m4a")
-                staged_final = os.path.join(stage_dir, f"{raw_title}.mp4") if cache_dir else final_filename
-
-                # 1. Download video track
-                print(f"> Fetching video track [{v_fmt}]...")
-                ydl_v_opts = get_ytdlp_opts({
-                    'format': v_fmt,
-                    'outtmpl': temp_v,
-                    'quiet': False,
-                    'no_warnings': True,
-                    'progress_hooks': [ytdlp_progress_hook],
-                }, cookie=cookie)
-                try:
-                    with yt_dlp.YoutubeDL(ydl_v_opts) as ydl_v:
-                        ydl_v.download([url])
-                except Exception as ve:
-                    print(f"[WARN] Video stream fetch: {ve}")
-
-                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                    if cache_dir and stage_dir != out_dir:
-                        shutil.rmtree(stage_dir, ignore_errors=True)
-                    else:
-                        for tf in (temp_v, temp_a):
-                            if os.path.exists(tf): os.remove(tf)
-                    return None
-
-                # 2. Download audio track
-                print(f"> Fetching audio track [{a_fmt}]...")
-                ydl_a_opts = get_ytdlp_opts({
-                    'format': a_fmt,
-                    'outtmpl': temp_a,
-                    'quiet': False,
-                    'no_warnings': True,
-                    'progress_hooks': [ytdlp_progress_hook],
-                }, cookie=cookie)
-                try:
-                    with yt_dlp.YoutubeDL(ydl_a_opts) as ydl_a:
-                        ydl_a.download([url])
-                except Exception as ae:
-                    print(f"[WARN] Audio stream fetch: {ae}")
-
-                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                    if cache_dir and stage_dir != out_dir:
-                        shutil.rmtree(stage_dir, ignore_errors=True)
-                    else:
-                        for tf in (temp_v, temp_a):
-                            if os.path.exists(tf): os.remove(tf)
-                    return None
-
-                # 3. Native hardware muxing
-                mux_ok = False
-                if os.path.exists(temp_v) and os.path.exists(temp_a):
-                    try:
-                        from com.erawat.arc import EmbeddedEngine
-                        print("> Combining video and audio tracks natively...")
-                        mux_ok = EmbeddedEngine.mux(temp_v, temp_a, staged_final)
-                    except Exception as me:
-                        print(f"[WARN] Native mux: {me}")
-                    if not mux_ok and shutil.which("ffmpeg"):
-                        # Desktop and CLI have no MediaMuxer, but ffmpeg does the
-                        # same job. Without this the run silently kept the video
-                        # track and threw the audio away.
-                        try:
-                            print("> Combining video and audio tracks with ffmpeg...")
-                            subprocess.run(
-                                ["ffmpeg", "-y", "-i", temp_v, "-i", temp_a,
-                                 "-c", "copy", "-movflags", "+faststart", staged_final],
-                                check=True, capture_output=True,
-                            )
-                            mux_ok = os.path.exists(staged_final) and os.path.getsize(staged_final) > 0
-                        except Exception as fe:
-                            print(f"[WARN] ffmpeg mux: {fe}")
-
-                if mux_ok and os.path.exists(staged_final):
-                    if cache_dir and staged_final != final_filename:
-                        safe_move(staged_final, final_filename)
-                        shutil.rmtree(stage_dir, ignore_errors=True)
-                    else:
-                        for tf in (temp_v, temp_a):
-                            if os.path.exists(tf):
-                                try: os.remove(tf)
-                                except Exception: pass
-                    print(f"[OK] Downloaded and merged: {final_filename}")
-                    if jid:
-                        render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
-                    return final_filename
-                else:
-                    # Never report a video-only track as a successful download.
-                    # If the video or audio track was absent, or muxing failed,
-                    # fall back to a progressive audio+video format at the cap.
-                    fallback_height = int(height_match.group(1)) if height_match else 720
-                    fallback_template = os.path.join(stage_dir, f"{raw_title}_with_audio.%(ext)s")
-                    fallback_format = (
-                        f"best[height<={fallback_height}][ext=mp4]/"
-                        f"best[height<={fallback_height}]/best"
-                    )
-                    print("> Mux unavailable; retrying as one combined audio+video file...")
-                    try:
-                        fallback_opts = get_ytdlp_opts({
-                            'format': fallback_format,
-                            'outtmpl': fallback_template,
-                            'quiet': False,
-                            'no_warnings': True,
-                            'progress_hooks': [ytdlp_progress_hook],
-                        }, cookie=cookie)
-                        with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
-                            ydl_fallback.download([url])
-                        fallback_files = [
-                            os.path.join(stage_dir, name) for name in os.listdir(stage_dir)
-                            if name.startswith(f"{raw_title}_with_audio.")
-                            and not name.endswith((".part", ".ytdl"))
-                        ]
-                        fallback_file = next((p for p in fallback_files if os.path.isfile(p)), None)
-                        if fallback_file and os.path.getsize(fallback_file) > 0:
-                            if fallback_file != final_filename:
-                                safe_move(fallback_file, final_filename)
-                            if os.path.exists(temp_v): os.remove(temp_v)
-                            if os.path.exists(temp_a): os.remove(temp_a)
-                            if cache_dir and stage_dir != out_dir:
-                                shutil.rmtree(stage_dir, ignore_errors=True)
-                            print(f"[OK] Downloaded combined audio/video: {final_filename}")
-                            if jid:
-                                render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
-                            return final_filename
-                    except Exception as fallback_error:
-                        print(f"[FAIL] Could not produce a combined audio/video file: {fallback_error}")
-                    if cache_dir and stage_dir != out_dir:
-                        shutil.rmtree(stage_dir, ignore_errors=True)
-                    else:
-                        for track in (temp_v, temp_a):
-                            try:
-                                if os.path.exists(track): os.remove(track)
-                            except OSError:
-                                pass
-                    return None
+            q_text = str(quality_arg or "").lower()
+            q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
+            if q_match:
+                cap = int(q_match.group(1))
+                format_spec = f"best[height<={cap}][ext=mp4]/best[height<={cap}]"
             else:
-                # A combined/progressive selector is essential on Android: its
-                # bundled engine has no FFmpeg postprocessor. Respect a requested
-                # height cap and never select a video-only stream here.
-                progressive_cap = int(height_match.group(1)) if height_match else None
-                if progressive_cap:
-                    format_spec = (
-                        f"best[height<={progressive_cap}][ext=mp4]/"
-                        f"best[height<={progressive_cap}]/best"
-                    )
-                else:
-                    format_spec = "best[ext=mp4]/best"
+                format_spec = "best[ext=mp4]/best"
+        print(f"> Android YouTube: downloading one audio+video format [{format_spec}]...")
 
     if cache_dir:
         ytdl_stage = os.path.join(cache_dir, f"ytdl_raw_{jid}")
@@ -4891,6 +4718,40 @@ def app_search(query, platform="netmirror"):
     return {"platform": "catalog", "results": igl_matches + results}
 
 
+def select_progressive_youtube_format(formats, quality="best"):
+    """Pick one YouTube format with both audio and video under the requested cap.
+
+    Direct video-only URLs have no sound in an external player unless we mux a
+    separate audio stream, so streaming deliberately excludes them.
+    """
+    q = str(quality or "best").lower()
+    cap = None
+    if "4k" in q or "2160" in q:
+        cap = 2160
+    elif "2k" in q or "1440" in q:
+        cap = 1440
+    else:
+        match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q)
+        if match:
+            cap = int(match.group(1))
+    candidates = []
+    for fmt in formats or []:
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        if fmt.get("vcodec") in (None, "none") or fmt.get("acodec") in (None, "none"):
+            continue
+        height = fmt.get("height") or 0
+        try:
+            height = int(height)
+        except (TypeError, ValueError):
+            height = 0
+        if cap and height > cap:
+            continue
+        candidates.append((height, fmt.get("tbr") or 0, fmt))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2] if candidates else None
+
+
 def app_resolve(url, quality="best", season=None, episode=None):
     if not url:
         raise Exception("A URL is required")
@@ -5022,52 +4883,19 @@ def app_resolve(url, quality="best", season=None, episode=None):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
         
-        stream_url = None
         formats = info.get("formats", []) or []
-
-        # 1. Progressive streams (combined video + audio)
-        progressive = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")]
-        if progressive:
-            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
-            stream_url = progressive_sorted[0].get("url")
-
-        # 2. Combined HLS stream or best playable format
-        if not stream_url:
-            for f in reversed(formats):
-                url_str = f.get("url", "")
-                if f.get("vcodec") != "none" and ("m3u8" in url_str or f.get("protocol") == "m3u8_native"):
-                    stream_url = url_str
-                    break
-
-        # 3. Direct video stream or format url
-        if not stream_url:
-            for f in reversed(formats):
-                if f.get("vcodec") != "none" and f.get("url"):
-                    stream_url = f.get("url")
-                    break
-
-        if not stream_url and info.get("url"):
-            stream_url = info.get("url")
-
-        # 4. Fallback to web watch url for external players (VLC has built-in YouTube playback)
-        if not stream_url:
+        selected_stream = select_progressive_youtube_format(formats, clean_quality)
+        if selected_stream:
+            stream_url = selected_stream["url"]
+            selected_height = selected_stream.get("height") or 0
+            print(f"> Selected one-file audio+video stream: {selected_height}p")
+        else:
+            # Never give VLC a video-only googlevideo URL: it has no audio track.
+            # VLC's YouTube resolver can play the original page with audio, though
+            # that resolver may choose its own quality when no progressive format exists.
             stream_url = url
-
-        # 4. Fallback to format url
-        if not stream_url and info.get("requested_formats"):
-            for rf in info["requested_formats"]:
-                if rf.get("vcodec") != "none" and rf.get("url"):
-                    stream_url = rf.get("url")
-                    break
-
-        if not stream_url and formats:
-            for f in reversed(formats):
-                if f.get("vcodec") != "none" and f.get("url"):
-                    stream_url = f.get("url")
-                    break
-
-        if not stream_url:
-            raise Exception("No direct stream could be extracted from video source")
+            selected_height = 0
+            print("> No combined stream matched; handing the YouTube page to the player for audio/video playback.")
 
         # Extract REAL video quality tiers in descending order (exclude storyboard/thumbnails like sb0)
         tiers = set()

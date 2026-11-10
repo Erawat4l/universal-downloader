@@ -275,6 +275,20 @@ def t_sort_quality_labels():
     assert DL.sort_quality_labels(["1080p", "1080P", "720p"]) == ["1080p", "720p"]
 
 
+@register
+@test("YouTube stream selector caps resolution and never chooses silent video-only formats")
+def t_youtube_progressive_stream_selection():
+    formats = [
+        {"url": "video-only-2160", "height": 2160, "vcodec": "av01", "acodec": "none"},
+        {"url": "av-720", "height": 720, "vcodec": "avc1", "acodec": "mp4a", "tbr": 2000},
+        {"url": "av-360", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "tbr": 800},
+        {"url": "audio-only", "height": None, "vcodec": "none", "acodec": "opus"},
+    ]
+    assert DL.select_progressive_youtube_format(formats, "360p")["url"] == "av-360"
+    assert DL.select_progressive_youtube_format(formats, "4K")["url"] == "av-720"
+    assert DL.select_progressive_youtube_format(formats, "144p") is None
+
+
 # ================================ probing / health ============================
 @register
 @test("B4: the quality probe classifies ok/dead/unknown instead of no-oping")
@@ -945,29 +959,18 @@ def t_stream_headers():
     assert plain.get("Referer"), plain
 
 
-# ================================== muxing ====================================
+# ========================== single-file YouTube ==============================
 @register
-@test("HD merge falls back to ffmpeg when Android's MediaMuxer is absent")
-def t_ffmpeg_mux_fallback():
+@test("Android YouTube downloads select one combined audio/video format")
+def t_android_youtube_single_file():
     source = ENGINE.read_text(encoding="utf-8")
-    assert 'shutil.which("ffmpeg")' in source, "the ffmpeg mux fallback is missing"
-    assert "best[height<=" in source and "combined audio+video file" in source, (
-        "a progressive audio+video fallback is required when muxing fails"
-    )
-    assert "Video and audio could not be merged" not in source, (
-        "the engine must not report a silent video-only track as a successful download"
-    )
-
-
-@register
-@test("B16 note: EmbeddedEngine.mux is only reached inside the APK")
-def t_muxer_import_guarded():
-    source = ENGINE.read_text(encoding="utf-8")
-    assert "from com.erawat.arc import EmbeddedEngine" in source
-    # It must stay inside a try/except so desktop and CLI do not crash on it.
-    index = source.index("from com.erawat.arc import EmbeddedEngine")
-    window = source[max(0, index - 400): index + 200]
-    assert "try:" in window, "the Android-only import is not guarded"
+    start = source.index("def handle_youtube_or_video(")
+    end = source.index("def handle_studocu(", start)
+    body = source[start:end]
+    assert 'best[height<={cap}][ext=mp4]/best[height<={cap}]' in body
+    assert 'Android YouTube: downloading one audio+video format' in body
+    assert "Android standalone HD: Downloading video and audio streams" not in body
+    assert "Fetching video track" not in body and "Fetching audio track" not in body
 
 
 # =================================== main =====================================
