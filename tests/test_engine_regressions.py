@@ -967,7 +967,9 @@ def t_android_youtube_single_file():
     start = source.index("def handle_youtube_or_video(")
     end = source.index("def handle_studocu(", start)
     body = source[start:end]
-    assert 'best[height<={cap}][ext=mp4]/best[height<={cap}]' in body
+    assert 'best[height<={cap}][ext=mp4]/best[height<={cap}]/' in body
+    assert 'best[ext=mp4]/best' in body
+    assert 'retrying once with YouTube\'s best single audio+video format' in body
     assert 'Android YouTube: downloading one audio+video format' in body
     assert "Android standalone HD: Downloading video and audio streams" not in body
     assert "Fetching video track" not in body and "Fetching audio track" not in body
