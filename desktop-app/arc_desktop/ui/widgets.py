@@ -659,7 +659,7 @@ class LibraryCard(QFrame):
         self.open_button = QPushButton("Play")
         self.open_button.setObjectName("Primary")
         self.open_button.setCursor(Qt.PointingHandCursor)
-        self.open_button.setFixedHeight(32)
+        self.open_button.setStyleSheet("padding: 4px 8px; font-size: 12px;")
         self.open_button.clicked.connect(lambda: self.open_clicked.emit(self.path))
         self.folder_button = QPushButton("Folder")
         self.folder_button.setObjectName("Ghost")
@@ -669,6 +669,10 @@ class LibraryCard(QFrame):
         self.delete_button.setObjectName("Ghost")
         self.delete_button.setCursor(Qt.PointingHandCursor)
         self.delete_button.clicked.connect(lambda: self.delete_clicked.emit(self.path))
+        # Fixed width and height keep the primary Play action on the same
+        # baseline and x-position as Folder/Delete in every Library row.
+        for button in (self.open_button, self.folder_button, self.delete_button):
+            button.setFixedSize(72, 34)
         actions.addWidget(self.open_button)
         actions.addWidget(self.folder_button)
         actions.addWidget(self.delete_button)

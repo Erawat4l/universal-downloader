@@ -545,6 +545,15 @@ def t_search_results_visible_immediately():
     assert "item.hide()" not in pages
 
 
+@test("Library Play/Folder/Delete actions share a fixed aligned footprint")
+def t_library_actions_fixed_size():
+    widgets = (DESKTOP / "arc_desktop" / "ui" / "widgets.py").read_text(encoding="utf-8")
+    library_card = widgets.split("class LibraryCard(QFrame):", 1)[1].split("class Toast(QWidget):", 1)[0]
+    assert "for button in (self.open_button, self.folder_button, self.delete_button):" in library_card
+    assert "button.setFixedSize(72, 34)" in library_card
+    assert "self.open_button.setStyleSheet(\"padding: 4px 8px; font-size: 12px;\")" in library_card
+
+
 @test("Android build keeps its checked-in engine instead of copying desktop dl.py")
 def t_android_engine_stays_independent():
     builder = (REPO / "android-app" / "tools" / "build_android.py").read_text(encoding="utf-8")
