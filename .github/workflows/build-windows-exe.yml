@@ -104,10 +104,12 @@ jobs:
     # Freezing takes tens of minutes, so it runs on an explicit request or a tag -
     # not on every pull request, where `verify` alone already proves the engine,
     # the desktop core and the headless UI all still work.
+    # The last clause is TEMPORARY: it lets this branch prove the freeze before
+    # the first tagged release. Remove it once verified.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.ref, 'refs/tags/v') ||
-      github.ref == 'refs/heads/arena/c48518ae-universal-downloader'   # TEMPORARY
+      github.ref == 'refs/heads/arena/c48518ae-universal-downloader'
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
