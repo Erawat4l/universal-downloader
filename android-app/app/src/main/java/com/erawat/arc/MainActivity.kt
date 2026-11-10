@@ -263,6 +263,30 @@ private data class MediaTarget(
     val selectedAudioLang: String = "",
 )
 
+private fun directFileDisplayName(rawName: String): String {
+    val name = rawName.substringAfterLast('/').ifBlank { "Direct download" }
+    val ext = name.substringAfterLast('.', "").takeIf { it.matches(Regex("[A-Za-z0-9]{1,8}")) }
+    val stem = if (ext != null) name.dropLast(ext.length + 1) else name
+    // Some CDNs expose an opaque SHA/hash as the URL filename. Don't present a
+    // 64-character digest as if it were a meaningful media title.
+    if (stem.length >= 32 && stem.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+        return if (ext != null) "Direct file.$ext" else "Direct download"
+    }
+    return name
+}
+
+private fun looksLikeDirectFileUrl(raw: String): Boolean {
+    val path = runCatching { Uri.parse(raw).path.orEmpty() }.getOrDefault("").lowercase()
+    val extension = path.substringAfterLast('.', "")
+    // HLS/DASH manifests are streams, not ordinary downloadable files.
+    if (extension in setOf("m3u8", "mpd")) return false
+    return extension in setOf(
+        "mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp", "ts", "mp3", "m4a", "aac", "ogg", "opus", "wav", "flac",
+        "pdf", "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "apk", "exe", "dmg", "iso", "doc", "docx", "xls", "xlsx",
+        "ppt", "pptx", "txt", "csv", "json", "xml", "jpg", "jpeg", "png", "gif", "webp", "svg", "epub"
+    )
+}
+
 private fun cleanShowTitle(raw: String): String {
     return raw
         .replace(Regex("""[\s\-_]+S\d+(-S\d+)?(\s*E\d+)?.*""", RegexOption.IGNORE_CASE), "")
@@ -1009,8 +1033,9 @@ private fun ArcApp(
                     return
                 }
 
-                val jobTitle = job?.title?.ifBlank { "Download" } ?: "Download"
-                jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path, progress = 100f) else it }
+                val actualFileName = path.substringAfterLast('/').substringAfterLast('\\').ifBlank { job?.title ?: "Download" }
+                val jobTitle = actualFileName
+                jobs = jobs.map { if (it.id == result.jobId) it.copy(title = actualFileName, detail = if (it.detail == "File") "File" else it.detail, status = "Complete", path = path, progress = 100f) else it }
                 message("Download complete: $jobTitle")
                 postNotification(jobTitle, path)
             }
@@ -1069,7 +1094,8 @@ private fun ArcApp(
             clean.startsWith("telegram.me/", ignoreCase = true) ||
             clean.startsWith("magnet:", ignoreCase = true)
         if (isDirectUrl) {
-            resolveLoading = true
+            val isDirectFile = looksLikeDirectFileUrl(clean)
+            resolveLoading = !isDirectFile
             val isSameShow = clean.equals(target.targetUrl, ignoreCase = true) ||
                              (target.title.isNotBlank() && titleOverride != null && cleanShowTitle(target.title).equals(cleanShowTitle(titleOverride), ignoreCase = true))
 
@@ -1102,14 +1128,44 @@ private fun ArcApp(
                     playlistEntries = emptyList(),
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
-                    canStream = true,
-                    mediaType = "video",
+                    canStream = !isDirectFile,
+                    mediaType = if (isDirectFile) "file" else "video",
                     audioTracks = audioChoices,
                     selectedAudioLang = selectedAudioLang,
                 )
             }
             overlay = "analysis"
             homeOverlay = "analysis"
+            if (isDirectFile) {
+                val fileName = directFileDisplayName(clean.substringBefore('?').substringBefore('#').substringAfterLast('/'))
+                target = target.copy(
+                    title = titleOverride ?: fileName,
+                    source = "Direct file",
+                    detail = "Direct File",
+                    size = "",
+                    description = clean,
+                    targetUrl = clean,
+                    directStreamUrl = clean,
+                    proxyUrl = "",
+                    availableQualities = emptyList(),
+                    qualityUrls = emptyMap(),
+                    streamHeaders = emptyMap(),
+                    isSeries = false,
+                    isPlaylist = false,
+                    canStream = false,
+                    mediaType = "file",
+                )
+                currentTrace = CliTrace(
+                    action = "Direct file",
+                    target = target.title,
+                    durationSeconds = 0.0,
+                    steps = listOf("Direct download link detected", "[OK] Ready to download as a file"),
+                    stdoutLogs = "No stream resolution needed.",
+                    status = "Completed",
+                    isError = false,
+                )
+                return
+            }
             submit(
                 JSONObject().apply {
                     put("action", "resolve")
@@ -1178,7 +1234,7 @@ private fun ArcApp(
             id = java.util.UUID.randomUUID().toString(),
             title = finalTitle,
             source = target.source.ifBlank { "Stream" },
-            detail = "${if (isAudio) "Audio" else selectedQuality}${if (isAudio) " · Audio" else " · Video"}",
+            detail = if (target.mediaType == "file" || !target.canStream) "File" else "${if (isAudio) "Audio" else selectedQuality}${if (isAudio) " · Audio" else " · Video"}",
             status = "Downloading",
             speed = "Connecting...",
             downloaded = "Starting...",

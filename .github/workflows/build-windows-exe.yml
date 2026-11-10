@@ -94,10 +94,9 @@ jobs:
   build:
     name: Freeze ${{ matrix.layout }}
     needs: verify
-    # Freezing takes tens of minutes, so it runs on an explicit request or a tag -
-    # not on every pull request, where `verify` alone already proves the engine,
-    # the desktop core and the headless UI all still work.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    # Public-repository Actions minutes are free. Build on PRs too, so each
+    # proposed desktop change gets a real frozen Windows exe and startup test.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -143,15 +142,22 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Build produced no exe at $exe" }
           $size = (Get-Item $exe).Length / 1MB
           Write-Host ("{0} -> {1:N1} MB" -f $exe, $size)
-          # Launch it, give the windowed process time to unpack, then confirm it
-          # is alive and shut it down. A crash-on-start would exit by itself.
-          $proc = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 45
-          if ($proc.HasExited) {
-            throw "Arc.exe exited during startup with code $($proc.ExitCode)"
+          # Exercise the actual frozen entry point in headless self-test mode.
+          # Merely checking that the GUI process remains alive misses import
+          # exceptions shown in a modal Windows error dialog.
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru
+          try {
+            Wait-Process -Id $proc.Id -Timeout 180 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Frozen Arc self-test timed out or failed to exit: $_"
           }
-          Write-Host "Arc.exe is running (pid $($proc.Id))"
-          Stop-Process -Id $proc.Id -Force
+          $proc.Refresh()
+          if ($proc.ExitCode -ne 0) {
+            throw "Frozen Arc self-test exited with code $($proc.ExitCode)"
+          }
+          Write-Host "Frozen Arc self-test passed (exit code 0)"
 
       - name: Package
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}

@@ -78,7 +78,10 @@ icon_path = HERE / "assets" / "arc.ico"
 ONEFILE = os.environ.get("ARC_ONEFILE", "1") != "0"
 
 a = Analysis(
-    [str(HERE / "arc_desktop" / "app.py")],
+    # Use a small top-level launcher that imports arc_desktop.app by its fully
+    # qualified package name. Freezing app.py directly breaks its relative
+    # imports at startup ("attempted relative import with no known parent package").
+    [str(HERE / "launcher.py")],
     pathex=[str(HERE), str(REPO)],
     binaries=[],
     datas=datas,
