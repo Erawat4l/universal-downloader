@@ -29,6 +29,13 @@ on:
       - "igl.py"
       - "desktop-app/**"
       - ".github/workflows/build-windows-exe.yml"
+  # TEMPORARY: proves the freeze works before the first tagged release. Remove.
+  push:
+    branches: ["arena/c48518ae-universal-downloader"]
+    paths:
+      - "dl.py"
+      - "desktop-app/**"
+      - ".github/workflows/build-windows-exe.yml"
 
 permissions:
   contents: write      # needed to attach assets to a release on tag push
@@ -97,7 +104,10 @@ jobs:
     # Freezing takes tens of minutes, so it runs on an explicit request or a tag -
     # not on every pull request, where `verify` alone already proves the engine,
     # the desktop core and the headless UI all still work.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.ref == 'refs/heads/arena/c48518ae-universal-downloader'   # TEMPORARY
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
