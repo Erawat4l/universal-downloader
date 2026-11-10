@@ -32,7 +32,8 @@ from .pages import (
     AUDIO_QUALITIES, ActivityPage, AnalysisPage, HomePage, LibraryPage,
     SearchPage, SettingsPage, VIDEO_QUALITY_DEFAULTS,
 )
-from .widgets import Toast, nav_icon_glyph
+from .widgets import Toast
+from ..theme import nav_icon_glyph
 
 POLL_INTERVAL_MS = 400          # same cadence as the APK's LaunchedEffect(jobs)
 THINK_TICK_MS = 350             # same cadence as the animated thinking dots

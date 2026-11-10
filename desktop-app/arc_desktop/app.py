@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -50,10 +51,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_window(args: argparse.Namespace):
-    """Create QApplication, load the engine and construct MainWindow."""
+def build_window(args: argparse.Namespace, store: Optional[Store] = None):
+    """Create QApplication, load the engine and construct MainWindow.
+
+    `store` may be supplied by the self-test so that exercising the UI never
+    writes to the real settings file in %APPDATA%.
+    """
     _qt_high_dpi()
-    from PySide6.QtCore import Qt
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -68,9 +72,10 @@ def build_window(args: argparse.Namespace):
     application.setWindowIcon(QIcon(_icon_path()))
     application.setStyleSheet(theme.build_stylesheet())
 
-    store = Store()
+    if store is None:
+        store = Store()
     if args.download_dir:
-        store.set("download_path", args.download_dir)
+        store.set("download_path", args.download_dir, persist=False)
 
     bridge = EngineBridge(Path(args.engine) if args.engine else None)
     window = MainWindow(bridge, store)
@@ -93,8 +98,16 @@ def run_selftest(args: argparse.Namespace) -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     started = time.time()
     problems: list[str] = []
+
+    # A throwaway store: the self-test adds and removes history entries, and must
+    # never touch the real settings file in %APPDATA% / ~/.config.
+    sandbox = Path(tempfile.mkdtemp(prefix="arc-selftest-"))
+    store = Store(sandbox / "arc-desktop.json")
+    if not args.download_dir:
+        args.download_dir = str(sandbox / "downloads")
+
     try:
-        application, window = build_window(args)
+        application, window = build_window(args, store=store)
     except EngineError as error:
         print(f"[SELFTEST][FAIL] engine: {error}")
         return 1
@@ -172,18 +185,35 @@ def run_selftest(args: argparse.Namespace) -> int:
         else:
             if "12.5%" not in card.percent_label.text():
                 problems.append(f"progress text wrong: {card.percent_label.text()}")
-            if not card.pause_button.isVisible() or card.resume_button.isVisible():
-                problems.append("pause/resume visibility wrong for Downloading")
+            # isHidden(), not isVisible(): the Activity page is not the current
+            # page of the stack, so every widget in it reports invisible even
+            # when it is correctly shown.
+            if card.pause_button.isHidden() or not card.resume_button.isHidden():
+                problems.append("pause/resume visibility wrong for a Downloading job")
+            if not card.open_button.isHidden():
+                problems.append("Open should be hidden until the file exists")
         window.jobs.pop("selftest-job", None)
         window._render_jobs()
 
+        # The store is the throwaway one created above, so this cannot touch the
+        # real settings file. A real file is used so the existence filter is
+        # exercised too, not just the append.
         store = window.store
+        real_file = sandbox / "selftest-media.mp4"
+        real_file.write_bytes(b"\x00" * 16)
         before = len(store.history())
-        store.add_history({"title": "Selftest File", "path": str(Path(__file__) / "x.mp4"),
+        store.add_history({"title": "Selftest File", "path": str(real_file),
                            "source": "Test", "detail": "1080p"})
         if len(store.history(only_existing=False)) != before + 1:
             problems.append("history append failed")
-        store.remove_history(str(Path(__file__) / "x.mp4"))
+        if len(store.history()) != before + 1:
+            problems.append("an existing file was filtered out of the Library")
+        real_file.unlink()
+        if len(store.history()) != before:
+            problems.append("a deleted file is still listed in the Library")
+        store.remove_history(str(real_file))
+        if store.path.parent != sandbox:
+            problems.append(f"self-test wrote to a real config dir: {store.path}")
 
         application.processEvents()
     except Exception:

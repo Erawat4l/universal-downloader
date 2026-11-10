@@ -425,6 +425,115 @@ def t_theme_tokens():
                 f"#{value} is no longer used by the APK, so the two designs have diverged"
 
 
+@test("every intra-package import in the desktop app resolves")
+def t_imports_resolve():
+    """Catches the ImportError class of bug without needing a Qt runtime.
+
+    A misspelled or misplaced import only surfaces when the module is imported,
+    which for the Qt layer means a display. Checking the AST instead means CI
+    finds it before the headless self-test ever runs.
+    """
+    import ast
+
+    root = DESKTOP / "arc_desktop"
+    modules = {path.relative_to(root.parent).with_suffix("").as_posix().replace("/", "."): path
+               for path in root.rglob("*.py")}
+    assert modules, "no desktop modules were found"
+
+    def top_level_names(path: Path) -> set:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name)
+        return names
+
+    defined = {name: top_level_names(path) for name, path in modules.items()}
+    problems: list[str] = []
+    for module, path in sorted(modules.items()):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level == 0:
+                continue
+            parts = module.split(".")
+            base = parts[: len(parts) - node.level] if node.level else parts
+            target = ".".join(base + ([node.module] if node.module else []))
+            resolved = next((c for c in (target, target + ".__init__") if c in defined), None)
+            if resolved is None:
+                problems.append(f"{module}: cannot resolve module '{target}'")
+                continue
+            package = resolved[:-9] if resolved.endswith(".__init__") else resolved
+            for alias in node.names:
+                if alias.name in defined[resolved]:
+                    continue
+                # `from .. import theme` imports a submodule, which is valid even
+                # though the package __init__ never names it.
+                if package and f"{package}.{alias.name}" in modules:
+                    continue
+                problems.append(
+                    f"{module}: imports '{alias.name}' from {resolved}, which does not define it")
+    assert not problems, "\n        " + "\n        ".join(problems)
+
+
+@test("every PySide6 name the app imports exists in the installed Qt")
+def t_qt_names_exist():
+    """Verifies Qt API usage against the shipped type stubs, without importing Qt.
+
+    Importing PySide6 needs a working platform plugin, so this reads the .pyi
+    stubs the wheel ships and confirms each imported class/enum is really there.
+    """
+    import ast
+    import re
+
+    try:
+        import PySide6
+    except Exception:
+        return                      # Qt not installed here; CI covers it
+    stub_dir = Path(PySide6.__file__).resolve().parent
+    stubs = {path.stem: path for path in stub_dir.glob("Qt*.pyi")}
+    if not stubs:
+        return                      # stubs stripped from this install
+
+    available = {name: set(re.findall(r"^\s*class\s+([A-Za-z_]\w*)",
+                                      path.read_text(encoding="utf-8", errors="replace"), re.M))
+                 | set(re.findall(r"^\s{4}([A-Z]\w+)\s*=",
+                                   path.read_text(encoding="utf-8", errors="replace"), re.M))
+                 for name, path in stubs.items()}
+
+    problems: list[str] = []
+    checked = 0
+    for path in sorted((DESKTOP / "arc_desktop").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if not node.module.startswith("PySide6"):
+                continue
+            stub = node.module.split(".")[-1]
+            names = available.get(stub)
+            if names is None:
+                problems.append(f"{path.name}: no stub module for {node.module}")
+                continue
+            for alias in node.names:
+                checked += 1
+                if alias.name not in names:
+                    problems.append(f"{path.name}: '{alias.name}' is not in PySide6.{stub}")
+    assert checked > 20, f"only {checked} Qt imports were checked - the scan is broken"
+    assert not problems, "\n        " + "\n        ".join(problems)
+
+
 # ============================================================== main
 def main() -> int:
     print("")
