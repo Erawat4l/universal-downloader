@@ -20,3 +20,13 @@ android-app/python-vendor/**/build/
 .idea/
 *.iml
 .kotlin/
+
+# Windows desktop build outputs and local virtualenv
+desktop-app/.venv/
+desktop-app/build/
+desktop-app/dist/
+desktop-app/*.spec.bak
+desktop-app/Arc-windows-x64.exe
+desktop-app/Arc-windows-x64-portable.zip
+desktop-app/assets/arc.ico
+.arc-cache/

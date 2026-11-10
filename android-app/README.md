@@ -33,10 +33,13 @@ app\build\outputs\apk\debug\app-debug.apk
 After a successful build, the builder also creates the next local artifact:
 
 ```text
-app\build\outputs\apk\debug\A4C 1.apk
+app\build\outputs\apk\debug\ARC 1.apk
 ```
 
-The number increments on each build. If `tt` is available on PATH, that numbered APK is automatically sent with:
+The number increments on each build (`ARC 2.apk`, `ARC 3.apk`, ...). It is chosen by scanning both the output
+folder and `/sdcard/Download` for existing `ARC {n}.apk` names, so a rebuild never overwrites an artifact you
+already shared. Older `A4C {n}.apk` files are counted too, which keeps the sequence continuous if you built
+before the rename. If `tt` is available on PATH, that numbered APK is automatically sent with:
 
 ```text
 tt send 2 <apk-path>
@@ -62,7 +65,7 @@ Search, resolve, stream, and download requests execute inside the app process. N
 
 The UI mirrors the engine capabilities: direct files, supported video platforms, Telegram, educational PDFs, NetMirror, quality selection, audio-only formats, direct links, retries, resume, and real download output. If a dependency, network request, extractor, or Telegram credential is unavailable, Arc reports the actual error instead of showing fallback data.
 
-Downloads are written to the app's private Downloads directory. This avoids Termux and scoped-storage workarounds; the returned file path is shown in Activity and Library so it can be opened or shared by a later file action.
+Downloads go to public storage — `/sdcard/Download` — whenever the all-files permission allows it, and fall back to the app's private `~/Downloads` when it does not. `dl.py` picks the directory once at import (`get_default_dir()`) by write-probing each candidate, so the same engine behaves correctly on a phone and on a desktop without a branch. The returned file path is shown in Activity and Library so it can be opened or shared by a later file action.
 
 ### Telegram setup
 

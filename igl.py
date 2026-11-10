@@ -36,13 +36,31 @@ FALLBACK_DOMAINS = [
 WORKER_URL = "https://okcdn.moivies.workers.dev"
 
 def get_dest_dir():
-    target = os.environ.get("ARC_DOWNLOAD_DIR") or "/sdcard/Download"
-    if os.path.exists(target):
-        return target
-    fallback = os.path.expanduser("~/downloads")
-    return fallback
+    """Resolve the download folder once, at import time.
 
-OUTPUT_DIR = "/sdcard/Download"
+    This used to be defined and then never called: OUTPUT_DIR was hardcoded to
+    /sdcard/Download, so ARC_DOWNLOAD_DIR (documented in README) did nothing and
+    igl on a desktop tried to write into a path that does not exist.
+    """
+    target = os.environ.get("ARC_DOWNLOAD_DIR") or ""
+    candidates = [target] if target else []
+    candidates.append("/sdcard/Download")
+    candidates.append(os.path.join(os.path.expanduser("~"), "Downloads"))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".igl_write_test")
+            with open(probe, "w") as handle:
+                handle.write("ok")
+            os.remove(probe)
+            return candidate
+        except Exception:
+            continue
+    return os.path.expanduser("~")
+
+OUTPUT_DIR = get_dest_dir()
 
 # ANSI Colors
 CLR_RESET = "\033[0m"
@@ -352,8 +370,12 @@ def execute_download(info):
                 sync_to_sdcard_if_needed(dest_path)
                 return dest_path
 
-        dl_script = os.path.expanduser("~/scripts/d.py")
-        if os.path.exists(dl_script):
+        dl_script = next((c for c in [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "dl.py"),
+            os.path.expanduser("~/scripts/dl.py"),
+            os.path.expanduser("~/scripts/d.py"),
+        ] if os.path.exists(c)), None)
+        if dl_script:
             subprocess.run(["python3", dl_script, stream_url, "-d", OUTPUT_DIR, "-q", "1080p"])
             return dest_path
         print(f"{CLR_RED}✖ Download tool unavailable for YouTube.{CLR_RESET}")
@@ -386,6 +408,7 @@ def execute_download(info):
 
     # Fallback direct streaming download
     print(f"{CLR_CYAN}➜ Downloading stream directly via Python...{CLR_RESET}")
+    os.makedirs(os.path.dirname(dest_path) or OUTPUT_DIR, exist_ok=True)
     with requests.get(stream_url, stream=True, timeout=30) as r:
         r.raise_for_status()
         total_len = int(r.headers.get('content-length', 0))

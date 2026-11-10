@@ -6,8 +6,9 @@
 
 **The high-speed stream bypasser, 4K media downloader, and offline video hub — from terminal to native Android.**
 
-One engine (`dl.py`), two front ends: the **`dl`** command-line tool for Termux, Linux, macOS and Windows,
-and **Arc**, a native Android app (`com.erawat.arc`) that carries the same engine inside the APK.
+One engine (`dl.py`), three front ends: the **`dl`** command-line tool for Termux, Linux, macOS and Windows,
+**Arc**, a native Android app (`com.erawat.arc`) that carries the same engine inside the APK, and
+**Arc Desktop**, a Windows `.exe` that carries the same engine inside a Qt window.
 No companion apps, no terminal, no root.
 
 [![Python](https://img.shields.io/badge/python-3.12%20%E2%80%93%203.14-3776ab?logo=python&logoColor=white)](#install--setup)
@@ -17,6 +18,7 @@ No companion apps, no terminal, no root.
 [![License: MIT](https://img.shields.io/badge/license-MIT-34d399)](#privacy-security--license)
 [![4K UHD](https://img.shields.io/badge/4K%20UHD-up%20to%202160p-0d0d0d)](#quality-ladder)
 [![aria2c](https://img.shields.io/badge/aria2c-16%C3%97%20parallel-fbbf24)](#why-it-is-fast--unique)
+[![Windows](https://img.shields.io/badge/Windows-Arc.exe-0078d6?logo=windows&logoColor=white)](#arc-desktop-windows-app)
 [![Branch](https://img.shields.io/badge/branch-main%20only-8e8e93)](#project-architecture)
 
 </div>
@@ -48,7 +50,9 @@ The terminal side looks like this (`dl` with no arguments):
   - [Quality ladder](#quality-ladder)
 - [Feature breakdown](#feature-breakdown)
 - [Arc Android app](#arc-android-app)
+- [Arc Desktop (Windows app)](#arc-desktop-windows-app)
 - [Install & setup](#install--setup)
+  - [Windows (Arc.exe)](#windows-arcexe)
   - [Android (direct APK)](#android-direct-apk)
   - [Termux (native on Android)](#termux-native-on-android)
   - [Building the APK on Termux](#building-the-apk-on-termux)
@@ -58,6 +62,7 @@ The terminal side looks like this (`dl` with no arguments):
 - [Configuration & credentials](#configuration--credentials)
 - [CLI command reference (`dl`)](#cli-command-reference-dl)
 - [Project architecture](#project-architecture)
+- [Tests](#tests)
 - [Privacy, security & license](#privacy-security--license)
 
 ---
@@ -129,14 +134,85 @@ free space before choosing it.
 
 ---
 
+## Arc Desktop (Windows app)
+
+A native Windows program with the same monochrome UI as the APK, built on PySide6 (Qt) and driving the same
+`dl.py` in-process. See [`desktop-app/README.md`](desktop-app/README.md) for the full detail.
+
+- **Same engine, loaded not copied.** `desktop-app/arc_desktop/engine_bridge.py` imports the repository's root
+  `dl.py` at runtime and calls the same `run_app_json_request()` machine interface the APK uses
+  (`search`, `resolve`, `download`, `progress`, `cancel`, `telegram_check`, `stream_proxy`). There is no second
+  copy of the engine to drift out of sync.
+- **Genuinely faster than the APK.** Android cannot ship `aria2c` or `ffmpeg`, so every download there falls
+  back to the single-connection Python loop. On Windows the same code takes `aria2c -x16 -s16` (16 parallel
+  connections) and merges HD video+audio with real ffmpeg. Settings → Accelerators shows what your machine has.
+- **Also decrypts what the APK cannot.** `pycryptodomex` unlocks the AES-GCM NetMirror streams that have no
+  crypto backend on Android.
+- **Tabs.** Home (paste a link or type a title) · Activity (live percent, speed, ETA, pause/resume/cancel,
+  polled every 400 ms like the APK) · Library (finished files, persisted across restarts, plus a folder scan) ·
+  Settings (save location, default quality, notifications, Telegram session, accelerators, update check).
+- **Execution trace.** Every search and resolve shows elapsed seconds, the steps taken and the engine's own
+  sanitised log output, with a Copy button — the desktop twin of the APK's thinking card.
+- **Android-only side effects are patched out, not forked.** `adb push` to `/sdcard`, the `:8080` ADM link
+  server with its `v1.mp4` hardlinks, and the `am start` player launch are replaced at runtime with Windows
+  equivalents, so the engine stays a single file.
+
+| | APK | Arc.exe |
+|---|---|---|
+| Download connections | 1 (Python loop) | **16** (`aria2c`) |
+| Video + audio merge | Kotlin `MediaMuxer` | **ffmpeg** |
+| NetMirror AES-GCM | ✗ | ✓ |
+| Library survives restart | ✗ | ✓ |
+| Instant streaming | proxy → external player | proxy → **VLC** |
+
+---
+
 ## Install & setup
 
 | You want | Use |
 |---|---|
 | The app, on a phone | [Android (direct APK)](#android-direct-apk) |
+| The app, on a Windows PC | [Windows (Arc.exe)](#windows-arcexe) |
 | The CLI on the same phone | [Termux](#termux-native-on-android) |
 | The CLI on a computer | [Linux & macOS](#linux--macos) or [Windows](#windows-powershell--wsl) |
 | To build the APK yourself | [Building the APK on Termux](#building-the-apk-on-termux) |
+| To build the .exe yourself | [Windows (Arc.exe)](#windows-arcexe) |
+
+### Windows (Arc.exe)
+
+**Easiest:** download `Arc-windows-x64.exe` (one file) or `Arc-windows-x64-portable.zip` (starts faster) from
+the repository's **Releases** page, then double-click it. Windows SmartScreen may warn about an unsigned build:
+choose *More info* → *Run anyway*.
+
+**Build it yourself** on any Windows 10/11 machine with Python 3.9 – 3.13 from python.org
+(tick *"Add python.exe to PATH"*):
+
+```bat
+cd desktop-app
+build.bat
+```
+
+That creates `.venv`, installs the dependencies, runs a headless UI self-test and freezes `dist\Arc.exe`.
+Prefer to try it before building? Run `run-from-source.bat` instead.
+
+For full speed also install the two helpers the APK cannot ship:
+
+```powershell
+winget install aria2.aria2
+winget install Gyan.FFmpeg
+```
+
+**CI builds it for you.** `.github/workflows/build-windows-exe.yml` runs the engine and desktop test suites,
+builds the GUI headless, freezes both layouts and smoke-tests the resulting exe — then attaches them to a
+release when you push a `v*` tag. Trigger a build from anywhere, including a tablet:
+
+```bash
+gh workflow run build-windows-exe.yml
+```
+
+> A Windows `.exe` **cannot** be built on Android/Termux. PyInstaller freezes the CPython it runs under, so it
+> cannot cross-compile; `llvm-mingw-w64` builds C/C++/Go/Rust PE files but has no way to turn `dl.py` plus
+> `yt-dlp` and `pyrogram` into an exe. Use the GitHub Actions workflow above, or a Windows machine.
 
 ### Android (direct APK)
 
@@ -463,6 +539,21 @@ universal-downloader/
 ├── TERMUX.md                 # on-device APK build, POSIX and fish versions
 ├── build.bat                 # Windows launcher for the APK build
 ├── index.html · prototype.html · serve_prototype.py     # UI prototypes
+├── tests/
+│   ├── test_engine_regressions.py   # 50 hermetic tests over dl.py (no network needed)
+│   └── test_desktop_core.py         # 25 tests over the Qt-free desktop core
+├── .github/workflows/
+│   └── build-windows-exe.yml        # verify + freeze Arc.exe on windows-latest
+├── desktop-app/
+│   ├── arc_desktop/
+│   │   ├── app.py                   # entry point; --selftest builds the UI headless
+│   │   ├── engine_bridge.py         # imports the ROOT dl.py; serialised call queue
+│   │   ├── platform_adapter.py      # Android-only side effects -> Windows equivalents
+│   │   ├── store.py                 # settings + download history as JSON in %APPDATA%
+│   │   ├── theme.py                 # the APK's monochrome tokens as Qt stylesheets
+│   │   └── ui/                      # widgets, pages, main window (400 ms poll)
+│   ├── arc.spec · build_exe.py · build.bat · run-from-source.bat · requirements.txt
+│   └── README.md
 └── android-app/
     ├── build.gradle.kts · settings.gradle.kts · gradle.properties · gradlew(.bat)
     ├── build-android.sh · build-android.bat · build.bat
@@ -487,7 +578,40 @@ universal-downloader/
 ```
 
 The app's copy of `dl.py` is overwritten from the root file on every build, so **edit the root `dl.py`** and
-rebuild; never edit the copy under `android-app/app/src/main/python/`.
+rebuild; never edit the copy under `android-app/app/src/main/python/`. The Windows app needs no copy at all:
+it imports the root file directly, and `arc.spec` bundles it as data.
+
+```text
+                        ┌── dl  (CLI)          runs dl.py directly
+   dl.py  ──────────────┼── Arc  (APK)         Chaquopy -> run_app_json_request()
+   single source        └── Arc.exe (Windows)  PySide6  -> run_app_json_request()
+```
+
+---
+
+## Tests
+
+Both suites are plain Python scripts — no pytest, no network, no display. They run on Termux, on Windows and
+in CI:
+
+```bash
+python tests/test_engine_regressions.py     # 50 tests over the shared engine
+cd desktop-app && python ../tests/test_desktop_core.py   # 25 tests over the desktop core
+cd desktop-app && python -m arc_desktop --selftest       # builds the whole GUI headless
+```
+
+The engine suite transfers real bytes against a local `127.0.0.1` server, so it verifies live progress,
+pause/resume, cancellation, resume-from-`.part`, retry policy and file integrity — not just imports. Every test
+names the bug it locks down, so a regression fails with an explanation.
+
+| Area | Covered |
+|---|---|
+| Download integrity | pause/resume must not lose a chunk; a short transfer is never renamed to the final file |
+| Job control | cancel during transfer, during retry backoff, and while a silent subprocess runs |
+| Resilience | permanent HTTP 4xx fails fast; offline waits are bounded and cancel-aware |
+| Log capture | each request keeps its own logs; host output is never swallowed |
+| Quality | CLI keys, app labels and CDN text all resolve to the same key; best-first ranking |
+| Machine interface | every `run_app_json_request` action, including malformed input |
 
 ---
 

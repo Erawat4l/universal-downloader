@@ -14,6 +14,10 @@ import base64
 import io
 import contextlib
 import shutil
+import hashlib
+import json
+import time
+import signal
 import requests
 import html
 from bs4 import BeautifulSoup
@@ -22,6 +26,193 @@ import http.server
 import socketserver
 import threading
 import concurrent.futures
+
+
+# ---------------------------------------------------------------------------
+# Windowed-executable safety.
+#
+# A PyInstaller/Nuitka build started with --noconsole (the Arc desktop .exe) and
+# the Chaquopy runtime inside the APK both leave sys.stdin / sys.stdout /
+# sys.stderr as None. The engine calls sys.stdout.isatty(), sys.stdin.isatty()
+# and print() on almost every code path, which would raise
+# AttributeError: 'NoneType' object has no attribute 'isatty'.
+#
+# These shims keep the engine importable and runnable headless: isatty() is
+# False (so interactive prompts take their non-interactive branch instead of
+# crashing) and writes are captured rather than lost.
+# ---------------------------------------------------------------------------
+
+class _NullStream(io.StringIO):
+    """A stream that is never a TTY and never blocks on read."""
+
+    def isatty(self):
+        return False
+
+    def write(self, value):
+        try:
+            return super().write(value)
+        except Exception:
+            return 0
+
+    def flush(self):
+        try:
+            super().flush()
+        except Exception:
+            pass
+
+    def read(self, *args):
+        raise EOFError("no interactive input in this runtime")
+
+    def readline(self, *args):
+        raise EOFError("no interactive input in this runtime")
+
+    def fileno(self):
+        raise OSError("no real file descriptor in this runtime")
+
+
+for _name in ("stdin", "stdout", "stderr"):
+    if getattr(sys, _name, None) is None:
+        setattr(sys, _name, _NullStream())
+
+
+# ---------------------------------------------------------------------------
+# Thread-aware log capture
+#
+# run_app_json_request() used contextlib.redirect_stdout(), which swaps
+# sys.stdout for the WHOLE PROCESS. That was survivable on Android because the
+# app serialised every engine call, but it means any output produced while a
+# request is in flight - the host process's own logging, or a second concurrent
+# request - is silently swallowed into the first request's buffer. The desktop
+# app polls progress while downloads run, so the capture is now filtered by
+# thread instead: each request keeps only its own lines, and everything else
+# still reaches the real console.
+# ---------------------------------------------------------------------------
+_CAPTURE_REGISTRY = {}
+_CAPTURE_LOCK = threading.Lock()
+
+
+class _ThreadFilteredStream:
+    """A stdout/stderr proxy that routes writes to the right capture buffer."""
+
+    def __init__(self, real_stream):
+        self._real = real_stream
+
+    def _buffer_for_current_thread(self):
+        """The capture buffer registered for THIS thread, or None.
+
+        Deliberately strict: output from a thread that never registered goes to
+        the real console. An earlier revision absorbed foreign writes whenever a
+        single request was in flight, which silently swallowed the host
+        process's own logging (the desktop GUI prints diagnostics while a
+        download runs). Engine worker threads opt in via inherit_capture().
+        """
+        with _CAPTURE_LOCK:
+            return _CAPTURE_REGISTRY.get(threading.get_ident())
+
+    def write(self, data):
+        buffer = self._buffer_for_current_thread()
+        target = buffer if buffer is not None else self._real
+        try:
+            return target.write(data)
+        except Exception:
+            return 0
+
+    def flush(self):
+        buffer = self._buffer_for_current_thread()
+        target = buffer if buffer is not None else self._real
+        try:
+            target.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        if self._buffer_for_current_thread() is not None:
+            return False
+        try:
+            return bool(self._real.isatty())
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def writable(self):
+        return True
+
+    @property
+    def encoding(self):
+        return getattr(self._real, "encoding", "utf-8")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _capture_thread_logs:
+    """Context manager: capture this thread's prints into a StringIO buffer."""
+
+    def __init__(self):
+        self.buffer = io.StringIO()
+        self._token = None
+        self._previous = None
+
+    def __enter__(self):
+        self._token = threading.get_ident()
+        with _CAPTURE_LOCK:
+            self._previous = _CAPTURE_REGISTRY.get(self._token)
+            _CAPTURE_REGISTRY[self._token] = self.buffer
+        return self.buffer
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        with _CAPTURE_LOCK:
+            if self._previous is None:
+                _CAPTURE_REGISTRY.pop(self._token, None)
+            else:
+                _CAPTURE_REGISTRY[self._token] = self._previous
+        return False
+
+    def text(self):
+        try:
+            return self.buffer.getvalue()
+        except Exception:
+            return ""
+
+
+def inherit_capture(target):
+    """Wrap a callable so a spawned thread logs into its parent request's buffer.
+
+    Engine worker threads (episode prefetch, quality probing, OTT lookups) print
+    lines that belong to the request which spawned them. Capture is registered
+    per thread, so the child must opt in explicitly - otherwise that output would
+    escape to the host console and vanish from the app's execution trace.
+    Returns the callable unchanged when no capture is active (plain CLI use).
+    """
+    parent_buffer = _CAPTURE_REGISTRY.get(threading.get_ident())
+    if parent_buffer is None or not callable(target):
+        return target
+
+    def wrapped(*args, **kwargs):
+        token = threading.get_ident()
+        with _CAPTURE_LOCK:
+            previous = _CAPTURE_REGISTRY.get(token)
+            _CAPTURE_REGISTRY[token] = parent_buffer
+        try:
+            return target(*args, **kwargs)
+        finally:
+            with _CAPTURE_LOCK:
+                if previous is None:
+                    _CAPTURE_REGISTRY.pop(token, None)
+                else:
+                    _CAPTURE_REGISTRY[token] = previous
+
+    return wrapped
+
+
+_REAL_STDOUT = sys.stdout
+_REAL_STDERR = sys.stderr
+if not isinstance(sys.stdout, _ThreadFilteredStream):
+    sys.stdout = _ThreadFilteredStream(_REAL_STDOUT)
+if not isinstance(sys.stderr, _ThreadFilteredStream):
+    sys.stderr = _ThreadFilteredStream(_REAL_STDERR)
 try:
     import urllib3.util.connection as urllib3_conn
     urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
@@ -529,25 +720,68 @@ def save_m3u8_stream_file(url, title, target_dir=None):
         pass
     return None
 
-def decrypt_netmirror_tv_url(encrypted_val):
-    """Decrypt AES-GCM encrypted media URL from NetMirror watchbox."""
+_AES_GCM_BACKEND = None
+_AES_GCM_WARNED = False
+
+
+def _aes_gcm_decrypt(key, nonce, ciphertext, tag):
+    """AES-256-GCM decrypt using whichever backend this runtime provides.
+
+    The original code imported Cryptodome unconditionally and swallowed every
+    failure, and it also called hashlib.sha256() while hashlib was only imported
+    locally inside handle_netmirror - so it raised NameError on the first call
+    and returned None forever, on every platform. The vendored pyaes cannot help
+    here: it implements CTR/CBC/CFB/OFB/ECB but not GCM.
+
+    The desktop build installs pycryptodomex, so encrypted NetMirror streams
+    resolve there. Where no backend exists we now say so once instead of failing
+    silently.
+    """
+    global _AES_GCM_BACKEND, _AES_GCM_WARNED
+    if _AES_GCM_BACKEND is None:
+        try:
+            from Cryptodome.Cipher import AES as _CryptoAES
+            _AES_GCM_BACKEND = ("pycryptodomex", _CryptoAES)
+        except Exception:
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+                _AES_GCM_BACKEND = ("cryptography", _AESGCM)
+            except Exception:
+                _AES_GCM_BACKEND = False
+    if _AES_GCM_BACKEND is False:
+        if not _AES_GCM_WARNED:
+            _AES_GCM_WARNED = True
+            print("[WARN] An encrypted stream needs an AES-GCM backend. Install one "
+                  "with: pip install pycryptodomex")
+        return None
+
+    name, backend = _AES_GCM_BACKEND
     try:
-        from Cryptodome.Cipher import AES
-        clean_enc = encrypted_val.replace('&encrypt=true', '').strip()
+        if name == "pycryptodomex":
+            cipher = backend.new(key, backend.MODE_GCM, nonce=nonce)
+            return cipher.decrypt_and_verify(ciphertext, tag)
+        return backend(key).decrypt(nonce, ciphertext + tag, None)
+    except Exception:
+        return None
+
+
+def decrypt_netmirror_tv_url(encrypted_val):
+    """Decrypt the AES-GCM encrypted media URL from the NetMirror watchbox."""
+    try:
+        clean_enc = str(encrypted_val).replace('&encrypt=true', '').strip()
         raw = base64.b64decode(clean_enc)
         if len(raw) < 28:
             return None
         iv = raw[:12]
         tag = raw[12:28]
         ciphertext = raw[28:]
-        for secret in [b'net###@@sss', b'NET_TV_SECRET_KEY']:
-            try:
-                key = hashlib.sha256(secret).digest()
-                cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-                decrypted = cipher.decrypt_and_verify(ciphertext, tag)
-                return decrypted.decode('utf-8')
-            except Exception:
-                continue
+        for secret in (b'net###@@sss', b'NET_TV_SECRET_KEY'):
+            decrypted = _aes_gcm_decrypt(hashlib.sha256(secret).digest(), iv, ciphertext, tag)
+            if decrypted:
+                try:
+                    return decrypted.decode('utf-8')
+                except Exception:
+                    continue
         return None
     except Exception:
         return None
@@ -599,35 +833,73 @@ def safe_move(src, dst):
 import time
 import socket
 
-def check_network():
+NETWORK_PROBE_TIMEOUT = 1.5
+NETWORK_WAIT_MAX_SECONDS = 300
+
+def check_network(timeout=NETWORK_PROBE_TIMEOUT):
     """Check internet connection by testing socket connections to reliable hosts."""
     for host, port in [("1.1.1.1", 53), ("8.8.8.8", 53), ("google.com", 80)]:
         try:
-            s = socket.create_connection((host, port), timeout=3)
+            s = socket.create_connection((host, port), timeout=timeout)
             s.close()
             return True
         except Exception:
             pass
     return False
 
-def wait_for_network():
-    """If network is down, pause and wait until connectivity is restored."""
+def wait_for_network(job_id=None, max_wait=NETWORK_WAIT_MAX_SECONDS):
+    """Block until connectivity returns, honouring cancel/pause, with a deadline.
+
+    Returns True when the network came back, False when the wait was abandoned
+    (the job was cancelled, or it was still offline after max_wait seconds).
+
+    The previous version was `while not check_network(): time.sleep(3)` - an
+    unbounded loop that inspected no job state. A dropped connection, a captive
+    portal, or any machine without a route to the probe hosts left the download
+    stuck forever, and neither Cancel nor Pause could release it. The status also
+    stayed "Downloading" the whole time, so the app looked frozen rather than
+    offline.
+    """
     if check_network():
-        return
+        return True
+
+    jid = str(job_id or get_current_job_id() or "")
     print("\n" + "!"*60)
     print(" [WARN] Network connection lost! Download paused.")
-    print(" > Waiting for internet connection to recover...")
+    print(f" > Waiting up to {int(max_wait)}s for connectivity...")
     print("!"*60, flush=True)
-    
-    down_start = time.time()
-    while not check_network():
+
+    state = ACTIVE_DOWNLOAD_PROGRESS.get(jid) if jid else None
+    if isinstance(state, dict):
+        state["status"] = "Waiting for network"
+        state["speed"] = "--"
+        state["eta"] = "--"
+
+    started = time.time()
+    while True:
+        if jid and jid in CANCELLED_DOWNLOAD_JOBS:
+            print("\n[WARN] Cancelled while waiting for the network.")
+            return False
+        if jid and jid in PAUSED_DOWNLOAD_JOBS:
+            event = PAUSE_EVENTS.get(jid)
+            if event is not None:
+                event.wait(timeout=1.0)
+                continue
+        if check_network():
+            offline_for = int(time.time() - started)
+            print("\n" + "="*60)
+            print(f" [OK] Network connection restored (was offline for {offline_for}s)!")
+            print(" > Resuming download...")
+            print("="*60, flush=True)
+            if isinstance(state, dict):
+                state["status"] = "Downloading"
+            return True
+        if time.time() - started >= max_wait:
+            print(f"\n[FAIL] Still offline after {int(time.time() - started)}s.")
+            print(" > Giving up so this download can be retried instead of hanging.")
+            return False
         time.sleep(3)
-        
-    down_duration = int(time.time() - down_start)
-    print("\n" + "="*60)
-    print(f" [OK] Network connection restored (was offline for {down_duration}s)!")
-    print(" > Resuming download...")
-    print("="*60, flush=True)
+
 
 PROGRESS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 PROGRESS_SPINNER_INDEX = 0
@@ -690,6 +962,131 @@ def cancel_download(job_id):
             ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Cancelled"
     return True
 
+def format_speed(speed):
+    """Human-readable transfer speed from bytes/second. Accepts None/0/str."""
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        return str(speed) if speed else "--"
+    if value <= 0:
+        return "--"
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.2f}MB/s"
+    if value >= 1024:
+        return f"{value / 1024:.1f}KB/s"
+    return f"{value:.0f}B/s"
+
+
+def format_eta(seconds):
+    """Human-readable remaining time from seconds. Accepts None/0/str."""
+    try:
+        value = int(float(seconds))
+    except (TypeError, ValueError):
+        return str(seconds) if seconds else "--"
+    if value <= 0:
+        return "--"
+    if value >= 3600:
+        hours, rest = divmod(value, 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    minutes, secs = divmod(value, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+QUALITY_ALIASES = {
+    '4k': ('4k', '2160p'), '2160p': ('4k', '2160p'), 'uhd': ('4k', '2160p'),
+    '2k': ('1440p',), '1440p': ('1440p',), 'qhd': ('1440p',),
+    '1080p': ('1080p',), 'fhd': ('1080p',), '720p': ('720p',),
+    '480p': ('480p',), '360p': ('360p',), '240p': ('240p',), '144p': ('144p',),
+}
+# Longest first so "2160p" wins over a stray "1080" match inside a size string.
+_QUALITY_TOKEN_RE = re.compile(r'(2160|1440|1080|720|480|360|240|144)\s*p|\b4k\b|\b2k\b|\buhd\b|\bqhd\b|\bfhd\b', re.I)
+_BEST_WORDS = ('best', 'auto', 'highest', 'default')
+
+
+QUALITY_RANK_TOKEN_RE = re.compile(r"\b(\d{3,4})\s*p?\b", re.IGNORECASE)
+
+
+def sort_quality_labels(labels):
+    """Sort front-end quality labels best-first, mirroring the APK's ranking.
+
+    MainActivity.kt does this in Kotlin (sortQualitiesDescending); the CLI never
+    needed it because its keys are already ordered. Both desktop and any future
+    front end can now share one implementation instead of re-deriving the table.
+
+    Ranking: 4k/2160 first, then descending resolution, then 'auto', then 'best'.
+    Labels with no recognisable number keep their relative order at the end.
+    """
+    if not labels:
+        return []
+
+    unique = []
+    seen = set()
+    for label in labels:
+        text = str(label).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            unique.append(text)
+
+    def score(text):
+        lowered = text.lower()
+        if "4k" in lowered or "2160" in lowered or "uhd" in lowered:
+            return 4000
+        if "2k" in lowered or "1440" in lowered or "qhd" in lowered:
+            return 1440
+        match = QUALITY_RANK_TOKEN_RE.search(text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return 0
+        if lowered.startswith("auto"):
+            return 50
+        if "best" in lowered or "highest" in lowered or "default" in lowered:
+            return 10
+        return 0
+
+    return sorted(unique, key=lambda text: (-score(text), text.lower()))
+
+
+def match_quality_key(requested, keys, infos=None):
+    """Resolve a quality string from any front end to one of the engine's keys.
+
+    The CLI sends bare keys ('1080p', '4k'). The Android app and the desktop app
+    send display labels ('1080p (Full HD)', '2160p (4K UHD)') and NetMirror hands
+    back CDN text ('1080P 2GB'). The old test was `quality_arg.lower() in k`, which
+    is backwards for every label form and silently fell through to the highest
+    quality. This accepts all of them. Returns None when nothing matches so the
+    caller keeps its own fallback. `keys` must already be sorted best-first.
+    """
+    if not requested or not keys:
+        return None
+    req = str(requested).strip().lower()
+    if any(w in req for w in _BEST_WORDS) and not _QUALITY_TOKEN_RE.search(req):
+        return keys[0]
+
+    infos = infos or {}
+    if req in keys:
+        return req
+    for key in keys:
+        label = str(infos.get(key, {}).get('label') or key).strip().lower()
+        if req == label:
+            return key
+
+    token = _QUALITY_TOKEN_RE.search(req)
+    if token:
+        raw = (token.group(1) or token.group(0)).strip().lower()
+        wanted = QUALITY_ALIASES.get(raw, QUALITY_ALIASES.get(f"{raw}p", (raw, raw + 'p')))
+        for candidate in wanted:
+            if candidate in keys:
+                return candidate
+        # A label such as "1080P (FULL HD)" also identifies the key directly.
+        for key in keys:
+            if any(candidate in key.lower() for candidate in wanted):
+                return key
+    return None
+
+
 def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--", job_id=None, downloaded_str=None):
     """Render a sleek, animated single-line progress bar guaranteed not to wrap or spam."""
     global PROGRESS_SPINNER_INDEX, CURRENT_DOWNLOAD_JOB_ID, ACTIVE_DOWNLOAD_PROGRESS
@@ -716,6 +1113,11 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
         elif str(jid) in PAUSED_DOWNLOAD_JOBS or current_status == "Paused":
             status = "Paused"
         elif current_status == "Complete":
+            status = "Complete"
+        elif pct >= 100.0 or str(total_str).strip().lower() == "complete":
+            # The last frame of a finished transfer used to report "Downloading"
+            # at 100%, so a front end polling this dict showed a full bar that
+            # still claimed to be in progress until the request returned.
             status = "Complete"
         else:
             status = "Downloading"
@@ -835,9 +1237,90 @@ def _process_progress_line(line):
     sys.stdout.write(f"\r\033[K{line}\n")
     sys.stdout.flush()
 
-def run_command_with_clean_progress(cmd):
-    """Run subprocess while processing \r and \n into clean single-line progress updates."""
+def run_command_with_clean_progress(cmd, job_id=None):
+    """Run subprocess while processing \\r and \\n into clean single-line progress updates.
+
+    This drives every external downloader (aria2c for direct files and torrents,
+    the yt-dlp binary for HLS). It previously never looked at the job-control
+    sets, so the app's Cancel button could not stop an aria2c transfer at all -
+    the subprocess ran to completion while the UI already said "Cancelled".
+    """
     p = None
+    jid = str(job_id) if job_id else get_current_job_id()
+    jid = str(jid) if jid else None
+    # Mutable so the watchdog thread and the read loop share one flag.
+    state = {"suspended": False}
+    watchdog_stop = threading.Event()
+    watchdog = None
+
+    def _job_cancelled():
+        return bool(jid) and (jid in CANCELLED_DOWNLOAD_JOBS or
+                              ACTIVE_DOWNLOAD_PROGRESS.get(jid, {}).get("status") == "Cancelled")
+
+    def _job_paused():
+        return bool(jid) and (jid in PAUSED_DOWNLOAD_JOBS or
+                              ACTIVE_DOWNLOAD_PROGRESS.get(jid, {}).get("status") == "Paused")
+
+    def _suspend(proc):
+        """Best-effort pause. POSIX can SIGSTOP a child; Windows cannot."""
+        if hasattr(signal, "SIGSTOP"):
+            try:
+                os.kill(proc.pid, signal.SIGSTOP)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _resume(proc):
+        if hasattr(signal, "SIGCONT"):
+            try:
+                os.kill(proc.pid, signal.SIGCONT)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _watchdog():
+        """Enforce cancel/pause even while the read loop is blocked.
+
+        `p.stdout.read(1)` blocks until the child writes a byte. A quiet child -
+        aria2c during a stall, yt-dlp resolving a manifest, or any command that
+        only prints at the end - therefore froze the loop above, and its cancel
+        check never ran: the app said "Cancelled" while the process kept running
+        to completion. Polling from a second thread keeps job control responsive.
+
+        select() cannot wait on pipes under Windows, so a poller is the portable
+        answer rather than a non-blocking read.
+        """
+        while not watchdog_stop.wait(0.25):
+            try:
+                if p is None or p.poll() is not None:
+                    return
+                if _job_cancelled():
+                    try:
+                        if state["suspended"]:
+                            _resume(p)
+                            state["suspended"] = False
+                        p.terminate()
+                        try:
+                            p.wait(timeout=2)
+                        except Exception:
+                            p.kill()
+                    except Exception:
+                        pass
+                    return
+                if _job_paused():
+                    if not state["suspended"]:
+                        if _suspend(p):
+                            state["suspended"] = True
+                        elif jid:
+                            ACTIVE_DOWNLOAD_PROGRESS.setdefault(jid, {})["pause_note"] = "unsupported"
+                elif state["suspended"]:
+                    if _resume(p):
+                        state["suspended"] = False
+            except Exception:
+                return
+
     try:
         p = subprocess.Popen(
             cmd,
@@ -847,8 +1330,45 @@ def run_command_with_clean_progress(cmd):
             bufsize=1,
             universal_newlines=True
         )
+        if jid:
+            watchdog = threading.Thread(target=_watchdog, name=f"arc-jobctl-{jid[:8]}", daemon=True)
+            watchdog.start()
         buf = []
         while True:
+            if _job_cancelled():
+                try:
+                    if state["suspended"]:
+                        _resume(p)
+                        state["suspended"] = False
+                    p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                sys.stdout.write("\n[STOP] Download cancelled by user.\n")
+                sys.stdout.flush()
+                return -1
+
+            if _job_paused():
+                if not state["suspended"]:
+                    state["suspended"] = _suspend(p)
+                    if not state["suspended"] and jid:
+                        # Nothing portable can freeze a Windows child process, so
+                        # report it instead of silently pretending to pause.
+                        ACTIVE_DOWNLOAD_PROGRESS.setdefault(jid, {})["pause_note"] = "unsupported"
+                if jid:
+                    evt = PAUSE_EVENTS.get(jid)
+                    if evt:
+                        evt.wait(timeout=0.5)
+                    else:
+                        time.sleep(0.5)
+                continue
+            elif state["suspended"]:
+                _resume(p)
+                state["suspended"] = False
+
             ch = p.stdout.read(1)
             if not ch:
                 if buf:
@@ -860,15 +1380,25 @@ def run_command_with_clean_progress(cmd):
                     buf = []
             else:
                 buf.append(ch)
+        if state["suspended"]:
+            _resume(p)
+            state["suspended"] = False
         p.wait()
+        if _job_cancelled():
+            sys.stdout.write("\n[STOP] Download cancelled by user.\n")
+            sys.stdout.flush()
+            return -1
         if p.returncode == 0:
-            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s")
+            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
         sys.stdout.write("\n")
         sys.stdout.flush()
         return p.returncode
     except KeyboardInterrupt:
         if p:
             try:
+                if state["suspended"]:
+                    _resume(p)
+                    state["suspended"] = False
                 p.terminate()
                 p.wait(timeout=1.5)
             except Exception:
@@ -882,6 +1412,62 @@ def run_command_with_clean_progress(cmd):
     except Exception as e:
         print(f"[FAIL] Process execution error: {e}")
         return 1
+    finally:
+        # Always stop the poller, and never leave a child suspended: a SIGSTOPed
+        # process whose parent walked away would linger forever.
+        watchdog_stop.set()
+        if p is not None:
+            try:
+                if state["suspended"]:
+                    _resume(p)
+                    state["suspended"] = False
+                if p.poll() is None and _job_cancelled():
+                    p.kill()
+            except Exception:
+                pass
+
+MAX_STREAM_RETRIES = 5
+RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 509, 520, 521, 522, 524}
+
+
+def _interruptible_sleep(seconds, job_id=None):
+    """Sleep while staying responsive to cancel and pause.
+
+    Returns False if the job was cancelled, True if the sleep completed. A plain
+    time.sleep() in a retry loop is why Cancel used to appear to do nothing: the
+    flag was only examined between chunks, never while backing off.
+    """
+    jid = str(job_id or get_current_job_id() or "")
+    deadline = time.time() + max(0.0, float(seconds))
+    while True:
+        if jid and jid in CANCELLED_DOWNLOAD_JOBS:
+            return False
+        if jid and jid in PAUSED_DOWNLOAD_JOBS:
+            event = PAUSE_EVENTS.get(jid)
+            if event is not None:
+                event.wait(timeout=0.5)
+                continue
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.25, remaining))
+
+
+def _is_retryable_stream_error(error):
+    """True when retrying could plausibly succeed.
+
+    4xx responses (other than timeouts and rate limits) mean the link itself is
+    refused - an expired CDN token, a deleted file, a missing Referer. Retrying
+    those forever only burns the user's time, which is what the old code did.
+    """
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        return True          # connection reset, DNS blip, timeout: worth a retry
+    if status in RETRYABLE_STATUS_CODES:
+        return True
+    return not (400 <= status < 500)
+
 
 def download_file_stream(url, filename, custom_headers=None, target_dir=None, cache_dir=None, job_id=None, batch_info=None):
     headers = get_stream_headers_for_url(url, {**HEADERS, **(custom_headers or {})})
@@ -899,6 +1485,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
 
     downloaded = 0
     total_bytes = 0
+    attempts = 0
     if os.path.exists(work_path):
         try:
             downloaded = os.path.getsize(work_path)
@@ -954,19 +1541,42 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                             return None
 
                         if jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
-                            pct_val = (downloaded / total_bytes * 100) if total_bytes > 0 else 0.0
-                            if batch_info:
-                                b_idx, b_tot = batch_info
-                                pct_val = round(((b_idx - 1) / b_tot) * 100.0 + (pct_val / b_tot), 1)
-                                tot_label = f"Ep {b_idx}/{b_tot} (Paused)"
-                            else:
-                                tot_label = f"{downloaded / (1024*1024):.1f}/{total_bytes / (1024*1024):.1f}MB" if total_bytes > 0 else f"{downloaded / (1024*1024):.1f}MB"
-                            render_download_progress(pct_val, tot_label, "Paused", "--", job_id=jid)
-                            evt = PAUSE_EVENTS.get(str(jid))
-                            if evt:
-                                evt.wait()
+                            # Hold on to `chunk` while paused and write it after
+                            # the resume. This branch used to `continue`, which
+                            # threw the chunk away: every paused download lost
+                            # exactly one 512 KB block and still reported
+                            # "[OK] Download complete!", producing a corrupt file
+                            # with no warning.
+                            while jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
+                                pct_val = (downloaded / total_bytes * 100) if total_bytes > 0 else 0.0
+                                if batch_info:
+                                    b_idx, b_tot = batch_info
+                                    pct_val = round(((b_idx - 1) / b_tot) * 100.0 + (pct_val / b_tot), 1)
+                                    tot_label = f"Ep {b_idx}/{b_tot} (Paused)"
+                                else:
+                                    tot_label = f"{downloaded / (1024*1024):.1f}/{total_bytes / (1024*1024):.1f}MB" if total_bytes > 0 else f"{downloaded / (1024*1024):.1f}MB"
+                                render_download_progress(pct_val, tot_label, "Paused", "--", job_id=jid)
+                                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                                    break
+                                evt = PAUSE_EVENTS.get(str(jid))
+                                if evt:
+                                    evt.wait(timeout=0.5)
+                                else:
+                                    time.sleep(0.5)
+
+                            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                                print("\n[STOP] Download cancelled by user.")
+                                try:
+                                    if os.path.exists(work_path):
+                                        os.remove(work_path)
+                                except Exception:
+                                    pass
+                                return None
+
+                            # The stall is not part of the transfer rate.
                             last_time = time.time()
-                            continue
+                            last_downloaded = downloaded
+                            smooth_speed = 0.0
 
                         if chunk:
                             f.write(chunk)
@@ -1000,13 +1610,57 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                                         render_download_progress(100.0, total_str="--", speed_str=speed_str, eta_str="--", job_id=jid, downloaded_str=f"{mb_done:.1f} MB")
                                 last_time = now
                                 last_downloaded = downloaded
+
+                # The stream ended. If the server told us how big the file is and
+                # we have fewer bytes than that, the transfer stopped early -
+                # re-enter the loop so the Range header resumes it instead of
+                # promoting a truncated file to the final name.
+                if total_bytes and downloaded < total_bytes:
+                    attempts += 1
+                    if attempts > MAX_STREAM_RETRIES:
+                        print(f"\n[FAIL] Transfer keeps stopping early at "
+                              f"{downloaded / (1024*1024):.1f} of {total_bytes / (1024*1024):.1f} MB.")
+                        return None
+                    print(f"\n[WARN] Stream ended early ({downloaded} of {total_bytes} bytes). "
+                          f"Resuming from where it stopped...", flush=True)
+                    if not _interruptible_sleep(1.0, jid):
+                        print("\n[STOP] Download cancelled.")
+                        return None
+                    continue
                 break
         except (requests.exceptions.RequestException, socket.error) as e:
+            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                print("\n[STOP] Download cancelled.")
+                return None
+
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if not _is_retryable_stream_error(e):
+                print(f"\n[FAIL] The server refused this link (HTTP {status_code}).")
+                print(" > It is expired, removed, or needs different headers - retrying will not help.")
+                print(" > The partial file is kept so a fresh link resumes where this stopped.")
+                return None
+
+            attempts += 1
+            if attempts > MAX_STREAM_RETRIES:
+                print(f"\n[FAIL] Giving up on {filename} after {MAX_STREAM_RETRIES} attempts: {e}")
+                return None
+
             if not check_network():
-                wait_for_network()
-            else:
-                print(f"\n[WARN] Network hiccup: {e}. Retrying in 3s...", flush=True)
-                time.sleep(3)
+                if not wait_for_network(job_id=jid):
+                    # Keep the .part fragment so a retry resumes rather than
+                    # restarting, and never promote a partial file to the final
+                    # destination name.
+                    print(f"[FAIL] Giving up on {filename}: network unavailable.")
+                    return None
+                attempts = 0        # connectivity is back: allow a full retry budget
+                continue
+
+            backoff = min(3 * attempts, 15)
+            hint = f"HTTP {status_code}" if status_code else "connection problem"
+            print(f"\n[WARN] Attempt {attempts}/{MAX_STREAM_RETRIES} failed ({hint}). Retrying in {backoff}s...", flush=True)
+            if not _interruptible_sleep(backoff, jid):
+                print("\n[STOP] Download cancelled.")
+                return None
 
     if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
         if os.path.exists(work_path):
@@ -1014,8 +1668,16 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
             except Exception: pass
         return None
 
-    # Move from temporary work path to destination path
+    # Move from temporary work path to destination path, but only when it is
+    # actually complete. A short file left in the cache can still be resumed;
+    # the same file renamed to its final name looks finished and is not.
     if os.path.exists(work_path):
+        final_size = os.path.getsize(work_path)
+        if total_bytes and final_size < total_bytes:
+            print(f"\n[FAIL] Incomplete download kept for resume: "
+                  f"{final_size} of {total_bytes} bytes.")
+            print(f" > Fragment: {work_path}")
+            return None
         safe_move(work_path, dest_path)
 
     sys.stdout.write("\n")
@@ -1163,13 +1825,13 @@ class NetworkAwareLogger:
         msg_l = msg.lower()
         if "retrying" in msg_l or "failed to resolve" in msg_l or "unreachable" in msg_l or "broken" in msg_l:
             if not check_network():
-                wait_for_network()
+                wait_for_network(job_id=get_current_job_id())
     def error(self, msg):
         print(f"[FAIL] {msg}", flush=True)
         msg_l = msg.lower()
         if "failed to resolve" in msg_l or "unreachable" in msg_l or "connection" in msg_l:
             if not check_network():
-                wait_for_network()
+                wait_for_network(job_id=get_current_job_id())
 
 def get_ytdlp_opts(custom_opts=None, cookie=None):
     opts = {}
@@ -1228,14 +1890,30 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
     return opts
 
 
-def download_hls_with_python(url, dest_path, headers=None):
-    """Download an HLS stream without requiring an external yt-dlp executable."""
+def download_hls_with_python(url, dest_path, headers=None, job_id=None):
+    """Download an HLS stream without requiring an external yt-dlp executable.
+
+    This is the path taken inside the APK (Chaquopy ships the yt_dlp module but
+    not the yt-dlp binary) and on any desktop without yt-dlp on PATH.
+    """
     if not HAS_YTDLP:
         return 1
+    jid = job_id or get_current_job_id()
     try:
         def progress_hook(d):
-            if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
+            if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
                 raise Exception("Download cancelled by user")
+            if jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
+                render_download_progress(0.0, "Paused", "Paused", "--", job_id=jid)
+                evt = PAUSE_EVENTS.get(str(jid))
+                while str(jid) in PAUSED_DOWNLOAD_JOBS:
+                    if str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                        raise Exception("Download cancelled by user")
+                    if evt:
+                        evt.wait(timeout=0.5)
+                    else:
+                        time.sleep(0.5)
+
             status = d.get('status')
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -1243,13 +1921,19 @@ def download_hls_with_python(url, dest_path, headers=None):
                 speed = d.get('speed') or 0
                 eta = d.get('eta') or 0
                 percent = (downloaded / total * 100) if total > 0 else 0.0
+                mb_done = downloaded / (1024 * 1024)
+                mb_total = total / (1024 * 1024) if total > 0 else 0.0
+                tot_str = f"{mb_done:.1f}/{mb_total:.1f}MB" if total > 0 else f"{mb_done:.1f}MB"
                 render_download_progress(
-                    percent=percent,
-                    speed=format_speed(speed),
-                    eta=format_eta(eta),
-                    downloaded_bytes=downloaded,
-                    total_bytes=total,
+                    percent,
+                    total_str=tot_str,
+                    speed_str=format_speed(speed),
+                    eta_str=format_eta(eta),
+                    job_id=jid,
+                    downloaded_str=f"{mb_done:.1f} MB",
                 )
+            elif status == 'finished':
+                render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
 
         options = get_ytdlp_opts({
             "format": "best",
@@ -1589,6 +2273,20 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         mux_ok = EmbeddedEngine.mux(temp_v, temp_a, staged_final)
                     except Exception as me:
                         print(f"[WARN] Native mux: {me}")
+                    if not mux_ok and shutil.which("ffmpeg"):
+                        # Desktop and CLI have no MediaMuxer, but ffmpeg does the
+                        # same job. Without this the run silently kept the video
+                        # track and threw the audio away.
+                        try:
+                            print("> Combining video and audio tracks with ffmpeg...")
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", temp_v, "-i", temp_a,
+                                 "-c", "copy", "-movflags", "+faststart", staged_final],
+                                check=True, capture_output=True,
+                            )
+                            mux_ok = os.path.exists(staged_final) and os.path.getsize(staged_final) > 0
+                        except Exception as fe:
+                            print(f"[WARN] ffmpeg mux: {fe}")
 
                 if mux_ok and os.path.exists(staged_final):
                     if cache_dir and staged_final != final_filename:
@@ -1604,14 +2302,18 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
                     return final_filename
                 elif os.path.exists(temp_v):
+                    had_audio = os.path.exists(temp_a)
                     if cache_dir and stage_dir != out_dir:
                         safe_move(temp_v, final_filename)
                         shutil.rmtree(stage_dir, ignore_errors=True)
                     else:
                         safe_move(temp_v, final_filename)
-                        if os.path.exists(temp_a):
+                        if had_audio:
                             try: os.remove(temp_a)
                             except Exception: pass
+                    if had_audio:
+                        print("[WARN] Video and audio could not be merged, so the saved file has NO SOUND.")
+                        print("       Install ffmpeg to enable merging, then download this title again.")
                     if jid:
                         render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
                     return final_filename
@@ -1702,7 +2404,9 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             print(f"\n[FAIL] Download error encountered: {err_str}")
 
             if not check_network():
-                wait_for_network()
+                if not wait_for_network(job_id=jid):
+                    print("[FAIL] Giving up: network unavailable.")
+                    return None
                 continue
 
             if "Conversion failed" in err_str or "Postprocessing" in err_str or "obu_forbidden_bit" in err_str or "Invalid data" in err_str:
@@ -1768,6 +2472,27 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
             return None
         raise e
 
+def _get_fallback_tg_creds():
+    api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
+    api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
+    session = os.environ.get("TELEGRAM_SESSION", "").strip()
+    if not (api_id and api_hash and session):
+        for p in [
+            os.path.join(os.path.dirname(__file__), "credentials.local.json"),
+            os.path.join(os.path.dirname(__file__), "assets", "credentials.local.json"),
+            os.path.expanduser("~/.telegram_credentials.json"),
+        ]:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        api_id = api_id or str(data.get("api_id", "")).strip()
+                        api_hash = api_hash or str(data.get("api_hash", "")).strip()
+                        session = session or str(data.get("session", "")).strip()
+                except Exception:
+                    pass
+    return api_id, api_hash, session
+
 def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
     print("> Detected Telegram link...")
     parsed = urllib.parse.urlparse(url)
@@ -1793,26 +2518,6 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
             if path_parts[1].isdigit():
                 msg_id = int(path_parts[1])
 
-def _get_fallback_tg_creds():
-    api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
-    api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
-    session = os.environ.get("TELEGRAM_SESSION", "").strip()
-    if not (api_id and api_hash and session):
-        for p in [
-            os.path.join(os.path.dirname(__file__), "credentials.local.json"),
-            os.path.join(os.path.dirname(__file__), "assets", "credentials.local.json"),
-            os.path.expanduser("~/.telegram_credentials.json"),
-        ]:
-            if os.path.exists(p):
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        api_id = api_id or str(data.get("api_id", "")).strip()
-                        api_hash = api_hash or str(data.get("api_hash", "")).strip()
-                        session = session or str(data.get("session", "")).strip()
-                except Exception:
-                    pass
-    return api_id, api_hash, session
 
     def load_tg_creds():
         fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
@@ -2144,7 +2849,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 return None
 
         next_prefetch_future = prefetch_executor.submit(
-            prefetch_single_ep, episodes_to_download[0][0], episodes_to_download[0][1]
+            inherit_capture(prefetch_single_ep), episodes_to_download[0][0], episodes_to_download[0][1]
         ) if episodes_to_download else None
 
         is_batch_cancelled = False
@@ -2166,7 +2871,8 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
             if idx < total_items:
                 next_s, next_ep = episodes_to_download[idx]
-                next_prefetch_future = prefetch_executor.submit(prefetch_single_ep, next_s, next_ep)
+                next_prefetch_future = prefetch_executor.submit(
+                    inherit_capture(prefetch_single_ep), next_s, next_ep)
             else:
                 next_prefetch_future = None
 
@@ -2375,32 +3081,54 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 sys.stdout.flush()
 
                 valid_qualities = {}
+                probe_health = {}
                 q_order = {'4k': 6, '2160p': 6, '1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'auto': 1}
+
                 def _probe(item):
+                    """HEAD each candidate and classify it as ok / dead / unknown.
+
+                    Previously this returned the item unchanged on every path, so
+                    nothing was ever filtered and 429 counted as healthy while the
+                    UI still printed "[OK] Verified (status 200)".
+
+                    Many CDNs answer HEAD with 403/405 while serving GET normally,
+                    so only a definitive 404/410 is treated as dead. Anything else
+                    stays 'unknown' and is still offered - hiding a working quality
+                    would be worse than listing an unverified one.
+                    """
                     q_k, q_info = item
                     chk_h = get_stream_headers_for_url(q_info['url'])
                     try:
-                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5)
-                        if chk.status_code in (200, 206, 302, 301, 429):
-                            return q_k, q_info
+                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5, allow_redirects=True)
+                        code = chk.status_code
+                        if code in (200, 206, 301, 302):
+                            return q_k, q_info, 'ok'
+                        if code in (404, 410):
+                            return q_k, q_info, 'dead'
+                        return q_k, q_info, 'unknown'
                     except Exception:
-                        pass
-                    return q_k, q_info
+                        return q_k, q_info, 'unknown'
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(qualities_dict) or 1)) as ex:
-                    for pres in ex.map(_probe, list(qualities_dict.items())):
-                        if pres:
-                            valid_qualities[pres[0]] = pres[1]
+                    for pres in ex.map(inherit_capture(_probe), list(qualities_dict.items())):
+                        q_k, q_info, health = pres
+                        probe_health[q_k] = health
+                        if health != 'dead':
+                            valid_qualities[q_k] = q_info
 
                 if valid_qualities:
-                    print("[OK] Verified (status 200)")
+                    ok_count = sum(1 for v in probe_health.values() if v == 'ok')
+                    dead_count = sum(1 for v in probe_health.values() if v == 'dead')
+                    if ok_count:
+                        print(f"[OK] {ok_count} verified live" + (f", {dead_count} dead link(s) dropped" if dead_count else ""))
+                    elif dead_count:
+                        print(f"[WARN] {dead_count} dead link(s) dropped, {len(valid_qualities)} unverified")
+                    else:
+                        print(f"[WARN] CDN refused HEAD checks; {len(valid_qualities)} candidate(s) kept")
                     sorted_q = sorted(valid_qualities.keys(), key=lambda q: q_order.get(q, 0), reverse=True)
                     chosen_q_key = None
                     if quality_arg:
-                        for k in sorted_q:
-                            if quality_arg.lower() in k:
-                                chosen_q_key = k
-                                break
+                        chosen_q_key = match_quality_key(quality_arg, sorted_q, valid_qualities)
                     if not chosen_q_key:
                         if action_mode not in ('direct_link_only', 'direct') and len(sorted_q) > 1 and sys.stdin.isatty():
                             print("\n" + "="*65)
@@ -2680,9 +3408,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             for hk, hv in stream_headers.items():
                 cmd.extend(['--add-header', f'{hk}:{hv}'])
             if shutil.which('yt-dlp'):
-                ret = run_command_with_clean_progress(cmd)
+                ret = run_command_with_clean_progress(cmd, job_id=jid)
             else:
-                ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers)
+                ret = download_hls_with_python(direct_stream_url, dest_path, stream_headers, job_id=jid)
             if ret == -1:
                 print("[WARN] Download cancelled.")
                 return None
@@ -2712,7 +3440,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             for hk, hv in stream_headers.items():
                 cmd.append(f'--header={hk}: {hv}')
             cmd.append(direct_stream_url)
-            ret = run_command_with_clean_progress(cmd)
+            ret = run_command_with_clean_progress(cmd, job_id=jid)
             if ret == -1:
                 print("[WARN] Download cancelled.")
                 return None
@@ -3248,7 +3976,7 @@ def group_and_deduplicate_results(results):
 
     # Fetch OTT providers in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        f_map = {ex.submit(get_ott_providers_for_title, g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
+        f_map = {ex.submit(inherit_capture(get_ott_providers_for_title), g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
         for f in concurrent.futures.as_completed(f_map):
             k = f_map[f]
             groups[k]['otts'] = f.result() or []
@@ -3679,9 +4407,17 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None,
             PROCESS_MONITOR.set_status("Completed (Bypassed)")
             return bypassed_path
 
-        if any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
+        if url_lower.startswith('magnet:') or url_lower.endswith('.torrent'):
+            PROCESS_MONITOR.set_status("Downloading via BitTorrent...")
+            if not shutil.which("aria2c"):
+                raise Exception("Torrent downloads need aria2c. Install it (pkg install aria2 / apt install aria2 / winget install aria2.aria2) and retry.")
+            dn = re.search(r"[?&]dn=([^&]+)", url)
+            torrent_title = out_name or (urllib.parse.unquote(dn.group(1)).replace("+", " ") if dn else "Torrent media")
+            return download_torrent(url, title=torrent_title, target_dir=target_dir, job_id=get_current_job_id())
+        elif any(nm in url_lower for nm in ['netmirror.', 'net52.cc', 'net77.cc', 'watch21.', 'watch22.']):
             PROCESS_MONITOR.set_status("Bypassing NetMirror Stream...")
-            return handle_netmirror(url, out_name=out_name, target_dir=target_dir, quality_arg=quality_arg)
+            return handle_netmirror(url, out_name=out_name, target_dir=target_dir, quality_arg=quality_arg,
+                                    **{k: v for k, v in kwargs.items() if k in ('action_mode', 'target_season', 'target_episode', 'download_scope', 'job_id', 'cache_dir')})
         elif any(tg_domain in url_lower for tg_domain in ['t.me/', 'telegram.me/', 'telegram.dog/']):
             PROCESS_MONITOR.set_status("Downloading Telegram Media...")
             return handle_telegram(url, out_name=out_name, target_dir=target_dir)
@@ -4038,7 +4774,7 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
         cmd.append(f"--select-file={file_idx}")
     cmd.append(magnet_url)
 
-    ret = run_command_with_clean_progress(cmd)
+    ret = run_command_with_clean_progress(cmd, job_id=jid)
     if ret == -1:
         print("[WARN] Torrent download cancelled.")
         return None
@@ -4495,8 +5231,40 @@ def app_download(payload):
         except Exception as e:
             print(f"[WARN] DDL bypass during download: {e}")
 
+    # Priority 0.5: BitTorrent magnet links.
+    #
+    # app_resolve() already answers a magnet with torrent_sources and
+    # can_stream=false, but app_download() had no matching branch, so the magnet
+    # fell through to "Priority 5: direct file" and download_file_stream() was
+    # handed the literal string "magnet:?xt=urn:btih:...". download_torrent() and
+    # fetch_torrent_tiers() were written but never called from anywhere.
+    if lower.startswith("magnet:") or stream_lower.startswith("magnet:"):
+        magnet = url if lower.startswith("magnet:") else stream_url
+        if not shutil.which("aria2c"):
+            raise Exception(
+                "Torrent downloads need aria2c. Install it (winget install aria2.aria2 on "
+                "Windows, pkg install aria2 on Termux, apt install aria2 on Debian) and retry."
+            )
+        torrent_title = title
+        if torrent_title in ("", "download"):
+            dn = re.search(r"[?&]dn=([^&]+)", magnet)
+            torrent_title = urllib.parse.unquote(dn.group(1)).replace("+", " ") if dn else "Torrent media"
+        file_idx = payload.get("file_idx")
+        if file_idx is None:
+            for source in (payload.get("torrent_sources") or {}).values():
+                if isinstance(source, dict) and source.get("file_idx") is not None:
+                    file_idx = source.get("file_idx")
+                    break
+        path = download_torrent(
+            magnet,
+            title=torrent_title,
+            target_dir=target_dir,
+            file_idx=file_idx,
+            job_id=CURRENT_DOWNLOAD_JOB_ID,
+        )
+
     # Priority 1: India's Got Latent
-    if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
+    elif lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
         igl_res = app_igl_resolve(url, quality=quality)
         clean_name = out_name or clean_filename(title, default_ext=".mp4")
         if not clean_name.lower().endswith(".mp4"):
@@ -4517,7 +5285,7 @@ def app_download(payload):
 
         if ".m3u8" in stream_url.lower() or "m3u8" in str(s_headers.get("Accept", "")).lower():
             print(f"> Downloading HLS stream via in-process engine: {stream_url[:70]}...")
-            ret = download_hls_with_python(stream_url, dest_path, s_headers)
+            ret = download_hls_with_python(stream_url, dest_path, s_headers, job_id=CURRENT_DOWNLOAD_JOB_ID)
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 path = dest_path
             else:
@@ -4577,7 +5345,7 @@ def app_download(payload):
 
         if ".m3u8" in target_direct.lower() or "m3u8" in str(s_headers.get("Accept", "")).lower():
             print(f"> Downloading HLS video stream via in-process engine: {target_direct[:70]}...")
-            ret = download_hls_with_python(target_direct, dest_path, s_headers)
+            ret = download_hls_with_python(target_direct, dest_path, s_headers, job_id=CURRENT_DOWNLOAD_JOB_ID)
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 path = dest_path
             else:
@@ -4695,9 +5463,9 @@ def run_app_json_request(payload):
         cancel_download(payload.get("job_id"))
         return {"ok": True, "cancelled": payload.get("job_id")}
 
-    output = io.StringIO()
+    capture = _capture_thread_logs()
     try:
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        with capture:
             if action == "search":
                 result = app_search(payload.get("query", ""), payload.get("platform", "netmirror"))
             elif action == "resolve":
@@ -4721,10 +5489,10 @@ def run_app_json_request(payload):
             else:
                 raise Exception("Unknown app action. Use capabilities, search, resolve, download, progress, or cancel.")
         
-        clean_logs = sanitize_app_logs(output.getvalue())
+        clean_logs = sanitize_app_logs(capture.text())
         return {"ok": True, "action": action, "result": result, "logs": clean_logs[-12000:]}
     except Exception as error:
-        clean_logs = sanitize_app_logs(output.getvalue())
+        clean_logs = sanitize_app_logs(capture.text())
         return {"ok": False, "action": action, "error": str(error), "logs": clean_logs[-12000:]}
 
 

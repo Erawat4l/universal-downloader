@@ -12,7 +12,7 @@ For a fresh Termux installation, paste this entire block. It also works when the
 set -eu
 
 REPO="$HOME/universal-downloader"
-BRANCH="arena/87a00d95-universal-downloader"
+BRANCH="main"
 SDK="$PREFIX/opt/android-sdk"
 
 pkg update
@@ -71,7 +71,7 @@ The block above uses POSIX shell syntax. If your Termux prompt is Fish (`➜`), 
 
 ```fish
 set REPO "$HOME/universal-downloader"
-set BRANCH "arena/87a00d95-universal-downloader"
+set BRANCH "main"
 set SDK "$PREFIX/opt/android-sdk"
 
 pkg update
@@ -143,10 +143,10 @@ The Arc builder packages the embedded engine with Python **3.12, 3.13, or 3.14**
 
 ## 2. Clone the app branch
 
-Clone the Arena branch directly so the standalone-engine changes are included:
+Clone `main` so the current engine is included:
 
 ```sh
-git clone --branch arena/87a00d95-universal-downloader --single-branch https://github.com/Erawat4l/universal-downloader.git
+git clone --branch main --single-branch https://github.com/Erawat4l/universal-downloader.git
 cd universal-downloader
 ```
 
@@ -160,7 +160,7 @@ git log -1 --oneline
 It should show:
 
 ```text
-arena/87a00d95-universal-downloader
+main
 ```
 
 ## 3. Install Android SDK 35
@@ -243,11 +243,49 @@ The first build can require significant storage and network data because it pack
 
 ```sh
 cd "$HOME/universal-downloader"
-git pull --ff-only origin arena/87a00d95-universal-downloader
+git pull --ff-only origin main
 ./android-app/build-android.sh
 ```
 
-The branch is intentionally fixed to `arena/87a00d95-universal-downloader` for this Arena session.
+The build tracks `main`, the repository's default branch, so `git pull` always brings the current engine.
+
+## 6. Build the Windows exe from the tablet
+
+The APK builds natively in Termux. **The Windows `.exe` does not** — and no Termux package changes that:
+
+- PyInstaller freezes the Python interpreter it runs under. Running it on Android produces an Android binary;
+  it has no cross-compile mode.
+- `llvm-mingw-w64` (`x86_64-w64-mingw32-clang`) genuinely builds Windows PE executables from Termux, but only
+  for C, C++, Go and Rust. It cannot turn `dl.py` plus `yt-dlp` and `pyrogram` into an exe.
+- Nuitka and cx_Freeze have the same limitation: they need a Windows toolchain and a Windows CPython.
+
+So the exe is built on a Windows machine, or by GitHub Actions — which you can trigger from the tablet, with no
+second operating system installed anywhere:
+
+```sh
+pkg install github-cli -y
+gh auth login
+
+cd ~/universal-downloader
+gh workflow run build-windows-exe.yml
+
+# watch it, then download the artifact
+gh run list --workflow build-windows-exe.yml --limit 3
+gh run watch
+gh run download --name arc-desktop-onefile --dir ~/Arc
+ls -lh ~/Arc
+```
+
+Pushing a `v*` tag does the same thing and also publishes a release:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow runs on `windows-latest`, so the tests, the headless UI self-test and the frozen exe are all
+verified on real Windows before an artifact is attached. See [`desktop-app/README.md`](desktop-app/README.md)
+for what the exe contains and why it downloads faster than the APK.
 
 ## Troubleshooting
 

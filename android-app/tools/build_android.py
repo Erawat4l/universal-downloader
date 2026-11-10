@@ -251,7 +251,7 @@ def pin_wrapper_properties(wrapper_properties: Path) -> None:
             properties = re.sub(r"^networkTimeout=.*", timeout_line, properties, flags=re.MULTILINE)
             changed = True
     else:
-        properties = properties.rstrip("\\n") + "\\n" + timeout_line + "\\n"
+        properties = properties.rstrip("\n") + "\n" + timeout_line + "\n"
         changed = True
 
     if changed:

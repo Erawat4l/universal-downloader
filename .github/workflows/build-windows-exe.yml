@@ -1,0 +1,224 @@
+name: Build Windows exe
+
+# Builds Arc.exe from the repository's dl.py engine and publishes it as a
+# workflow artifact (and, on a tag, as a GitHub release asset).
+#
+# Trigger it from anywhere - including a tablet - with:
+#   gh workflow run build-windows-exe.yml
+# or by pushing a tag:
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# A Windows .exe cannot be cross-compiled: PyInstaller freezes the CPython it
+# runs under, so this must execute on windows-latest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      layout:
+        description: "Build layout"
+        required: true
+        default: "both"
+        type: choice
+        options: [both, onefile, onedir]
+  push:
+    tags: ["v*"]
+    paths-ignore: ["**.md"]
+  pull_request:
+    paths:
+      - "dl.py"
+      - "igl.py"
+      - "desktop-app/**"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  contents: write      # needed to attach assets to a release on tag push
+
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify engine and UI
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: desktop-app/requirements.txt
+
+      - name: Install dependencies
+        working-directory: desktop-app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Byte-compile the engine
+        run: python -m py_compile dl.py igl.py
+
+      - name: Engine regression tests
+        run: python tests/test_engine_regressions.py
+
+      - name: Desktop core tests
+        working-directory: desktop-app
+        run: python ../tests/test_desktop_core.py
+
+      - name: Headless UI self-test
+        working-directory: desktop-app
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m arc_desktop --selftest
+
+      - name: Confirm the APK engine copies still match the root
+        run: |
+          $pairs = @(
+            @("dl.py",  "android-app/app/src/main/python/dl.py"),
+            @("igl.py", "android-app/app/src/main/python/igl.py")
+          )
+          foreach ($pair in $pairs) {
+            $root = Get-FileHash $pair[0] -Algorithm SHA256
+            $copy = Get-FileHash $pair[1] -Algorithm SHA256
+            if ($root.Hash -ne $copy.Hash) {
+              Write-Host "::warning::$($pair[1]) is out of sync with $($pair[0])."
+              Write-Host "::warning::Run 'python android-app/tools/build_android.py' to re-sync before building the APK."
+            } else {
+              Write-Host "$($pair[1]) matches $($pair[0])"
+            }
+          }
+
+  build:
+    name: Freeze ${{ matrix.layout }}
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        layout: [onefile, onedir]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: desktop-app/requirements.txt
+
+      - name: Install dependencies
+        working-directory: desktop-app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.6"
+
+      - name: Install accelerators so the build reports them
+        run: |
+          # Not strictly required - the app works without them - but bundling
+          # nothing means Settings shows 1x connections on a fresh install.
+          choco install aria2 ffmpeg -y --no-progress
+          aria2c --version | Select-Object -First 1
+          ffmpeg -version  | Select-Object -First 1
+        continue-on-error: true
+
+      - name: Build
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
+        working-directory: desktop-app
+        run: python build_exe.py --skip-checks --${{ matrix.layout }}
+
+      - name: Smoke-test the frozen exe
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
+        working-directory: desktop-app
+        run: |
+          $exe = if ("${{ matrix.layout }}" -eq "onefile") { "dist\Arc.exe" } else { "dist\Arc\Arc.exe" }
+          if (-not (Test-Path $exe)) { throw "Build produced no exe at $exe" }
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host ("{0} -> {1:N1} MB" -f $exe, $size)
+          # Launch it, give the windowed process time to unpack, then confirm it
+          # is alive and shut it down. A crash-on-start would exit by itself.
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 45
+          if ($proc.HasExited) {
+            throw "Arc.exe exited during startup with code $($proc.ExitCode)"
+          }
+          Write-Host "Arc.exe is running (pid $($proc.Id))"
+          Stop-Process -Id $proc.Id -Force
+
+      - name: Package
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
+        working-directory: desktop-app
+        run: |
+          if ("${{ matrix.layout }}" -eq "onefile") {
+            Copy-Item dist\Arc.exe Arc-windows-x64.exe
+          } else {
+            Compress-Archive -Path dist\Arc\* -DestinationPath Arc-windows-x64-portable.zip -Force
+          }
+
+      - name: Upload artifact
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-desktop-${{ matrix.layout }}
+          path: |
+            desktop-app/Arc-windows-x64.exe
+            desktop-app/Arc-windows-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Write release notes
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          cat > notes.md <<EOF
+          ## Arc Desktop ${tag}
+
+          Windows build of the same engine as the Arc APK.
+
+          | File | Use it when |
+          |---|---|
+          | \`Arc-windows-x64.exe\` | you want one file to double-click or share |
+          | \`Arc-windows-x64-portable.zip\` | you want the fastest startup (unzip anywhere) |
+
+          For full download speed also install:
+
+          \`\`\`bat
+          winget install aria2.aria2
+          winget install Gyan.FFmpeg
+          \`\`\`
+          EOF
+
+      - name: Create the release, or add assets if it already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          files=$(find artifacts -type f \( -name '*.exe' -o -name '*.zip' \) | tr '\n' ' ')
+          if [ -z "$files" ]; then
+            echo "::error::No .exe or .zip artifacts were produced."
+            exit 1
+          fi
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release $tag already exists; uploading assets."
+            gh release upload "$tag" $files --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "$tag" $files \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Arc Desktop ${tag}" \
+              --notes-file notes.md
+          fi

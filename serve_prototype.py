@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 REPO_ROOT = Path(__file__).resolve().parent
 GITHUB_OWNER = "Erawat4l"
 GITHUB_REPO = "universal-downloader"
-GITHUB_BRANCH = "master"
+GITHUB_BRANCH = "main"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 
 CAPABILITIES = {
@@ -105,7 +105,10 @@ def update_status():
     release, release_error = github_json("/releases/latest")
 
     remote_sha = (remote_commit or {}).get("sha", "")
-    message = ((remote_commit or {}).get("commit") or {}).get("message", "").splitlines()[0]
+    # splitlines() on an empty string returns [], so [0] raised IndexError and
+    # /api/update/check died with an empty reply whenever GitHub 404'd.
+    message = (((remote_commit or {}).get("commit") or {}).get("message", "") or "").splitlines()
+    message = message[0] if message else ""
     commit_url = (remote_commit or {}).get("html_url", f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{GITHUB_BRANCH}")
 
     apk_asset = None
