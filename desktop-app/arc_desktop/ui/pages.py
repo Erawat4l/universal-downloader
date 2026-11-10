@@ -109,13 +109,13 @@ class HomePage(QWidget):
         hero = QVBoxLayout()
         hero.setContentsMargins(2, 6, 2, 0)
         hero.setSpacing(5)
-        hero.addWidget(label("Universal Downloader", "ScreenTitle"))
-        hero.addWidget(label("Download and stream media at full speed on your PC", "ScreenSubtitle"))
+        hero.addWidget(label("Paste a link or search", "ScreenTitle"))
+        hero.addWidget(label("Download and stream media directly on your PC", "ScreenSubtitle"))
         scroll.add_layout(hero)
 
         input_card, input_layout = card("vertical", 10)
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Paste a link, or type a movie / series / song name")
+        self.input_field.setPlaceholderText("Link or search")
         self.input_field.setClearButtonEnabled(True)
         self.input_field.returnPressed.connect(self._submit)
         input_layout.addWidget(self.input_field)
@@ -134,11 +134,6 @@ class HomePage(QWidget):
         button_row.addWidget(self.analyze_button, 1)
         input_layout.addLayout(button_row)
 
-        hints = QLabel("Supports YouTube and 1000+ sites \u00b7 NetMirror movies and series \u00b7 "
-                       "Telegram \u00b7 magnets \u00b7 MediaFire / Terabox \u00b7 study PDFs")
-        hints.setObjectName("MetaDim")
-        hints.setWordWrap(True)
-        input_layout.addWidget(hints)
         scroll.add(input_card)
 
         self.recent_header = SectionHeader("Recent Downloads", "See Library")
@@ -838,6 +833,7 @@ class SettingsPage(QWidget):
     check_updates_requested = Signal()
     open_release_requested = Signal()
     scan_requested = Signal()
+    install_requested = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -850,7 +846,7 @@ class SettingsPage(QWidget):
         head.setContentsMargins(2, 0, 2, 0)
         head.setSpacing(4)
         head.addWidget(label("Settings", "ScreenTitle"))
-        head.addWidget(label("Preferences, accelerators and integrations", "ScreenSubtitle"))
+        head.addWidget(label("Preferences", "ScreenSubtitle"))
         self._scroll.add_layout(head)
 
         # ---------------------------------------------------------- downloads
@@ -921,7 +917,7 @@ class SettingsPage(QWidget):
         self._scroll.add(self._group("Integrations"))
         tg_card, tg_layout = card("vertical", 9, 14, "Card")
         tg_layout.addWidget(label("Telegram Session (MTProto)", "SectionHeader"))
-        tg_layout.addWidget(label("Needed for private channels. Stored only on this PC.", "Meta"))
+        tg_layout.addWidget(label("Private channel access", "Meta"))
         self.tg_id = QLineEdit()
         self.tg_id.setPlaceholderText("API ID (numeric)")
         self.tg_hash = QLineEdit()
@@ -1019,62 +1015,45 @@ class SettingsPage(QWidget):
         self._accel_rows.clear()
 
         parallel = int(environment.get("parallel_connections", 1))
-        headline = QLabel(
-            f"{parallel}\u00d7 parallel connections" if parallel > 1
-            else "1\u00d7 connection \u2014 install aria2c for 16\u00d7"
-        )
-        headline.setStyleSheet(
-            f"font-size: 14px; font-weight: 800;"
-            f" color: {theme.ARC_WHITE if parallel > 1 else theme.ARC_WARNING};"
-        )
+        headline = QLabel(f"{parallel}\u00d7 connections")
+        headline.setStyleSheet(f"font-size: 14px; font-weight: 800; color: {theme.ARC_WHITE};")
         self.accel_layout.insertWidget(0, headline)
         self._accel_rows.append(headline)
 
         accelerators = environment.get("accelerators", {}) or {}
         rows = [
-            ("aria2c", accelerators.get("aria2c"),
-             "16-connection downloads (the APK cannot do this)"),
-            ("ffmpeg", accelerators.get("ffmpeg"),
-             "Merges separate HD video + audio tracks"),
-            ("yt-dlp", accelerators.get("yt-dlp"),
-             "Optional standalone binary; the bundled module already works"),
-            ("VLC", environment.get("vlc"), "Instant streaming in a real player"),
+            ("aria2c", accelerators.get("aria2c"), "16-connection downloads"),
+            ("ffmpeg", accelerators.get("ffmpeg"), "HD audio/video merge"),
+            ("VLC", environment.get("vlc"), "External stream player"),
         ]
         for name, path, purpose in rows:
             row = QWidget()
             layout = QHBoxLayout(row)
             layout.setContentsMargins(0, 2, 0, 2)
-            layout.setSpacing(9)
-            state = QLabel("\u2713" if path else "\u2715")
-            state.setFixedWidth(14)
-            state.setStyleSheet(
-                f"color: {theme.ARC_SUCCESS if path else theme.ARC_ERROR};"
-                f" font-size: 12px; font-weight: 800;"
-            )
-            column = QVBoxLayout()
-            column.setContentsMargins(0, 0, 0, 0)
-            column.setSpacing(1)
-            name_label = QLabel(f"{name} \u2014 {'found' if path else 'not installed'}")
-            name_label.setStyleSheet("font-size: 12px; font-weight: 600;")
+            layout.setSpacing(10)
+            name_label = QLabel(name)
+            name_label.setStyleSheet("font-size: 12px; font-weight: 700;")
             purpose_label = QLabel(purpose)
             purpose_label.setObjectName("MetaDim")
-            column.addWidget(name_label)
-            column.addWidget(purpose_label)
-            layout.addWidget(state, 0, Qt.AlignTop)
-            layout.addLayout(column, 1)
+            layout.addWidget(name_label)
+            layout.addWidget(purpose_label, 1)
+            if path:
+                status = QLabel("Installed")
+                status.setObjectName("MetaDim")
+                layout.addWidget(status)
+            else:
+                install = QPushButton("Install")
+                install.setObjectName("Ghost")
+                install.setCursor(Qt.PointingHandCursor)
+                install.clicked.connect(lambda _=False, key=name.lower(): self.install_requested.emit(key))
+                layout.addWidget(install)
             self.accel_layout.addWidget(row)
             self._accel_rows.append(row)
 
         self.about_engine.setText(
-            f"Engine: {environment.get('engine_path', '?')}\n"
-            f"Loaded in {environment.get('engine_load_seconds', 0)}s \u00b7 "
-            f"Python {environment.get('python', '?')} \u00b7 "
-            f"{'frozen exe' if environment.get('frozen') else 'source run'}"
+            f"Arc {environment.get('python', '')} \u00b7 {environment.get('engine_load_seconds', 0)}s"
         )
-        self.quality_note.setText(
-            "Defaults apply when a resolved title offers that exact quality. Otherwise the "
-            "highest available is used."
-        )
+        self.quality_note.setText("Used automatically when available.")
 
     def set_telegram(self, api_id: str, api_hash: str, session: str) -> None:
         self.tg_id.setText(api_id or "")

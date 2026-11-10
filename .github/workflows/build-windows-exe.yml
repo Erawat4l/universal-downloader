@@ -13,13 +13,6 @@ name: Build Windows exe
 
 on:
   workflow_dispatch:
-    inputs:
-      layout:
-        description: "Build layout"
-        required: true
-        default: "both"
-        type: choice
-        options: [both, onefile, onedir]
   push:
     tags: ["v*"]
     paths-ignore: ["**.md"]
@@ -92,17 +85,13 @@ jobs:
           }
 
   build:
-    name: Freeze ${{ matrix.layout }}
+    name: Freeze single-file exe
     needs: verify
     # Public-repository Actions minutes are free. Build on PRs too, so each
     # proposed desktop change gets a real frozen Windows exe and startup test.
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        layout: [onefile, onedir]
     steps:
       - uses: actions/checkout@v4
 
@@ -130,15 +119,13 @@ jobs:
         continue-on-error: true
 
       - name: Build
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
         working-directory: desktop-app
-        run: python build_exe.py --skip-checks --${{ matrix.layout }}
+        run: python build_exe.py --skip-checks --onefile
 
       - name: Smoke-test the frozen exe
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
         working-directory: desktop-app
         run: |
-          $exe = if ("${{ matrix.layout }}" -eq "onefile") { "dist\Arc.exe" } else { "dist\Arc\Arc.exe" }
+          $exe = "dist\Arc.exe"
           if (-not (Test-Path $exe)) { throw "Build produced no exe at $exe" }
           $size = (Get-Item $exe).Length / 1MB
           Write-Host ("{0} -> {1:N1} MB" -f $exe, $size)
@@ -160,23 +147,14 @@ jobs:
           Write-Host "Frozen Arc self-test passed (exit code 0)"
 
       - name: Package
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
         working-directory: desktop-app
-        run: |
-          if ("${{ matrix.layout }}" -eq "onefile") {
-            Copy-Item dist\Arc.exe Arc-windows-x64.exe
-          } else {
-            Compress-Archive -Path dist\Arc\* -DestinationPath Arc-windows-x64-portable.zip -Force
-          }
+        run: Copy-Item dist\Arc.exe Arc-windows-x64.exe
 
       - name: Upload artifact
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.layout == 'both' || inputs.layout == matrix.layout }}
         uses: actions/upload-artifact@v4
         with:
-          name: arc-desktop-${{ matrix.layout }}
-          path: |
-            desktop-app/Arc-windows-x64.exe
-            desktop-app/Arc-windows-x64-portable.zip
+          name: arc-desktop-onefile
+          path: desktop-app/Arc-windows-x64.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -202,8 +180,7 @@ jobs:
 
           | File | Use it when |
           |---|---|
-          | \`Arc-windows-x64.exe\` | you want one file to double-click or share |
-          | \`Arc-windows-x64-portable.zip\` | you want the fastest startup (unzip anywhere) |
+          | \`Arc-windows-x64.exe\` | single-file Windows app |
 
           For full download speed also install:
 

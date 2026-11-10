@@ -1158,7 +1158,7 @@ private fun ArcApp(
                 currentTrace = CliTrace(
                     action = "Direct file",
                     target = target.title,
-                    durationSeconds = 0.0,
+                    durationSeconds = 0f,
                     steps = listOf("Direct download link detected", "[OK] Ready to download as a file"),
                     stdoutLogs = "No stream resolution needed.",
                     status = "Completed",

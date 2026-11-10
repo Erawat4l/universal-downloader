@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QProcess
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self.current_query: str = ""
         self.download_scope: str = "episode"
         self._think_started_at: float = 0.0
+        self._installer_processes: list[QProcess] = []
 
         self.signals = _WorkerSignals(self)
         self.signals.done.connect(self._on_engine_result)
@@ -220,6 +221,7 @@ class MainWindow(QMainWindow):
         settings.check_updates_requested.connect(self.check_for_updates)
         settings.open_release_requested.connect(self.open_releases_page)
         settings.scan_requested.connect(self._refresh_library)
+        settings.install_requested.connect(self.install_accelerator)
 
         settings.set_defaults(
             str(self.store.get("default_video_quality", "Ask each time")),
@@ -898,6 +900,44 @@ class MainWindow(QMainWindow):
         self.settings_page.set_download_path(folder)
         self._refresh_library()
         self.notify(f"Downloads now save to {folder}")
+
+    def install_accelerator(self, key: str) -> None:
+        packages = {
+            "aria2c": ("aria2.aria2", "aria2"),
+            "ffmpeg": ("Gyan.FFmpeg", "ffmpeg"),
+            "vlc": ("VideoLAN.VLC", "VLC"),
+        }
+        package = packages.get(key.lower())
+        if package is None:
+            return
+        package_id, display = package
+        process = QProcess(self)
+        self._installer_processes.append(process)
+        args = ["install", "--id", package_id, "--exact", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements"]
+        process.finished.connect(
+            lambda code, _status, proc=process, title=display:
+            self._installer_finished(proc, title, code))
+        process.errorOccurred.connect(
+            lambda _error, proc=process: self._installer_failed(proc))
+        process.start("winget", args)
+        self.notify(f"Installing {display}...")
+
+    def _installer_finished(self, process: QProcess, display: str, code: int) -> None:
+        if process in self._installer_processes:
+            self._installer_processes.remove(process)
+        process.deleteLater()
+        self.settings_page.set_environment(self.bridge.environment())
+        if code == 0:
+            self.notify(f"{display} installed. Restart Arc if it still shows missing.")
+        else:
+            self.notify(f"Could not install {display}; check Windows Package Manager.")
+
+    def _installer_failed(self, process: QProcess) -> None:
+        if process in self._installer_processes:
+            self._installer_processes.remove(process)
+        process.deleteLater()
+        self.notify("winget is not available on this Windows installation.")
 
     def save_telegram_credentials(self, api_id: str, api_hash: str, session: str) -> None:
         self.store.update({"telegram_api_id": api_id, "telegram_api_hash": api_hash,
