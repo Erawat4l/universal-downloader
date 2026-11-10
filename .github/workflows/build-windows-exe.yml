@@ -21,16 +21,8 @@ on:
         type: choice
         options: [both, onefile, onedir]
   push:
-    # One push block: tags publish a release. The branch entry is TEMPORARY - it
-    # lets this branch prove the freeze before the first tagged release, and
-    # should be removed afterwards.
     tags: ["v*"]
-    branches: ["arena/c48518ae-universal-downloader"]
-    paths:
-      - "dl.py"
-      - "igl.py"
-      - "desktop-app/**"
-      - ".github/workflows/build-windows-exe.yml"
+    paths-ignore: ["**.md"]
   pull_request:
     paths:
       - "dl.py"
@@ -105,12 +97,7 @@ jobs:
     # Freezing takes tens of minutes, so it runs on an explicit request or a tag -
     # not on every pull request, where `verify` alone already proves the engine,
     # the desktop core and the headless UI all still work.
-    # The last clause is TEMPORARY: it lets this branch prove the freeze before
-    # the first tagged release. Remove it once verified.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/v') ||
-      github.ref == 'refs/heads/arena/c48518ae-universal-downloader'
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
