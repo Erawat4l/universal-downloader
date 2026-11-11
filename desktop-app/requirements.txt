@@ -1,0 +1,35 @@
+# Arc Desktop runtime requirements.
+#
+# Install with:  python -m pip install -r requirements.txt
+#
+# The engine (dl.py) is the single source of truth shared with the CLI and the
+# APK, so its dependencies are listed here too. Everything except PySide6 and
+# pycryptodomex mirrors android-app/app/build.gradle.kts's pip{} block.
+
+# --- GUI -------------------------------------------------------------------
+PySide6>=6.6,<6.9          # Qt for Python: widgets, network (posters), SVG
+
+# --- engine: core ----------------------------------------------------------
+requests>=2.31
+beautifulsoup4>=4.12
+urllib3>=1.26,<3
+
+# --- engine: media extraction ---------------------------------------------
+yt-dlp>=2024.10.7          # YouTube and 1000+ sites
+
+# --- engine: Telegram (private channels) -----------------------------------
+pyrogram==2.0.106          # pinned: matches the APK exactly
+tgcrypto>=1.2.5            # optional C accelerator for pyrogram
+
+# --- engine: NetMirror AES-GCM stream decryption ---------------------------
+# The APK ships neither, so it cannot decrypt these streams at all. Having one
+# of the two is enough; pycryptodomex is preferred and installed first.
+pycryptodomex>=3.19
+cryptography>=41.0
+
+# --- engine: DDL bypass (MediaFire / Terabox / Drive) ----------------------
+# Vendored in the repository, installed from the local path by install_runtime.bat:
+#   python-vendor/  (pyaes and the bypasser package)
+
+# --- packaging (only needed to build the .exe) -----------------------------
+pyinstaller>=6.6
