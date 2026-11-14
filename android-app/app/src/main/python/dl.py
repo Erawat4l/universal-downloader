@@ -566,12 +566,64 @@ def decrypt_netmirror_tv_url(encrypted_val):
 def clean_filename(title, default_ext=""):
     title = re.sub(r'[\\/*?:"<>|\'’`"｜#%&{}\\<>*?/$!\'":@+`|=]', '', str(title or ""))
     title = re.sub(r'[\x00-\x1f\x7f]', '', title)
-    title = re.sub(r'\s+', '_', title).strip('_. ')
+    title = re.sub(r'[\s_]+', ' ', title).strip('_. ')
+    base, ext = os.path.splitext(title)
+    # Strip format tags like .f137, .f398, .part
+    base = re.sub(r'[\._-]f\d+$', '', base, flags=re.I).strip()
+    # Strip YouTube IDs like [hpwAMSaB28c] or (hpwAMSaB28c)
+    base = re.sub(r'\s*\[[a-zA-Z0-9_-]{11}\]$', '', base).strip()
+    base = re.sub(r'\s*\([a-zA-Z0-9_-]{11}\)$', '', base).strip()
+    # Strip version suffixes like _v1, v2, (v1), [v1]
+    base = re.sub(r'[\s._-]+(v\d+|\bv\d+\b|f\d+|part\d+)$', '', base, flags=re.I).strip()
+    base = re.sub(r'\s*[\(\[]v\d+[\)\]]$', '', base, flags=re.I).strip()
+    if ext:
+        title = base + ext
+    else:
+        title = base
     if not title:
         title = "downloaded_file"
     if default_ext and not os.path.splitext(title)[1]:
         title += default_ext
     return title
+
+def _cleanup_download_cache(cache_dir, target_dir, job_id=None, keep_path=None):
+    """Purge all temporary fragment files, .part, .ytdl, and staging folders so ONLY the final downloaded media file remains."""
+    jid_str = str(job_id or "").strip()
+    keep_norm = os.path.abspath(keep_path) if keep_path else None
+
+    # Clean cache directory if specified
+    if cache_dir and os.path.exists(cache_dir):
+        try:
+            for item in os.listdir(cache_dir):
+                item_path = os.path.join(cache_dir, item)
+                if item_path == keep_norm:
+                    continue
+                if (jid_str and jid_str in item) or item.endswith(('.part', '.ytdl', '.aria2', '.temp')) or item.startswith(('.temp', '.arc_stage', 'ytdl_raw')):
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
+                    else:
+                        try: os.remove(item_path)
+                        except Exception: pass
+        except Exception:
+            pass
+
+    # Clean target directory of any left-over stage dirs, temp files or fragment parts
+    if target_dir and os.path.exists(target_dir):
+        try:
+            for item in os.listdir(target_dir):
+                item_path = os.path.join(target_dir, item)
+                if item_path == keep_norm:
+                    continue
+                if (jid_str and jid_str in item and item.startswith(('.temp', '.arc_stage', 'ytdl_raw'))) or \
+                   item.endswith(('.part', '.ytdl', '.aria2', '.temp')) or \
+                   re.search(r'[\._-]f\d+\.(mp4|m4a|webm|part)$', item, re.I):
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
+                    else:
+                        try: os.remove(item_path)
+                        except Exception: pass
+        except Exception:
+            pass
 
 def get_dest_path(filename, target_dir=None):
     out_dir = target_dir or DEFAULT_DIR
@@ -1538,41 +1590,34 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         playlist_dir = os.path.join(out_dir, p_title)
         os.makedirs(playlist_dir, exist_ok=True)
         out_dir = playlist_dir
-    elif standalone:
-        if is_audio_only:
-            format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+        outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
+    else:
+        if out_name and not any(out_name.lower().startswith(p) for p in ('youtube video', 'video', 'download', 'stream')):
+            clean_base = clean_filename(out_name, default_ext="")
+            outtmpl_pattern = os.path.join(out_dir, f"{clean_base}.%(ext)s")
         else:
-            q_text = str(quality_arg or "").lower()
-            q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
-            if q_match:
-                cap = int(q_match.group(1))
-                if cap <= 360:
-                    format_spec = f"best[height<={cap}][vcodec!=none][acodec!=none]/bestvideo[height<={cap}]+bestaudio/best[height<={cap}]/best"
-                else:
-                    format_spec = (
-                        f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
-                        f"bestvideo[height<={cap}][ext=webm]+bestaudio[ext=webm]/"
-                        f"bestvideo[height<={cap}]+bestaudio/"
-                        f"bestvideo[height<={cap}]/best[height<={cap}]"
-                    )
-            else:
-                format_spec = (
-                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                    "bestvideo[ext=webm]+bestaudio[ext=webm]/"
-                    "bestvideo+bestaudio/best"
-                )
-        print(f"> Android YouTube: downloading target quality [{format_spec}]...")
-    else:
-        format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+            outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
 
-    if cache_dir:
-        ytdl_stage = os.path.join(cache_dir, f"ytdl_raw_{jid}")
+    if is_audio_only:
+        format_spec = "bestaudio[ext=m4a]/bestaudio/best"
     else:
-        ytdl_stage = os.path.join(out_dir, f".arc_stage_{jid}")
-    os.makedirs(ytdl_stage, exist_ok=True)
-    outtmpl_pattern = os.path.join(ytdl_stage, '%(title)s.%(ext)s')
+        q_text = str(quality_arg or "").lower()
+        q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
+        if q_match:
+            cap = int(q_match.group(1))
+            format_spec = (
+                f"best[height<={cap}][vcodec!=none][acodec!=none]/"
+                f"best[vcodec!=none][acodec!=none]/"
+                f"best[height<={cap}]/"
+                f"best"
+            )
+        else:
+            format_spec = (
+                "best[vcodec!=none][acodec!=none]/"
+                "best"
+            )
 
-    print(f"> Downloading video via yt-dlp [{format_spec}]...")
+    print(f"> Direct YouTube download [{format_spec}]...")
     ydl_opts = get_ytdlp_opts({
         'format': format_spec,
         'outtmpl': outtmpl_pattern,
@@ -1581,19 +1626,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'progress_hooks': [ytdlp_progress_hook],
         'extractor_args': {'youtube': {'player_client': ['visionos', 'android'], 'skip': ['webpage', 'configs']}},
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
+        'nopart': True,
     }, cookie=cookie)
-    
-    if is_audio_only and not standalone:
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    elif not standalone:
-        ydl_opts['merge_output_format'] = 'mp4'
-        if shutil.which("aria2c"):
-            ydl_opts['external_downloader'] = 'aria2c'
-            ydl_opts['external_downloader_args'] = {'aria2c': ['-s', '16', '-x', '16', '-k', '1M', '--console-log-level=warn']}
 
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
@@ -1610,50 +1644,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                     filename = ydl.prepare_filename(info)
 
                 if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                    if ytdl_stage and os.path.exists(ytdl_stage):
-                        shutil.rmtree(ytdl_stage, ignore_errors=True)
+                    if filename and os.path.exists(filename):
+                        try: os.remove(filename)
+                        except Exception: pass
                     return None
 
-                if ytdl_stage and os.path.exists(ytdl_stage):
-                    stage_files = [fn for fn in os.listdir(ytdl_stage) if not fn.endswith(('.part', '.ytdl'))]
-                    v_cands = [fn for fn in stage_files if any(fn.lower().endswith(ext) for ext in ['.mp4', '.webm', '.mkv']) and not any(a_tag in fn.lower() for a_tag in ['.m4a', '.opus', '.f140', '.f251', '.f250', '.f249'])]
-                    a_cands = [fn for fn in stage_files if any(fn.lower().endswith(ext) for ext in ['.m4a', '.opus', '.mp3', '.aac']) or any(a_tag in fn.lower() for a_tag in ['.f140', '.f251', '.f250', '.f249'])]
+                # Ensure clean filename (strip random IDs in brackets, format tags, version suffixes)
+                if filename and os.path.exists(filename) and os.path.isfile(filename):
+                    cur_dir, cur_fn = os.path.split(filename)
+                    cleaned_fn = clean_filename(cur_fn)
+                    if cleaned_fn != cur_fn:
+                        cleaned_path = os.path.join(cur_dir, cleaned_fn)
+                        safe_move(filename, cleaned_path)
+                        filename = cleaned_path
 
-                    if v_cands and a_cands and not is_playlist:
-                        v_file = os.path.join(ytdl_stage, v_cands[0])
-                        a_file = os.path.join(ytdl_stage, a_cands[0])
-                        clean_base = clean_filename(out_name or info.get('title') or 'video')
-                        clean_ext = '.webm' if (v_cands[0].endswith('.webm') and a_cands[0].endswith(('.webm', '.opus'))) else '.mp4'
-                        merged_target = os.path.join(out_dir, clean_base + clean_ext)
-                        print(f"> Merging separate video and audio into single {clean_ext}...")
-                        mux_ok = mux_video_and_audio(v_file, a_file, merged_target)
-                        if mux_ok:
-                            filename = merged_target
-                        else:
-                            target_fp = os.path.join(out_dir, clean_filename(v_cands[0]))
-                            safe_move(v_file, target_fp)
-                            filename = target_fp
-                    else:
-                        for fn in stage_files:
-                            fp = os.path.join(ytdl_stage, fn)
-                            clean_fn = clean_filename(fn)
-                            target_fp = os.path.join(out_dir, clean_fn)
-                            safe_move(fp, target_fp)
-                            if not is_playlist:
-                                filename = target_fp
-                    shutil.rmtree(ytdl_stage, ignore_errors=True)
-
-                base, ext = os.path.splitext(filename)
-                if is_audio_only and not standalone:
-                    mp3_file = base + ".mp3"
-                    if not os.path.exists(mp3_file) and os.path.exists(filename):
-                        try:
-                            subprocess.run(["ffmpeg", "-y", "-i", filename, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_file], check=True, capture_output=True)
-                            filename = mp3_file
-                        except Exception:
-                            pass
-                    elif os.path.exists(mp3_file):
-                        filename = mp3_file
+                # Purge any transient cache or fragment parts
+                _cleanup_download_cache(cache_dir, out_dir, job_id=jid, keep_path=filename)
                 sync_to_sdcard_if_needed(filename)
                 print_adm_link(filename)
             if jid:
@@ -1957,6 +1963,8 @@ def _get_fallback_tg_creds():
 
     raise Exception("Could not download Telegram link media.")
 
+_NETMIRROR_META_CACHE = {}
+
 def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None, download_scope="episode", job_id=None, cache_dir=None):
     jid = job_id or get_current_job_id()
     if direct_link_only:
@@ -2001,23 +2009,28 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     }
 
     results = []
-    hosts_to_try = ['api2.imdb4.shop', 'api2.imdb3.shop']
-    types_to_try = list(dict.fromkeys([media_type, 'tv', 'series', 'movie']))
-    for h in hosts_to_try:
-        for m_type in types_to_try:
-            try:
-                api_url = f'https://{h}/api/{m_type}/{media_id}'
-                res = requests.get(api_url, headers=headers, timeout=8)
-                if res.status_code == 200:
-                    data = res.json()
-                    results = data.get('results', [])
-                    if results:
-                        media_type = m_type
-                        break
-            except Exception:
-                continue
-        if results:
-            break
+    if media_id in _NETMIRROR_META_CACHE:
+        results = _NETMIRROR_META_CACHE[media_id].get("results", [])
+        media_type = _NETMIRROR_META_CACHE[media_id].get("media_type", media_type)
+    else:
+        hosts_to_try = ['api2.imdb4.shop', 'api2.imdb3.shop']
+        types_to_try = list(dict.fromkeys([media_type, 'tv', 'series', 'movie']))
+        for h in hosts_to_try:
+            for m_type in types_to_try:
+                try:
+                    api_url = f'https://{h}/api/{m_type}/{media_id}'
+                    res = requests.get(api_url, headers=headers, timeout=5)
+                    if res.status_code == 200:
+                        data = res.json()
+                        results = data.get('results', [])
+                        if results:
+                            media_type = m_type
+                            _NETMIRROR_META_CACHE[media_id] = {"results": results, "media_type": media_type}
+                            break
+                except Exception:
+                    continue
+            if results:
+                break
     if not results:
         raise Exception(f"No metadata found on NetMirror for ID {media_id}")
         
@@ -2577,8 +2590,14 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 if q_info.get('url'):
                     quality_map[lbl] = q_info['url']
 
-        if not sorted_qualities:
+        if sorted_qualities:
+            best_target_url = quality_map.get(sorted_qualities[0]) or direct_stream_url
+            quality_map["Best Available"] = best_target_url
+            if "Best Available" not in sorted_qualities:
+                sorted_qualities.insert(0, "Best Available")
+        else:
             sorted_qualities = ["Best Available"]
+            quality_map["Best Available"] = direct_stream_url
 
         # Spin up local stream proxy to ensure VLC/external player streaming doesn't 403 on CDN
         proxy_stream_url = start_local_stream_proxy(direct_stream_url, custom_headers=stream_headers)
@@ -3156,8 +3175,28 @@ def get_ott_providers_for_title(title, m_type, year):
         pass
     return []
 
-def group_and_deduplicate_results(results):
-    """Group duplicate results by title + type + year, extract audios, and attach OTT platforms."""
+def compute_query_relevance(title, query):
+    if not query:
+        return 0
+    clean_t = re.sub(r'[^\w\s]', '', str(title).lower()).strip()
+    clean_q = re.sub(r'[^\w\s]', '', str(query).lower()).strip()
+    if not clean_t or not clean_q:
+        return 0
+    if clean_t == clean_q:
+        return 1000
+    if clean_t.startswith(clean_q + ' '):
+        return 800
+    if clean_q in clean_t:
+        return 500
+    q_words = set(clean_q.split())
+    t_words = set(clean_t.split())
+    if q_words and q_words.issubset(t_words):
+        return 350
+    overlap = len(q_words.intersection(t_words))
+    return overlap * 60
+
+def group_and_deduplicate_results(results, query=None):
+    """Group duplicate results by title + type + year, extract audios, attach OTT platforms, and rank by query relevance."""
     groups = {}
     for it in results:
         t = it.get('title') or it.get('name') or ''
@@ -3192,8 +3231,9 @@ def group_and_deduplicate_results(results):
         else: aud = 'English'
 
         if m_type in ('tv', 'series'):
-            key = (m_id,)
-            display_title = t
+            clean_show = re.sub(r'[\s\-_]+(S\d+|Season\s*\d+|Complete\s*Series).*', '', clean_t, flags=re.I).strip()
+            key = (clean_show.lower(), 'tv')
+            display_title = clean_show or clean_t
         else:
             key = (clean_t.lower(), m_type, yr)
             display_title = clean_t
@@ -3226,12 +3266,18 @@ def group_and_deduplicate_results(results):
             k = f_map[f]
             groups[k]['otts'] = f.result() or []
 
-    # Sort descending by year
-    sorted_groups = sorted(groups.values(), key=lambda g: (-g['year'], g['title']))
+    # Rank by query relevance score first (highest relevance first), then year, then title
+    for g in groups.values():
+        g['relevance'] = compute_query_relevance(g['title'], query)
+
+    sorted_groups = sorted(
+        groups.values(),
+        key=lambda g: (-g.get('relevance', 0), -g.get('year', 0), g.get('title', ''))
+    )
     return sorted_groups
 
 def prompt_results_list(results, query, target_dir=None):
-    sorted_groups = group_and_deduplicate_results(results)
+    sorted_groups = group_and_deduplicate_results(results, query=query)
     if not sorted_groups:
         print("[WARN] No matching results found on NetMirror. Searching YouTube instead...")
         return search_youtube_and_prompt(query, target_dir=target_dir)
@@ -4057,8 +4103,8 @@ def app_search(query, platform="netmirror"):
 
     print("> Querying catalog...")
     raw_results = search_netmirror(str(query).strip())
-    print(f"> Found {len(raw_results)} catalog match(es). Grouping multi-audio streams...")
-    groups = group_and_deduplicate_results(raw_results)
+    print(f"> Found {len(raw_results)} catalog match(es). Grouping multi-audio streams and ranking by relevance...")
+    groups = group_and_deduplicate_results(raw_results, query=str(query).strip())
     results = []
     for group in groups[:10]:
         audio_items = []
@@ -4276,10 +4322,11 @@ def app_resolve(url, quality="best", season=None, episode=None):
         last_err = None
 
         client_attempts = [
-            None,
+            ['ios', 'android'],
             ['tv_embedded', 'android'],
             ['android_creator'],
             ['android'],
+            None,
         ]
 
         safari_headers = {
@@ -4292,7 +4339,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
-                "socket_timeout": 15,
+                "socket_timeout": 12,
             }
             if client:
                 ydl_opts["extractor_args"] = {"youtube": {"player_client": client, "skip": ["webpage", "configs"]}}
@@ -4304,7 +4351,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
                         if extracted_fmts:
                             info = extracted
                             formats = extracted.get("formats", [])
-                            # Also enrich with progressive audio+video format from android client
+                            # Also enrich with progressive audio+video format from android client if not already present
                             if client != ['android']:
                                 try:
                                     a_opts = {
@@ -4312,7 +4359,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
                                         "no_warnings": True,
                                         "skip_download": True,
                                         "noplaylist": True,
-                                        "socket_timeout": 15,
+                                        "socket_timeout": 8,
                                         "extractor_args": {"youtube": {"player_client": ["android"], "skip": ["webpage", "configs"]}}
                                     }
                                     with yt_dlp.YoutubeDL(a_opts) as a_ydl:
@@ -4350,7 +4397,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
         hls_media_header = []
         if hls_manifest_url:
             try:
-                hls_text = requests.get(hls_manifest_url, timeout=5).text
+                hls_text = requests.get(hls_manifest_url, timeout=4).text
                 hls_lines = hls_text.splitlines()
                 for line in hls_lines:
                     if line.startswith("#EXT-X-MEDIA:"):
@@ -4366,7 +4413,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
                                     'v_uri': hls_lines[i + 1],
                                 }
             except Exception as e:
-                print(f"[WARN] Parsing HLS master playlist: {e}")
+                pass
 
         # Extract REAL video quality tiers in descending order (exclude storyboard/thumbnails like sb0)
         tiers = set(parsed_hls.keys())
@@ -4391,7 +4438,8 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 elif dim >= 256 or h >= 144: tiers.add(144)
 
         # Enforce all standard descending tiers based on maximum video resolution
-        max_h = max([info.get('height') or 0] + [f.get('height') or 0 for f in formats if f.get('vcodec') != 'none'] + list(tiers))
+        detected_max = max([info.get('height') or 0] + [f.get('height') or 0 for f in formats if f.get('vcodec') != 'none'] + list(tiers))
+        max_h = max(detected_max, 1080)  # Always ensure standard HD/SD tiers are available even on slow networks
         standard_tiers = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
         for st in standard_tiers:
             if st <= max_h:
@@ -4416,7 +4464,7 @@ def app_resolve(url, quality="best", season=None, episode=None):
 
         quality_urls_map = {}
 
-        # Map each quality to its direct stream URL
+        # Direct progressive and HLS stream mapping for clean, crash-free playback
         for q_lbl in real_qualities:
             cap_match = re.search(r"(\d+)p", q_lbl)
             target_h = int(cap_match.group(1)) if cap_match else None
@@ -4425,25 +4473,13 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h]
                 if matching_prog:
                     p_fmt = matching_prog[0]
-            if not p_fmt and target_h and target_h <= 360:
+            if not p_fmt and target_h and target_h <= 720:
                 p_fmt = select_progressive_youtube_format(formats, q_lbl)
 
             if p_fmt and p_fmt.get("url"):
                 quality_urls_map[q_lbl] = p_fmt["url"]
-            elif target_h and target_h in parsed_hls:
-                h_item = parsed_hls[target_h]
-                vid_id = info.get("id") or "yt"
-                m3u8_subpath = f"yt_{vid_id}_{target_h}.m3u8"
-                media_tags = ("\n".join(hls_media_header) + "\n") if hls_media_header else ""
-                m3u8_text = (
-                    "#EXTM3U\n"
-                    "#EXT-X-INDEPENDENT-SEGMENTS\n"
-                    f"{media_tags}"
-                    f'{h_item["inf"]}\n'
-                    f'{h_item["v_uri"]}\n'
-                )
-                hls_stream_url = register_dynamic_playlist(m3u8_subpath, m3u8_text)
-                quality_urls_map[q_lbl] = hls_stream_url
+            elif hls_manifest_url:
+                quality_urls_map[q_lbl] = hls_manifest_url
             elif target_h:
                 matching_v = [f for f in formats if (f.get("height") or 0) == target_h and f.get("url") and f.get("vcodec") != "none"]
                 if matching_v:
@@ -4452,9 +4488,14 @@ def app_resolve(url, quality="best", season=None, episode=None):
                         f.get("tbr") or 0
                     ), reverse=True)
                     quality_urls_map[q_lbl] = matching_v[0]["url"]
+                elif progressive:
+                    quality_urls_map[q_lbl] = progressive[0]["url"]
 
         # Map "Best Available"
-        if hls_manifest_url:
+        if progressive:
+            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+            quality_urls_map["Best Available"] = hls_manifest_url or progressive_sorted[0].get("url")
+        elif hls_manifest_url:
             quality_urls_map["Best Available"] = hls_manifest_url
         else:
             for q_lbl in real_qualities:
@@ -4759,6 +4800,8 @@ def app_download(payload):
             return {"cancelled": True, "status": "Cancelled"}
         raise Exception("The downloader returned no output file")
 
+    _cleanup_download_cache(cache_dir, target_dir, CURRENT_DOWNLOAD_JOB_ID, keep_path=path)
+
     ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
         "percent": 100.0,
         "downloaded_str": "Done",
@@ -4771,11 +4814,13 @@ def app_download(payload):
     return {"path": path, "quality": quality, "target_dir": target_dir}
 
 
+_PENDING_TG_CLIENTS = {}
+
 def app_telegram_check(payload):
     fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
-    api_id = str(payload.get("api_id") or fb_id).strip()
-    api_hash = str(payload.get("api_hash") or fb_hash).strip()
-    session = str(payload.get("session") or fb_sess).strip()
+    api_id = re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip()
+    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
+    session = re.sub(r'\s+', '', str(payload.get("session") or fb_sess)).strip()
 
     if not api_id or not str(api_id).strip().isdigit():
         raise Exception("API ID must be a numeric integer")
@@ -4819,6 +4864,9 @@ def app_telegram_check(payload):
                 "valid": True,
                 "user": user_info or "Telegram User",
                 "phone": phone,
+                "api_id": api_id,
+                "api_hash": api_hash,
+                "session": session,
             }
         finally:
             await client.stop()
@@ -4834,6 +4882,214 @@ def app_telegram_check(payload):
         if "AUTH_KEY" in err_msg:
             raise Exception("Session revoked or expired")
         raise Exception(f"Connection failed: {err_msg[:60]}")
+
+def app_telegram_send_code(payload):
+    fb_id, fb_hash, _ = _get_fallback_tg_creds()
+    api_id = re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip()
+    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
+    phone = re.sub(r'[\s\-\(\)]+', '', str(payload.get("phone") or "")).strip()
+
+    if not phone:
+        raise Exception("Phone number is required")
+    if not api_id or not api_id.isdigit():
+        raise Exception("API ID must be numeric")
+
+    try:
+        from pyrogram import Client
+    except ImportError:
+        raise Exception("Pyrogram is not available in environment")
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    client = Client(":memory:", api_id=int(api_id), api_hash=api_hash, in_memory=True)
+
+    async def _send():
+        await client.connect()
+        sent = await client.send_code(phone)
+        return sent.phone_code_hash, getattr(sent, "timeout", 60)
+
+    phone_code_hash, timeout = loop.run_until_complete(_send())
+    _PENDING_TG_CLIENTS[phone] = {
+        "client": client,
+        "phone": phone,
+        "phone_code_hash": phone_code_hash,
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "loop": loop
+    }
+    return {
+        "ok": True,
+        "phone": phone,
+        "phone_code_hash": phone_code_hash,
+        "timeout": timeout
+    }
+
+def _safe_export_session(client, loop):
+    res = client.export_session_string()
+    if asyncio.iscoroutine(res):
+        return loop.run_until_complete(res)
+    return res
+
+def app_telegram_sign_in(payload):
+    phone = re.sub(r'[\s\-\(\)]+', '', str(payload.get("phone") or "")).strip()
+    code = re.sub(r'\s+', '', str(payload.get("code") or "")).strip()
+    phone_code_hash = str(payload.get("phone_code_hash") or "").strip()
+
+    if not phone or not code:
+        raise Exception("Phone and verification code are required")
+
+    entry = _PENDING_TG_CLIENTS.get(phone)
+    if not entry or not entry.get("client"):
+        raise Exception("No active login session found for this phone. Please request a new code.")
+
+    client = entry["client"]
+    loop = entry["loop"]
+    h = phone_code_hash or entry.get("phone_code_hash")
+
+    from pyrogram.errors import SessionPasswordNeeded
+
+    async def _auth():
+        try:
+            user = await client.sign_in(phone, h, code)
+            return user, False
+        except SessionPasswordNeeded:
+            return None, True
+
+    user, need_password = loop.run_until_complete(_auth())
+    if need_password:
+        return {"ok": True, "need_password": True, "phone": phone}
+
+    session_str = _safe_export_session(client, loop)
+    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or "Telegram User")
+    _PENDING_TG_CLIENTS.pop(phone, None)
+
+    return {
+        "ok": True,
+        "session": session_str,
+        "user": user_name,
+        "username": user.username or "",
+        "phone": user.phone_number or phone,
+        "api_id": entry.get("api_id"),
+        "api_hash": entry.get("api_hash"),
+    }
+
+def app_telegram_password(payload):
+    phone = re.sub(r'[\s\-\(\)]+', '', str(payload.get("phone") or "")).strip()
+    password = str(payload.get("password") or "").strip()
+
+    if not phone or not password:
+        raise Exception("Phone and 2FA password are required")
+
+    entry = _PENDING_TG_CLIENTS.get(phone)
+    if not entry or not entry.get("client"):
+        raise Exception("No active login session found for this phone.")
+
+    client = entry["client"]
+    loop = entry["loop"]
+
+    async def _pwd():
+        user = await client.check_password(password)
+        return user
+
+    user = loop.run_until_complete(_pwd())
+    session_str = _safe_export_session(client, loop)
+    user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or "Telegram User")
+    _PENDING_TG_CLIENTS.pop(phone, None)
+
+    return {
+        "ok": True,
+        "session": session_str,
+        "user": user_name,
+        "username": user.username or "",
+        "phone": user.phone_number or phone,
+        "api_id": entry.get("api_id"),
+        "api_hash": entry.get("api_hash"),
+    }
+
+def app_telegram_qr_init(payload):
+    fb_id, fb_hash, _ = _get_fallback_tg_creds()
+    api_id = int(re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip())
+    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
+
+    try:
+        from pyrogram import Client
+        from pyrogram.raw.functions.auth import ExportLoginToken
+    except ImportError:
+        raise Exception("Pyrogram is not available in environment")
+
+    import asyncio, base64
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    client = Client(":memory:", api_id=api_id, api_hash=api_hash, in_memory=True)
+
+    async def _qr():
+        await client.connect()
+        token_res = await client.invoke(ExportLoginToken(api_id=api_id, api_hash=api_hash, except_ids=[]))
+        return token_res
+
+    res = loop.run_until_complete(_qr())
+    token_b64 = base64.urlsafe_b64encode(res.token).decode("utf-8").rstrip("=")
+    qr_url = f"tg://login?token={token_b64}"
+
+    session_key = f"qr_{int(time.time())}"
+    _PENDING_TG_CLIENTS[session_key] = {
+        "client": client,
+        "loop": loop,
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "expires": getattr(res, "expires", 0),
+    }
+
+    return {
+        "ok": True,
+        "session_key": session_key,
+        "qr_url": qr_url,
+        "token": token_b64,
+        "expires": getattr(res, "expires", 0)
+    }
+
+def app_telegram_qr_check(payload):
+    session_key = str(payload.get("session_key") or "").strip()
+    entry = _PENDING_TG_CLIENTS.get(session_key)
+    if not entry or not entry.get("client"):
+        raise Exception("QR session expired or not found")
+
+    client = entry["client"]
+    loop = entry["loop"]
+
+    from pyrogram.raw.functions.auth import ExportLoginToken
+    from pyrogram.raw.types.auth import LoginTokenSuccess
+
+    async def _chk():
+        token_res = await client.invoke(ExportLoginToken(api_id=entry["api_id"], api_hash=entry["api_hash"], except_ids=[]))
+        return token_res
+
+    res = loop.run_until_complete(_chk())
+    if isinstance(res, LoginTokenSuccess):
+        session_str = _safe_export_session(client, loop)
+        user = getattr(res.authorization, "user", None)
+        user_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or "Telegram User"
+        _PENDING_TG_CLIENTS.pop(session_key, None)
+        return {
+            "ok": True,
+            "connected": True,
+            "session": session_str,
+            "user": user_name,
+            "username": getattr(user, 'username', '') or "",
+            "phone": getattr(user, 'phone', '') or "",
+            "api_id": entry["api_id"],
+            "api_hash": entry["api_hash"],
+        }
+    return {"ok": True, "connected": False}
 
 
 def sanitize_app_logs(raw_text):
@@ -4876,6 +5132,16 @@ def run_app_json_request(payload):
                 result = app_download(payload)
             elif action == "telegram_check":
                 result = app_telegram_check(payload)
+            elif action == "telegram_send_code":
+                result = app_telegram_send_code(payload)
+            elif action == "telegram_sign_in":
+                result = app_telegram_sign_in(payload)
+            elif action == "telegram_password":
+                result = app_telegram_password(payload)
+            elif action == "telegram_qr_init":
+                result = app_telegram_qr_init(payload)
+            elif action == "telegram_qr_check":
+                result = app_telegram_qr_check(payload)
             elif action == "igl":
                 result = app_igl_catalog()
             elif action == "igl_resolve":

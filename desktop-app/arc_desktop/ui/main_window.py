@@ -271,8 +271,6 @@ class MainWindow(QMainWindow):
             lambda value: self.store.set("prefer_vlc", value))
         settings.telegram_saved.connect(self.save_telegram_credentials)
         settings.telegram_test_requested.connect(self.test_telegram)
-        settings.check_updates_requested.connect(self.check_for_updates)
-        settings.open_release_requested.connect(self.open_releases_page)
         settings.scan_requested.connect(self._refresh_library)
         settings.install_requested.connect(self.install_accelerator)
 
@@ -1057,40 +1055,9 @@ class MainWindow(QMainWindow):
                 False, "Fill in API ID, API hash and session first.")
             return
         self.settings_page.set_telegram_busy(True)
+        clean_sess = re.sub(r'\s+', '', session)
         self._submit({"action": "telegram_check", "api_id": api_id, "api_hash": api_hash,
-                      "session": _pad_base64(session)}, "Check Telegram session")
-
-    def check_for_updates(self) -> None:
-        self.settings_page.set_update("Checking...", "Checking Arc for Windows")
-        try:
-            import urllib.request
-            request = urllib.request.Request(
-                "https://api.github.com/repos/Erawat4l/universal-downloader/releases/latest",
-                headers={"User-Agent": f"arc-desktop/{__version__}",
-                         "Accept": "application/vnd.github+json"},
-            )
-            with urllib.request.urlopen(request, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8", "replace"))
-            tag = str(data.get("tag_name", "")).strip()
-            exe_asset = next((asset for asset in data.get("assets", [])
-                              if str(asset.get("name", "")).lower() == "arc-windows-x64.exe"), None)
-            remote = tuple(int(part) for part in tag.lstrip("v").split("-")[0].split(".") if part.isdigit())
-            local = tuple(int(part) for part in str(__version__).lstrip("v").split("-")[0].split(".") if part.isdigit())
-            width = max(len(remote), len(local), 3)
-            newer = exe_asset is not None and remote + (0,) * (width - len(remote)) > local + (0,) * (width - len(local))
-            if newer:
-                self.settings_page.set_update("Windows app update found", f"Arc {tag} is ready", True)
-                self.notify(f"Arc for Windows update available: {tag}")
-            elif exe_asset is None:
-                self.settings_page.set_update("No Windows update", "No Windows exe release is published yet.")
-            else:
-                self.settings_page.set_update("Windows app is up to date", f"Arc {__version__}")
-        except Exception as error:
-            self.settings_page.set_update("Could not check Windows updates", str(error))
-
-    def open_releases_page(self) -> None:
-        QDesktopServices.openUrl(
-            QUrl("https://github.com/Erawat4l/universal-downloader/releases"))
+                      "session": _pad_base64(clean_sess)}, "Check Telegram session")
 
     # ------------------------------------------------------------------ polls
     def _start_polling(self) -> None:

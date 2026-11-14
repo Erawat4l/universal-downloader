@@ -399,6 +399,11 @@ class MainActivity : ComponentActivity() {
         return match?.value ?: raw.trim()
     }
 
+    override fun onResume() {
+        super.onResume()
+        StreamService.stop(this)
+    }
+
     override fun onDestroy() {
         StreamService.stop(this)
         super.onDestroy()
@@ -522,15 +527,14 @@ private fun ArcApp(
     var jobs by remember { mutableStateOf(emptyList<DownloadJob>()) }
     var cancelledJobIds by remember { mutableStateOf(setOf<String>()) }
     val activeCancelledIds = remember { java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>()) }
-    var update by remember { mutableStateOf(UpdateInfo()) }
-    var isDownloadingUpdate by remember { mutableStateOf(false) }
-    var updateProgress by remember { mutableFloatStateOf(0f) }
-    var updateStatusText by remember { mutableStateOf("") }
     var notifications by rememberSaveable { mutableStateOf(preferences.getBoolean("notifications_enabled", true)) }
-    var telegramApiId by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_id", "") ?: "") }
-    var telegramApiHash by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_hash", "") ?: "") }
+    var telegramApiId by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_id", "30909654") ?: "30909654") }
+    var telegramApiHash by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b") }
     var telegramSession by rememberSaveable { mutableStateOf(preferences.getString("telegram_session", "") ?: "") }
+    var telegramUserName by rememberSaveable { mutableStateOf(preferences.getString("telegram_user_name", "") ?: "") }
+    var telegramUserPhone by rememberSaveable { mutableStateOf(preferences.getString("telegram_user_phone", "") ?: "") }
     var showTelegramSetup by rememberSaveable { mutableStateOf(false) }
+    val episodeCache = remember { mutableMapOf<String, MediaTarget>() }
 
     var currentTrace by remember { mutableStateOf<CliTrace?>(null) }
     var isTraceExpanded by rememberSaveable { mutableStateOf(false) }
@@ -570,152 +574,6 @@ private fun ArcApp(
             }
         }
     )
-
-    fun installApkFile(ctx: Context, file: File) {
-        try {
-            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.provider", file)
-            val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            ctx.startActivity(installIntent)
-        } catch (e: Exception) {
-            message("Failed to open package installer: ${e.message}")
-        }
-    }
-
-    val installPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult(),
-        onResult = {
-            val apkFile = File(context.cacheDir, "arc_update.apk")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (context.packageManager.canRequestPackageInstalls()) {
-                    if (apkFile.exists() && apkFile.length() > 0) {
-                        installApkFile(context, apkFile)
-                    }
-                } else {
-                    message("Permission to install updates was not granted.")
-                }
-            } else {
-                if (apkFile.exists() && apkFile.length() > 0) {
-                    installApkFile(context, apkFile)
-                }
-            }
-        }
-    )
-
-    fun startUpdateDownloadAndInstall(targetApkUrl: String) {
-        val apkUrl = targetApkUrl.ifBlank { "https://github.com/Erawat4l/universal-downloader/releases/download/v0.1.0/ARC.apk" }
-        val apkFile = File(context.cacheDir, "arc_update.apk")
-
-        if (apkFile.exists() && apkFile.length() > 5 * 1024 * 1024 && !isDownloadingUpdate) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
-                message("Please grant permission to install updates")
-                val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                    data = Uri.parse("package:${context.packageName}")
-                }
-                installPermissionLauncher.launch(permIntent)
-            } else {
-                installApkFile(context, apkFile)
-            }
-            return
-        }
-
-        if (isDownloadingUpdate) return
-        isDownloadingUpdate = true
-        updateProgress = 0f
-        updateStatusText = "Connecting..."
-
-        scope.launch {
-            val success = withContext(Dispatchers.IO) {
-                try {
-                    var currentUrl = apkUrl
-                    var redirectCount = 0
-                    var connection: HttpURLConnection
-                    while (true) {
-                        val url = URL(currentUrl)
-                        connection = url.openConnection() as HttpURLConnection
-                        connection.instanceFollowRedirects = false
-                        connection.connectTimeout = 15000
-                        connection.readTimeout = 15000
-                        connection.setRequestProperty("User-Agent", "Arc-Updater/1.0")
-                        val status = connection.responseCode
-                        if (status in 300..399) {
-                            val newLoc = connection.getHeaderField("Location") ?: break
-                            currentUrl = try { URL(url, newLoc).toString() } catch (_: Exception) { newLoc }
-                            redirectCount++
-                            if (redirectCount > 10) break
-                        } else {
-                            break
-                        }
-                    }
-
-                    if (connection.responseCode !in 200..299) {
-                        throw java.io.IOException("HTTP ${connection.responseCode}")
-                    }
-
-                    val totalLength = connection.contentLengthLong
-                    if (apkFile.exists()) apkFile.delete()
-
-                    connection.inputStream.use { input ->
-                        apkFile.outputStream().use { output ->
-                            val buffer = ByteArray(64 * 1024)
-                            var bytesCopied = 0L
-                            var lastReportedTime = System.currentTimeMillis()
-                            var lastReportedBytes = 0L
-                            var read: Int
-                            while (input.read(buffer).also { read = it } != -1) {
-                                output.write(buffer, 0, read)
-                                bytesCopied += read
-                                val now = System.currentTimeMillis()
-                                if (now - lastReportedTime >= 250 || bytesCopied - lastReportedBytes >= 512 * 1024) {
-                                    lastReportedTime = now
-                                    lastReportedBytes = bytesCopied
-                                    if (totalLength > 0) {
-                                        val progress = bytesCopied.toFloat() / totalLength
-                                        withContext(Dispatchers.Main) {
-                                            updateProgress = progress
-                                            val mbCopied = bytesCopied / (1024f * 1024f)
-                                            val mbTotal = totalLength / (1024f * 1024f)
-                                            updateStatusText = "Downloading: ${(progress * 100).toInt()}% (%.1f / %.1f MB)".format(mbCopied, mbTotal)
-                                        }
-                                    } else {
-                                        val mbCopied = bytesCopied / (1024f * 1024f)
-                                        withContext(Dispatchers.Main) {
-                                            updateProgress = -1f
-                                            updateStatusText = "Downloading: %.1f MB".format(mbCopied)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    true
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        updateStatusText = "Failed: ${e.message}"
-                        message("Download failed: ${e.message}")
-                    }
-                    false
-                }
-            }
-
-            isDownloadingUpdate = false
-            if (success && apkFile.exists() && apkFile.length() > 0) {
-                updateStatusText = "Update downloaded. Ready to install."
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
-                    message("Please grant permission to install updates")
-                    val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                        data = Uri.parse("package:${context.packageName}")
-                    }
-                    installPermissionLauncher.launch(permIntent)
-                } else {
-                    installApkFile(context, apkFile)
-                }
-            }
-        }
-    }
 
     fun copyToClipboard(text: String, label: String = "Copied") {
         clipboard.setText(AnnotatedString(text))
@@ -771,9 +629,6 @@ private fun ArcApp(
     }
 
     LaunchedEffect(Unit) {
-        scope.launch {
-            update = GitHubUpdateChecker.check()
-        }
         if (notifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -877,10 +732,7 @@ private fun ArcApp(
                                   (!streamUrl.contains("hakunaymatata") && !streamUrl.contains("mzfi.me"))
 
             var playUrl = streamUrl
-            if (streamUrl.contains("127.0.0.1")) {
-                StreamService.start(context, streamUrl, headers)
-            } else if (!isDirectPlayable) {
-                StreamService.start(context, streamUrl, headers)
+            if (!isDirectPlayable && !streamUrl.contains("127.0.0.1")) {
                 val pPayload = JSONObject().apply {
                     put("action", "stream_proxy")
                     put("url", streamUrl)
@@ -893,6 +745,10 @@ private fun ArcApp(
                 if (!px.isNullOrBlank()) {
                     playUrl = px
                 }
+            }
+
+            if (playUrl.contains("127.0.0.1")) {
+                StreamService.start(context, streamUrl, headers)
             }
             val uri = Uri.parse(playUrl)
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1162,6 +1018,10 @@ private fun ArcApp(
                     year = resolvedYear,
                     mediaCategory = resolvedCategory,
                 )
+                val initS = target.selectedSeason
+                val initEp = target.selectedEpisode
+                val initKey = "${target.targetUrl}_S${initS}_E${initEp}"
+                episodeCache[initKey] = target
 
                 resolveLoading = false
                 overlay = "analysis"
@@ -1766,105 +1626,117 @@ private fun ArcApp(
                                     },
                                     onSelectSeason = { s ->
                                         episodeResolveJob?.cancel()
-                                        episodeLoading = true
-                                        target = target.copy(
-                                            selectedSeason = s,
-                                            selectedEpisode = 1,
-                                            directStreamUrl = "",
-                                            availableQualities = emptyList(),
-                                            qualityUrls = emptyMap()
-                                        )
-                                        episodeResolveJob = scope.launch {
-                                            val sPayload = JSONObject().apply {
-                                                put("action", "resolve")
-                                                put("url", target.targetUrl.ifBlank { input })
-                                                put("season", s)
-                                                put("episode", 1)
-                                                put("quality", selectedQuality)
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                            }
-                                            val data = res?.optJSONObject("result")
-                                            val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
-                                            val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                            val qUrlMap = mutableMapOf<String, String>()
-                                            data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                            }
-                                            val qList = mutableListOf<String>()
-                                            data?.optJSONArray("qualities")?.let { qArr ->
-                                                for (i in 0 until qArr.length()) {
-                                                    val q = qArr.optString(i)
-                                                    if (q.isNotBlank()) qList.add(q)
-                                                }
-                                            }
-                                            val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else emptyList()
-                                            val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
-                                            selectedQuality = activeQ
-                                            val finalDirect = qUrlMap[activeQ] ?: directUrl
-                                            val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                            val hMap = mutableMapOf<String, String>()
-                                            hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                            target = target.copy(
-                                                directStreamUrl = finalDirect,
-                                                proxyUrl = proxyUrl,
-                                                availableQualities = sortedQ,
-                                                qualityUrls = qUrlMap,
-                                                streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                            )
+                                        val cacheKey = "${target.targetUrl}_S${s}_E1"
+                                        val cached = episodeCache[cacheKey]
+                                        if (cached != null) {
+                                            target = cached.copy(selectedSeason = s, selectedEpisode = 1)
                                             episodeLoading = false
+                                        } else {
+                                            episodeLoading = true
+                                            target = target.copy(
+                                                selectedSeason = s,
+                                                selectedEpisode = 1,
+                                            )
+                                            episodeResolveJob = scope.launch {
+                                                val sPayload = JSONObject().apply {
+                                                    put("action", "resolve")
+                                                    put("url", target.targetUrl.ifBlank { input })
+                                                    put("season", s)
+                                                    put("episode", 1)
+                                                    put("quality", selectedQuality)
+                                                }
+                                                val res = withContext(Dispatchers.IO) {
+                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
+                                                }
+                                                val data = res?.optJSONObject("result")
+                                                val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
+                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
+                                                val qUrlMap = mutableMapOf<String, String>()
+                                                data?.optJSONObject("quality_urls")?.let { qObj ->
+                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                                                }
+                                                val qList = mutableListOf<String>()
+                                                data?.optJSONArray("qualities")?.let { qArr ->
+                                                    for (i in 0 until qArr.length()) {
+                                                        val q = qArr.optString(i)
+                                                        if (q.isNotBlank()) qList.add(q)
+                                                    }
+                                                }
+                                                val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else target.availableQualities
+                                                val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
+                                                selectedQuality = activeQ
+                                                val finalDirect = qUrlMap[activeQ] ?: directUrl
+                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                                                val hMap = mutableMapOf<String, String>()
+                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                                                val updatedTarget = target.copy(
+                                                    directStreamUrl = finalDirect,
+                                                    proxyUrl = proxyUrl,
+                                                    availableQualities = if (sortedQ.isNotEmpty()) sortedQ else target.availableQualities,
+                                                    qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
+                                                    streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                )
+                                                target = updatedTarget
+                                                episodeCache[cacheKey] = updatedTarget
+                                                episodeLoading = false
+                                            }
                                         }
                                     },
                                     onSelectEpisode = { ep ->
                                         episodeResolveJob?.cancel()
-                                        episodeLoading = true
-                                        target = target.copy(
-                                            selectedEpisode = ep,
-                                            directStreamUrl = "",
-                                            availableQualities = emptyList(),
-                                            qualityUrls = emptyMap()
-                                        )
-                                        episodeResolveJob = scope.launch {
-                                            val sPayload = JSONObject().apply {
-                                                put("action", "resolve")
-                                                put("url", target.targetUrl.ifBlank { input })
-                                                put("season", target.selectedSeason)
-                                                put("episode", ep)
-                                                put("quality", selectedQuality)
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                            }
-                                            val data = res?.optJSONObject("result")
-                                            val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
-                                            val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                            val qUrlMap = mutableMapOf<String, String>()
-                                            data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                            }
-                                            val qList = mutableListOf<String>()
-                                            data?.optJSONArray("qualities")?.let { qArr ->
-                                                for (i in 0 until qArr.length()) {
-                                                    val q = qArr.optString(i)
-                                                    if (q.isNotBlank()) qList.add(q)
-                                                }
-                                            }
-                                            val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else emptyList()
-                                            val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
-                                            selectedQuality = activeQ
-                                            val finalDirect = qUrlMap[activeQ] ?: directUrl
-                                            val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                            val hMap = mutableMapOf<String, String>()
-                                            hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                            target = target.copy(
-                                                directStreamUrl = finalDirect,
-                                                proxyUrl = proxyUrl,
-                                                availableQualities = sortedQ,
-                                                qualityUrls = qUrlMap,
-                                                streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                            )
+                                        val cacheKey = "${target.targetUrl}_S${target.selectedSeason}_E${ep}"
+                                        val cached = episodeCache[cacheKey]
+                                        if (cached != null) {
+                                            target = cached.copy(selectedEpisode = ep)
                                             episodeLoading = false
+                                        } else {
+                                            episodeLoading = true
+                                            target = target.copy(
+                                                selectedEpisode = ep,
+                                            )
+                                            episodeResolveJob = scope.launch {
+                                                val sPayload = JSONObject().apply {
+                                                    put("action", "resolve")
+                                                    put("url", target.targetUrl.ifBlank { input })
+                                                    put("season", target.selectedSeason)
+                                                    put("episode", ep)
+                                                    put("quality", selectedQuality)
+                                                }
+                                                val res = withContext(Dispatchers.IO) {
+                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
+                                                }
+                                                val data = res?.optJSONObject("result")
+                                                val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
+                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
+                                                val qUrlMap = mutableMapOf<String, String>()
+                                                data?.optJSONObject("quality_urls")?.let { qObj ->
+                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                                                }
+                                                val qList = mutableListOf<String>()
+                                                data?.optJSONArray("qualities")?.let { qArr ->
+                                                    for (i in 0 until qArr.length()) {
+                                                        val q = qArr.optString(i)
+                                                        if (q.isNotBlank()) qList.add(q)
+                                                    }
+                                                }
+                                                val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else target.availableQualities
+                                                val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
+                                                selectedQuality = activeQ
+                                                val finalDirect = qUrlMap[activeQ] ?: directUrl
+                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                                                val hMap = mutableMapOf<String, String>()
+                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                                                val updatedTarget = target.copy(
+                                                    directStreamUrl = finalDirect,
+                                                    proxyUrl = proxyUrl,
+                                                    availableQualities = if (sortedQ.isNotEmpty()) sortedQ else target.availableQualities,
+                                                    qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
+                                                    streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                )
+                                                target = updatedTarget
+                                                episodeCache[cacheKey] = updatedTarget
+                                                episodeLoading = false
+                                            }
                                         }
                                     },
                                     onSelectPlaylistItem = { entry ->
@@ -1926,19 +1798,20 @@ private fun ArcApp(
                                 message("Notifications disabled.")
                             }
                         },
+                        telegramSession = telegramSession,
+                        telegramUserName = telegramUserName,
+                        telegramUserPhone = telegramUserPhone,
                         onTelegramSetup = { showTelegramSetup = true },
-                        update = update,
-                        isDownloadingUpdate = isDownloadingUpdate,
-                        updateProgress = updateProgress,
-                        updateStatusText = updateStatusText,
-                        onCheckUpdates = {
-                            scope.launch {
-                                update = GitHubUpdateChecker.check()
-                                message(if (update.appUpdateAvailable) "Update ready: ${update.newVersionName.ifBlank { "Arc" }}" else "Arc is up to date.")
-                            }
-                        },
-                        onInstallUpdate = {
-                            startUpdateDownloadAndInstall(update.apkUrl)
+                        onTelegramDisconnect = {
+                            telegramSession = ""
+                            telegramUserName = ""
+                            telegramUserPhone = ""
+                            preferences.edit()
+                                .remove("telegram_session")
+                                .remove("telegram_user_name")
+                                .remove("telegram_user_phone")
+                                .apply()
+                            message("Telegram disconnected.")
                         },
                     )
                 }
@@ -2068,23 +1941,25 @@ private fun ArcApp(
                 )
             }
 
-            // Telegram Setup Dialog
+            // Telegram Auth Dialog
             if (showTelegramSetup) {
-                TelegramSetupDialog(
-                    apiId = telegramApiId,
-                    apiHash = telegramApiHash,
-                    session = telegramSession,
-                    onSave = { id, hash, sess ->
+                TelegramAuthDialog(
+                    initialSession = telegramSession,
+                    onSave = { id, hash, sess, user, phone ->
                         telegramApiId = id
                         telegramApiHash = hash
                         telegramSession = sess
+                        telegramUserName = user
+                        telegramUserPhone = phone
                         preferences.edit()
                             .putString("telegram_api_id", id)
                             .putString("telegram_api_hash", hash)
                             .putString("telegram_session", sess)
+                            .putString("telegram_user_name", user)
+                            .putString("telegram_user_phone", phone)
                             .apply()
                         showTelegramSetup = false
-                        message("Telegram session saved.")
+                        message("Telegram connected as ${user.ifBlank { phone }}")
                     },
                     onDismiss = { showTelegramSetup = false },
                 )
@@ -2747,17 +2622,21 @@ private fun AnalysisScreen(
                             .padding(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        itemsIndexed(target.playlistEntries) { idx, entry ->
-                            Surface(
-                                color = ArcSurface,
-                                shape = RoundedCornerShape(8.dp),
+                        itemsIndexed(
+                            items = target.playlistEntries,
+                            key = { idx, entry -> if (entry.id.isNotBlank()) entry.id else "${entry.url}_$idx" },
+                            contentType = { _, _ -> "playlist_entry" }
+                        ) { idx, entry ->
+                            Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(8.dp))
-                                    .clickable { onSelectPlaylistItem?.invoke(entry) },
+                                    .background(ArcSurface)
+                                    .clickable { onSelectPlaylistItem?.invoke(entry) }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    modifier = Modifier.fillMaxWidth(),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 ) {
@@ -3269,13 +3148,11 @@ private fun SettingsScreen(
     onOpenQualityDialog: () -> Unit,
     notifications: Boolean,
     onToggleNotifications: (Boolean) -> Unit,
+    telegramSession: String,
+    telegramUserName: String,
+    telegramUserPhone: String,
     onTelegramSetup: () -> Unit,
-    update: UpdateInfo,
-    isDownloadingUpdate: Boolean,
-    updateProgress: Float,
-    updateStatusText: String,
-    onCheckUpdates: () -> Unit,
-    onInstallUpdate: () -> Unit,
+    onTelegramDisconnect: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -3286,16 +3163,6 @@ private fun SettingsScreen(
             Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
             Text("Preferences and app configuration", color = ArcMuted, fontSize = 13.sp)
-        }
-        item {
-            GitHubCard(
-                update = update,
-                isDownloadingUpdate = isDownloadingUpdate,
-                updateProgress = updateProgress,
-                updateStatusText = updateStatusText,
-                onCheck = onCheckUpdates,
-                onInstallUpdate = onInstallUpdate,
-            )
         }
         item {
             SettingsGroup("Downloads")
@@ -3392,10 +3259,7 @@ private fun SettingsScreen(
             Card(
                 colors = CardDefaults.cardColors(containerColor = ArcSurface),
                 shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .clickable(onClick = onTelegramSetup),
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -3404,10 +3268,42 @@ private fun SettingsScreen(
                 ) {
                     MediaGlyph(Icons.AutoMirrored.Outlined.Send, Modifier.size(36.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Telegram Session", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Text("Configure Pyrogram session credentials", color = ArcMuted, fontSize = 11.sp)
+                        if (telegramSession.isNotBlank()) {
+                            val displayName = telegramUserName.ifBlank { telegramUserPhone.ifBlank { "Telegram Account" } }
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(displayName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF4CAF50))
+                                )
+                            }
+                            Text(telegramUserPhone.ifBlank { "Connected · Ready for downloads" }, color = ArcMuted, fontSize = 11.sp)
+                        } else {
+                            Text("Telegram", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Text("Connect for direct Telegram media downloads", color = ArcMuted, fontSize = 11.sp)
+                        }
                     }
-                    Icon(Icons.Outlined.Edit, contentDescription = "Configure", tint = ArcMuted, modifier = Modifier.size(18.dp))
+                    if (telegramSession.isNotBlank()) {
+                        OutlinedButton(
+                            onClick = onTelegramDisconnect,
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF5252)),
+                        ) {
+                            Text("Disconnect", fontSize = 11.sp)
+                        }
+                    } else {
+                        Button(
+                            onClick = onTelegramSetup,
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+                        ) {
+                            Text("Login", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
             }
         }
@@ -3645,21 +3541,90 @@ private fun DefaultQualityDialog(
 }
 
 @Composable
-private fun TelegramSetupDialog(
-    apiId: String,
-    apiHash: String,
-    session: String,
-    onSave: (String, String, String) -> Unit,
+private fun TelegramAuthDialog(
+    initialSession: String = "",
+    onSave: (String, String, String, String, String) -> Unit, // apiId, apiHash, session, user, phone
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var id by remember { mutableStateOf(apiId) }
-    var hash by remember { mutableStateOf(apiHash) }
-    var sess by remember { mutableStateOf(session) }
-    var checkLoading by remember { mutableStateOf(false) }
-    var checkResult by remember { mutableStateOf<String?>(null) }
-    var checkSuccess by remember { mutableStateOf(false) }
+    val defaultApiId = "30909654"
+    val defaultApiHash = "d4b340a406c5c1ed1d7f26d44749602b"
+
+    var selectedTab by remember { mutableStateOf(0) } // 0: Phone, 1: QR, 2: Session
+    val tabs = listOf("Phone", "QR Code", "Session")
+
+    // Phone state
+    var phoneInput by remember { mutableStateOf("") }
+    var codeInput by remember { mutableStateOf("") }
+    var passwordInput by remember { mutableStateOf("") }
+    var phoneCodeHash by remember { mutableStateOf("") }
+    var phoneStep by remember { mutableStateOf(0) } // 0: Enter phone, 1: Enter code, 2: Enter 2FA pwd
+
+    // QR state
+    var qrSessionKey by remember { mutableStateOf("") }
+    var qrUrl by remember { mutableStateOf("") }
+    var qrLoading by remember { mutableStateOf(false) }
+
+    // Session string state
+    var rawSessionInput by remember { mutableStateOf(initialSession) }
+
+    // Status state
+    var isLoading by remember { mutableStateOf(false) }
+    var statusText by remember { mutableStateOf<String?>(null) }
+    var isError by remember { mutableStateOf(false) }
+
+    // Periodic QR checker
+    LaunchedEffect(selectedTab, qrSessionKey) {
+        if (selectedTab == 1 && qrSessionKey.isNotBlank()) {
+            while (qrSessionKey.isNotBlank()) {
+                delay(2500)
+                val checkPayload = JSONObject().apply {
+                    put("action", "telegram_qr_check")
+                    put("session_key", qrSessionKey)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, checkPayload) }.getOrNull()
+                }
+                val rObj = res?.optJSONObject("result")
+                if (rObj?.optBoolean("connected", false) == true) {
+                    val sess = rObj.optString("session")
+                    val u = rObj.optString("user")
+                    val p = rObj.optString("phone")
+                    onSave(defaultApiId, defaultApiHash, sess, u, p)
+                    break
+                }
+            }
+        }
+    }
+
+    fun initQr() {
+        qrLoading = true
+        isLoading = true
+        statusText = "Requesting QR login..."
+        isError = false
+        scope.launch {
+            val payload = JSONObject().apply {
+                put("action", "telegram_qr_init")
+                put("api_id", defaultApiId)
+                put("api_hash", defaultApiHash)
+            }
+            val res = withContext(Dispatchers.IO) {
+                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+            }
+            isLoading = false
+            qrLoading = false
+            if (res != null && res.optBoolean("ok", false)) {
+                val rObj = res.optJSONObject("result")
+                qrSessionKey = rObj?.optString("session_key").orEmpty()
+                qrUrl = rObj?.optString("qr_url").orEmpty()
+                statusText = "Scan with your phone or tap below to link"
+            } else {
+                isError = true
+                statusText = res?.optString("error") ?: "Failed to generate QR token"
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -3667,178 +3632,302 @@ private fun TelegramSetupDialog(
         titleContentColor = ArcWhite,
         textContentColor = ArcWhite,
         shape = RoundedCornerShape(20.dp),
-        title = { Text("Telegram Session Credentials") },
+        title = {
+            Text("Telegram Login", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Enter Pyrogram session credentials for Telegram media downloads.", color = ArcMuted, fontSize = 11.sp)
-                OutlinedTextField(
-                    value = id,
-                    onValueChange = { id = it },
-                    label = { Text("API ID") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = arcTextFieldColors(),
-                )
-                OutlinedTextField(
-                    value = hash,
-                    onValueChange = { hash = it },
-                    label = { Text("API HASH") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = arcTextFieldColors(),
-                )
-                OutlinedTextField(
-                    value = sess,
-                    onValueChange = { sess = it },
-                    label = { Text("STRING_SESSION") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = arcTextFieldColors(),
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // Tab Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(ArcRaised)
+                        .padding(3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    tabs.forEachIndexed { idx, title ->
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (selectedTab == idx) ArcWhite else Color.Transparent)
+                                .clickable {
+                                    selectedTab = idx
+                                    statusText = null
+                                    isError = false
+                                    if (idx == 1 && qrSessionKey.isBlank()) {
+                                        initQr()
+                                    }
+                                }
+                                .padding(vertical = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = title,
+                                color = if (selectedTab == idx) ArcBlack else ArcMuted,
+                                fontSize = 11.sp,
+                                fontWeight = if (selectedTab == idx) FontWeight.Bold else FontWeight.Medium
+                            )
+                        }
+                    }
+                }
 
-                if (checkResult != null) {
+                // Tab Content
+                when (selectedTab) {
+                    0 -> { // Phone Login
+                        when (phoneStep) {
+                            0 -> {
+                                Text("Enter your phone number with country code.", color = ArcMuted, fontSize = 11.sp)
+                                OutlinedTextField(
+                                    value = phoneInput,
+                                    onValueChange = { phoneInput = it.trim() },
+                                    label = { Text("Phone Number (e.g. +919876543210)") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = arcTextFieldColors(),
+                                )
+                                Button(
+                                    onClick = {
+                                        isLoading = true
+                                        statusText = "Sending verification code..."
+                                        isError = false
+                                        scope.launch {
+                                            val payload = JSONObject().apply {
+                                                put("action", "telegram_send_code")
+                                                put("api_id", defaultApiId)
+                                                put("api_hash", defaultApiHash)
+                                                put("phone", phoneInput)
+                                            }
+                                            val res = withContext(Dispatchers.IO) {
+                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                                            }
+                                            isLoading = false
+                                            if (res != null && res.optBoolean("ok", false)) {
+                                                val rObj = res.optJSONObject("result")
+                                                phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
+                                                phoneStep = 1
+                                                statusText = "Code sent to your Telegram app!"
+                                            } else {
+                                                isError = true
+                                                statusText = res?.optString("error") ?: "Failed to send code"
+                                            }
+                                        }
+                                    },
+                                    enabled = !isLoading && phoneInput.length >= 8,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Send Code", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            1 -> {
+                                Text("Enter the 5-digit code sent to your Telegram app.", color = ArcMuted, fontSize = 11.sp)
+                                OutlinedTextField(
+                                    value = codeInput,
+                                    onValueChange = { codeInput = it.trim() },
+                                    label = { Text("Verification Code") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = arcTextFieldColors(),
+                                )
+                                Button(
+                                    onClick = {
+                                        isLoading = true
+                                        statusText = "Signing in..."
+                                        isError = false
+                                        scope.launch {
+                                            val payload = JSONObject().apply {
+                                                put("action", "telegram_sign_in")
+                                                put("phone", phoneInput)
+                                                put("code", codeInput)
+                                                put("phone_code_hash", phoneCodeHash)
+                                            }
+                                            val res = withContext(Dispatchers.IO) {
+                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                                            }
+                                            isLoading = false
+                                            if (res != null && res.optBoolean("ok", false)) {
+                                                val rObj = res.optJSONObject("result")
+                                                if (rObj?.optBoolean("need_password", false) == true) {
+                                                    phoneStep = 2
+                                                    statusText = "Two-step verification password required."
+                                                } else {
+                                                    val sess = rObj?.optString("session").orEmpty()
+                                                    val u = rObj?.optString("user").orEmpty()
+                                                    val p = rObj?.optString("phone").orEmpty()
+                                                    onSave(defaultApiId, defaultApiHash, sess, u, p)
+                                                }
+                                            } else {
+                                                isError = true
+                                                statusText = res?.optString("error") ?: "Sign in failed"
+                                            }
+                                        }
+                                    },
+                                    enabled = !isLoading && codeInput.isNotBlank(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Verify & Connect", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            2 -> {
+                                Text("Enter your 2FA Two-Step Verification Password.", color = ArcMuted, fontSize = 11.sp)
+                                OutlinedTextField(
+                                    value = passwordInput,
+                                    onValueChange = { passwordInput = it },
+                                    label = { Text("2FA Password") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = arcTextFieldColors(),
+                                )
+                                Button(
+                                    onClick = {
+                                        isLoading = true
+                                        statusText = "Verifying password..."
+                                        isError = false
+                                        scope.launch {
+                                            val payload = JSONObject().apply {
+                                                put("action", "telegram_password")
+                                                put("phone", phoneInput)
+                                                put("password", passwordInput)
+                                            }
+                                            val res = withContext(Dispatchers.IO) {
+                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                                            }
+                                            isLoading = false
+                                            if (res != null && res.optBoolean("ok", false)) {
+                                                val rObj = res.optJSONObject("result")
+                                                val sess = rObj?.optString("session").orEmpty()
+                                                val u = rObj?.optString("user").orEmpty()
+                                                val p = rObj?.optString("phone").orEmpty()
+                                                onSave(defaultApiId, defaultApiHash, sess, u, p)
+                                            } else {
+                                                isError = true
+                                                statusText = res?.optString("error") ?: "Invalid password"
+                                            }
+                                        }
+                                    },
+                                    enabled = !isLoading && passwordInput.isNotBlank(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Submit Password", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                    1 -> { // QR Code
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                "1. Open Telegram on your phone\n2. Settings → Devices → Link Desktop Device\n3. Tap below or scan QR to link",
+                                color = ArcMuted,
+                                fontSize = 11.sp
+                            )
+                            if (qrUrl.isNotBlank()) {
+                                Button(
+                                    onClick = {
+                                        try {
+                                            val i = Intent(Intent.ACTION_VIEW, Uri.parse(qrUrl))
+                                            context.startActivity(i)
+                                        } catch (_: Exception) {}
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Open in Telegram App", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { initQr() },
+                                enabled = !isLoading,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text("Refresh QR Token", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                    2 -> { // Session String
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Paste your Pyrogram String Session directly (spaces, newlines, and padding are cleaned automatically).", color = ArcMuted, fontSize = 11.sp)
+                            OutlinedTextField(
+                                value = rawSessionInput,
+                                onValueChange = { raw ->
+                                    rawSessionInput = raw.replace(Regex("""\s+"""), "")
+                                },
+                                label = { Text("STRING_SESSION") },
+                                singleLine = false,
+                                maxLines = 4,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = arcTextFieldColors(),
+                            )
+                            Button(
+                                onClick = {
+                                    isLoading = true
+                                    statusText = "Verifying string session..."
+                                    isError = false
+                                    scope.launch {
+                                        var cleanSess = rawSessionInput.replace(Regex("""\s+"""), "").trim()
+                                        val pad = cleanSess.length % 4
+                                        if (pad != 0) {
+                                            cleanSess += "=".repeat(4 - pad)
+                                        }
+                                        val payload = JSONObject().apply {
+                                            put("action", "telegram_check")
+                                            put("api_id", defaultApiId)
+                                            put("api_hash", defaultApiHash)
+                                            put("session", cleanSess)
+                                        }
+                                        val res = withContext(Dispatchers.IO) {
+                                            runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                                        }
+                                        isLoading = false
+                                        if (res != null && res.optBoolean("ok", false)) {
+                                            val rObj = res.optJSONObject("result")
+                                            val u = rObj?.optString("user", "Account Verified") ?: "Verified"
+                                            val p = rObj?.optString("phone", "") ?: ""
+                                            onSave(defaultApiId, defaultApiHash, cleanSess, u, p)
+                                        } else {
+                                            isError = true
+                                            statusText = res?.optString("error") ?: "Connection failed"
+                                        }
+                                    }
+                                },
+                                enabled = !isLoading && rawSessionInput.length > 20,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Text("Connect", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+
+                if (statusText != null) {
                     Text(
-                        text = checkResult.orEmpty(),
-                        color = if (checkSuccess) Color(0xFF4CAF50) else Color(0xFFFF5252),
+                        text = statusText.orEmpty(),
+                        color = if (isError) Color(0xFFFF5252) else Color(0xFF4CAF50),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
-
-
-
-                OutlinedButton(
-                    onClick = {
-                        checkLoading = true
-                        checkResult = null
-                        scope.launch {
-                            var cleanSess = sess.trim()
-                            val pad = cleanSess.length % 4
-                            if (pad != 0) {
-                                cleanSess += "=".repeat(4 - pad)
-                            }
-                            val payload = JSONObject().apply {
-                                put("action", "telegram_check")
-                                put("api_id", id.trim())
-                                put("api_hash", hash.trim())
-                                put("session", cleanSess)
-                            }
-                            val res = withContext(Dispatchers.IO) {
-                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                            }
-                            checkLoading = false
-                            if (res != null && res.optBoolean("ok", false)) {
-                                val rObj = res.optJSONObject("result")
-                                val u = rObj?.optString("user", "Account Verified") ?: "Verified"
-                                checkSuccess = true
-                                checkResult = "Connected: $u"
-                            } else {
-                                checkSuccess = false
-                                checkResult = "Error: ${res?.optString("error") ?: "Connection failed"}"
-                            }
-                        }
-                    },
-                    enabled = !checkLoading && id.isNotBlank() && hash.isNotBlank() && sess.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Outlined.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(if (checkLoading) "Testing connection..." else "Test Connection", fontSize = 12.sp)
-                }
             }
         },
-        confirmButton = {
-            Button(
-                onClick = {
-                    var s = sess.trim()
-                    val pad = s.length % 4
-                    if (pad != 0) {
-                        s += "=".repeat(4 - pad)
-                    }
-                    onSave(id.trim(), hash.trim(), s)
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                shape = RoundedCornerShape(10.dp),
-            ) {
-                Text("Save")
-            }
-        },
+        confirmButton = {},
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
-}
-
-@Composable
-private fun GitHubCard(
-    update: UpdateInfo,
-    isDownloadingUpdate: Boolean,
-    updateProgress: Float,
-    updateStatusText: String,
-    onCheck: () -> Unit,
-    onInstallUpdate: () -> Unit,
-) {
-    val title = when {
-        isDownloadingUpdate -> "Downloading update..."
-        update.loading -> "Checking updates..."
-        update.error.isNotBlank() -> "Update check unavailable"
-        update.appUpdateAvailable -> "Update ready: ${update.newVersionName.ifBlank { "Arc" }}"
-        else -> "Up to date"
-    }
-    val body = when {
-        isDownloadingUpdate -> updateStatusText.ifBlank { "Downloading update APK into cache..." }
-        update.loading -> "Checking GitHub for updates."
-        update.error.isNotBlank() -> "Could not reach repository."
-        update.appUpdateAvailable -> {
-            if (update.commitMessage.isNotBlank()) update.commitMessage
-            else if (update.releaseTag.isNotBlank()) "Release ${update.releaseTag} includes an updated APK."
-            else "A new update is ready on GitHub."
-        }
-        else -> "Arc is up to date."
-    }
-    Card(colors = CardDefaults.cardColors(containerColor = ArcSurface), shape = RoundedCornerShape(20.dp)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                MediaGlyph(if (isDownloadingUpdate || update.appUpdateAvailable) Icons.Outlined.FileDownload else Icons.Outlined.Refresh, Modifier.size(40.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("Updates", color = ArcMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    Text(title, fontWeight = FontWeight.Bold)
-                    Text(body, color = ArcMuted, fontSize = 11.sp)
-                }
-            }
-            if (isDownloadingUpdate) {
-                if (updateProgress >= 0f) {
-                    LinearProgressIndicator(
-                        progress = { updateProgress },
-                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                        color = ArcWhite,
-                        trackColor = ArcRaised,
-                    )
-                } else {
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                        color = ArcWhite,
-                        trackColor = ArcRaised,
-                    )
-                }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                Text("Universal Downloader", color = ArcSubtle, fontSize = 10.sp)
-                TextButton(
-                    onClick = if (update.appUpdateAvailable) onInstallUpdate else onCheck,
-                    enabled = !update.loading && !isDownloadingUpdate
-                ) {
-                    Text(
-                        when {
-                            isDownloadingUpdate -> "Downloading..."
-                            update.appUpdateAvailable -> "Install Update"
-                            else -> "Check Now"
-                        }
-                    )
-                }
-            }
-        }
-    }
 }
 
 @Composable

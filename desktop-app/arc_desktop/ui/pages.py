@@ -837,8 +837,6 @@ class SettingsPage(QWidget):
     prefer_vlc_changed = Signal(bool)
     telegram_test_requested = Signal(str, str, str)
     telegram_saved = Signal(str, str, str)
-    check_updates_requested = Signal()
-    open_release_requested = Signal()
     scan_requested = Signal()
     install_requested = Signal(str)
 
@@ -956,29 +954,6 @@ class SettingsPage(QWidget):
         tg_layout.addLayout(tg_buttons)
         self._scroll.add(tg_card)
 
-        # ------------------------------------------------------------ updates
-        self._scroll.add(self._group("Updates"))
-        self.update_card, self.update_layout = card("vertical", 7, 14, "Card")
-        self.update_title = label("Updates", "SectionHeader")
-        self.update_body = label("Check GitHub for a newer engine or release.", "Meta")
-        self.update_body.setWordWrap(True)
-        self.update_layout.addWidget(self.update_title)
-        self.update_layout.addWidget(self.update_body)
-        update_buttons = QHBoxLayout()
-        update_buttons.setSpacing(8)
-        self.check_updates_button = QPushButton("Check now")
-        self.check_updates_button.setCursor(Qt.PointingHandCursor)
-        self.check_updates_button.clicked.connect(lambda: self.check_updates_requested.emit())
-        self.open_release_button = QPushButton("Open releases")
-        self.open_release_button.setObjectName("Ghost")
-        self.open_release_button.setCursor(Qt.PointingHandCursor)
-        self.open_release_button.clicked.connect(lambda: self.open_release_requested.emit())
-        update_buttons.addWidget(self.check_updates_button)
-        update_buttons.addWidget(self.open_release_button)
-        update_buttons.addStretch(1)
-        self.update_layout.addLayout(update_buttons)
-        self._scroll.add(self.update_card)
-
         self._scroll.add_stretch()
         self._accel_rows: list[QWidget] = []
         self._install_buttons: dict[str, QPushButton] = {}
@@ -1082,14 +1057,9 @@ class SettingsPage(QWidget):
             f"color: {theme.ARC_SUCCESS if ok else theme.ARC_ERROR}; font-size: 11px; font-weight: 600;"
         )
 
-    def set_update(self, title: str, body: str, available: bool = False) -> None:
-        self.update_title.setText(title)
-        self.update_body.setText(body)
-        self.open_release_button.setVisible(True)
-        self.check_updates_button.setText("Download update" if available else "Check now")
-
     def telegram_values(self) -> tuple[str, str, str]:
-        return self.tg_id.text().strip(), self.tg_hash.text().strip(), self.tg_session.text().strip()
+        clean_sess = re.sub(r'\s+', '', self.tg_session.text())
+        return self.tg_id.text().strip(), self.tg_hash.text().strip(), clean_sess
 
     def _test_telegram(self) -> None:
         api_id, api_hash, session = self.telegram_values()
