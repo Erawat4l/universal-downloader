@@ -40,6 +40,61 @@ except Exception:
 
 # Lazy-loaded modules for instant CLI startup (0.2s launch)
 _YTDLP_MODULE = None
+_YTDLP_PATCHED = False
+
+def _patch_ytdlp_muxer():
+    global _YTDLP_PATCHED
+    if _YTDLP_PATCHED:
+        return
+    try:
+        from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor, FFmpegMergerPP
+        from yt_dlp.utils import prepend_extension
+
+        FFmpegPostProcessor.available = property(lambda self: True)
+        FFmpegPostProcessor.basename = property(lambda self: 'ffmpeg')
+
+        orig_determine = FFmpegPostProcessor._determine_executables
+        def custom_determine(self):
+            res = orig_determine(self)
+            if not res or 'ffmpeg' not in res or not shutil.which('ffmpeg'):
+                res = {'ffmpeg': 'native_muxer', 'ffprobe': 'native_muxer'}
+            return res
+        FFmpegPostProcessor._determine_executables = custom_determine
+
+        orig_merger_run = FFmpegMergerPP.run
+        def custom_merger_run(self, info):
+            if shutil.which("ffmpeg"):
+                try:
+                    return orig_merger_run(self, info)
+                except Exception as e:
+                    print(f"[WARN] FFmpeg merge failed: {e}, falling back to native muxer")
+            files = info.get('__files_to_merge', [])
+            if len(files) == 2:
+                target_out = info.get('filepath') or ''
+                v_file, a_file = files[0], files[1]
+                req = info.get('requested_formats', [])
+                if len(req) == 2 and req[0].get('vcodec') == 'none':
+                    v_file, a_file = files[1], files[0]
+                temp_out = prepend_extension(target_out, 'muxed')
+                if os.path.exists(temp_out):
+                    try: os.remove(temp_out)
+                    except Exception: pass
+                success = mux_video_and_audio(v_file, a_file, temp_out)
+                if success and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                    if os.path.exists(target_out):
+                        try: os.remove(target_out)
+                        except Exception: pass
+                    os.rename(temp_out, target_out)
+                    for f in files:
+                        if f != target_out and os.path.exists(f):
+                            try: os.remove(f)
+                            except Exception: pass
+                    return files, info
+            return orig_merger_run(self, info)
+        FFmpegMergerPP.run = custom_merger_run
+        _YTDLP_PATCHED = True
+    except Exception as e:
+        print(f"[WARN] Failed to patch yt-dlp muxer: {e}")
 
 def load_ytdlp():
     global _YTDLP_MODULE
@@ -47,6 +102,7 @@ def load_ytdlp():
         try:
             import yt_dlp as _mod
             _YTDLP_MODULE = _mod
+            _patch_ytdlp_muxer()
         except ImportError:
             _YTDLP_MODULE = False
     return _YTDLP_MODULE if _YTDLP_MODULE is not False else None
@@ -1460,34 +1516,48 @@ def mux_video_and_audio(video_path, audio_path, output_path):
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
         return False
 
+    temp_out = output_path
+    needs_rename = False
+    if output_path in (video_path, audio_path):
+        temp_out = output_path + ".mux_temp.mp4"
+        needs_rename = True
+
+    muxed = False
     # 1. Try Android Native MediaMuxer via EmbeddedEngine
     try:
         from com.erawat.arc import EmbeddedEngine
         mux_fn = getattr(EmbeddedEngine, 'mux', None) or getattr(getattr(EmbeddedEngine, 'INSTANCE', None), 'mux', None)
-        if mux_fn and mux_fn(str(video_path), str(audio_path), str(output_path)):
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                try: os.remove(video_path)
-                except Exception: pass
-                try: os.remove(audio_path)
-                except Exception: pass
-                return True
+        if mux_fn and mux_fn(str(video_path), str(audio_path), str(temp_out)):
+            if os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                muxed = True
     except Exception as e:
         print(f"[WARN] Native Android muxing: {e}")
 
     # 2. Try FFmpeg (Desktop / CLI / Termux)
-    if shutil.which("ffmpeg"):
+    if not muxed and shutil.which("ffmpeg"):
         try:
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", output_path]
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", temp_out]
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                try: os.remove(video_path)
-                except Exception: pass
-                try: os.remove(audio_path)
-                except Exception: pass
-                return True
+            if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                muxed = True
         except Exception as e:
             print(f"[WARN] FFmpeg muxing: {e}")
 
+    if muxed:
+        try: os.remove(video_path)
+        except Exception: pass
+        try: os.remove(audio_path)
+        except Exception: pass
+        if needs_rename:
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except Exception: pass
+            os.rename(temp_out, output_path)
+        return True
+
+    if needs_rename and os.path.exists(temp_out):
+        try: os.remove(temp_out)
+        except Exception: pass
     return False
 
 def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None):
@@ -1596,7 +1666,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             else:
                 if is_video_only_stream:
-                    render_download_progress(88.0, "Processing audio...", "Processing", "--", job_id=jid)
+                    render_download_progress(88.0, "Audio track downloading...", "Processing", "--", job_id=jid)
                 elif is_audio_only_stream:
                     render_download_progress(98.5, "Muxing media...", "Muxing", "--", job_id=jid)
                 else:
@@ -1622,14 +1692,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
         if q_match:
             cap = int(q_match.group(1))
-            format_spec = (
-                f"best[height<={cap}][vcodec!=none][acodec!=none]/"
-                f"best[height<={cap}][protocol^=m3u8]/"
-                f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={cap}]+bestaudio/"
-                f"best[height<={cap}]/"
-                f"best"
-            )
+            if cap <= 360:
+                format_spec = (
+                    f"best[height<={cap}][vcodec!=none][acodec!=none]/"
+                    f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={cap}]+bestaudio/"
+                    f"best[height<={cap}]/"
+                    f"best"
+                )
+            else:
+                format_spec = (
+                    f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={cap}]+bestaudio/"
+                    f"best[height={cap}][vcodec!=none][acodec!=none]/"
+                    f"best[height<={cap}]/"
+                    f"best"
+                )
         else:
             format_spec = (
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
@@ -4343,11 +4421,11 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
         last_err = None
 
         client_attempts = [
-            None,
-            ['web', 'default'],
+            ['visionos', 'android'],
+            ['android', 'ios'],
             ['tv', 'mweb'],
-            ['ios', 'android'],
-            ['android'],
+            ['web', 'default'],
+            None,
         ]
 
         safari_headers = {
@@ -4397,6 +4475,8 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
 
         if not info or not formats or not any(isinstance(f, dict) and f.get("url") for f in formats):
             err_msg = last_err or "No playable video streams found (YouTube bot verification or restriction)"
+            if "not a bot" in err_msg.lower() or "confirm you" in err_msg.lower():
+                raise Exception("YouTube IP verification detected. Toggle Airplane Mode to refresh cellular IP or add cookies.txt to /sdcard/Download/")
             clean_err = re.sub(r'https?://\S+', '', err_msg).strip()
             raise Exception(f"YouTube resolution failed: {clean_err}")
 
@@ -4408,31 +4488,40 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
 
         # Check if Google Video HLS Master Manifest is available
         hls_manifest_url = None
+        manifest_headers = {}
         for f in formats:
             m_u = f.get('manifest_url')
             if m_u and 'm3u8' in m_u:
                 hls_manifest_url = m_u
+                manifest_headers = f.get('http_headers') or {}
                 break
+
+        if not manifest_headers:
+            manifest_headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+            }
 
         parsed_hls = {}
         hls_media_header = []
         if hls_manifest_url:
             try:
-                hls_text = requests.get(hls_manifest_url, timeout=4).text
-                hls_lines = hls_text.splitlines()
-                for line in hls_lines:
-                    if line.startswith("#EXT-X-MEDIA:"):
-                        hls_media_header.append(line)
-                for i, line in enumerate(hls_lines):
-                    if 'RESOLUTION=' in line and i + 1 < len(hls_lines):
-                        m_h = re.search(r'RESOLUTION=\d+x(\d+)', line)
-                        if m_h:
-                            h_val = int(m_h.group(1))
-                            if h_val not in parsed_hls:
-                                parsed_hls[h_val] = {
-                                    'inf': line,
-                                    'v_uri': hls_lines[i + 1],
-                                }
+                hls_resp = requests.get(hls_manifest_url, headers=manifest_headers, timeout=10)
+                if hls_resp.status_code == 200:
+                    hls_text = hls_resp.text
+                    hls_lines = hls_text.splitlines()
+                    for line in hls_lines:
+                        if line.startswith("#EXT-X-MEDIA:"):
+                            hls_media_header.append(line)
+                    for i, line in enumerate(hls_lines):
+                        if 'RESOLUTION=' in line and i + 1 < len(hls_lines):
+                            m_h = re.search(r'RESOLUTION=\d+x(\d+)', line)
+                            if m_h:
+                                h_val = int(m_h.group(1))
+                                if h_val not in parsed_hls:
+                                    parsed_hls[h_val] = {
+                                        'inf': line,
+                                        'v_uri': hls_lines[i + 1],
+                                    }
             except Exception as e:
                 pass
 
@@ -4525,7 +4614,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                     quality_urls_map[q_lbl] = progressive[0]["url"]
 
         # Map "Best Available"
-        if hls_manifest_url:
+        top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_urls_map), None)
+        if top_res_key:
+            quality_urls_map["Best Available"] = quality_urls_map[top_res_key]
+        elif hls_manifest_url:
             quality_urls_map["Best Available"] = hls_manifest_url
         elif progressive:
             progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
@@ -5142,8 +5234,15 @@ def app_telegram_qr_check(payload):
         return {"ok": True, "connected": False, "error": err_msg}
 
     if isinstance(res, LoginTokenSuccess):
+        auth_obj = getattr(res, "authorization", None)
+        user = getattr(auth_obj, "user", None) or getattr(res, "user", None)
+        if user:
+            try:
+                loop.run_until_complete(client.storage.user_id(user.id))
+                loop.run_until_complete(client.storage.is_bot(False))
+            except Exception:
+                pass
         session_str = _safe_export_session(client, loop)
-        user = getattr(res.authorization, "user", None)
         user_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or "Telegram User"
         _PENDING_TG_CLIENTS.pop(session_key, None)
         return {
@@ -5157,6 +5256,64 @@ def app_telegram_qr_check(payload):
             "api_hash": entry["api_hash"],
         }
     return {"ok": True, "connected": False}
+
+def app_telegram_logout(payload):
+    global _PENDING_TG_CLIENTS
+    for k, v in list(_PENDING_TG_CLIENTS.items()):
+        try:
+            cl = v.get("client")
+            lp = v.get("loop")
+            if cl and lp and cl.is_connected:
+                lp.run_until_complete(cl.stop())
+        except Exception:
+            pass
+    _PENDING_TG_CLIENTS.clear()
+
+    fb_id, fb_hash, _ = _get_fallback_tg_creds()
+    api_id = re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip()
+    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
+    session = re.sub(r'\s+', '', str(payload.get("session") or payload.get("session_string") or "")).strip()
+
+    if not session:
+        return {"ok": True, "logged_out": True, "message": "No active session to terminate"}
+
+    missing = len(session) % 4
+    if missing:
+        session += '=' * (4 - missing)
+
+    try:
+        from pyrogram import Client
+    except ImportError:
+        return {"ok": True, "logged_out": True}
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    async def _do_logout():
+        client = Client(
+            "temp_tg_logout",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            session_string=session,
+            in_memory=True,
+        )
+        await client.start()
+        try:
+            await client.log_out()
+        finally:
+            if client.is_connected:
+                await client.stop()
+
+    try:
+        loop.run_until_complete(_do_logout())
+        return {"ok": True, "logged_out": True}
+    except Exception as e:
+        print(f"[WARN] Telegram logout: {e}")
+        return {"ok": True, "logged_out": True, "error": str(e)}
 
 
 def sanitize_app_logs(raw_text):
@@ -5210,6 +5367,8 @@ def run_app_json_request(payload):
                 result = app_telegram_qr_init(payload)
             elif action == "telegram_qr_check":
                 result = app_telegram_qr_check(payload)
+            elif action == "telegram_logout":
+                result = app_telegram_logout(payload)
             elif action == "igl":
                 result = app_igl_catalog()
             elif action == "igl_resolve":

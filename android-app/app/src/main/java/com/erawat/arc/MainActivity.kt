@@ -1806,6 +1806,7 @@ private fun ArcApp(
                         telegramUserPhone = telegramUserPhone,
                         onTelegramSetup = { showTelegramSetup = true },
                         onTelegramDisconnect = {
+                            val oldSession = telegramSession
                             telegramSession = ""
                             telegramUserName = ""
                             telegramUserPhone = ""
@@ -1815,6 +1816,19 @@ private fun ArcApp(
                                 .remove("telegram_user_phone")
                                 .apply()
                             message("Telegram disconnected.")
+                            if (oldSession.isNotBlank()) {
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        EmbeddedEngine.execute(
+                                            context,
+                                            JSONObject().apply {
+                                                put("action", "telegram_logout")
+                                                put("session", oldSession)
+                                            }
+                                        )
+                                    } catch (_: Exception) {}
+                                }
+                            }
                         },
                     )
                 }
