@@ -4322,11 +4322,11 @@ def app_resolve(url, quality="best", season=None, episode=None):
         last_err = None
 
         client_attempts = [
-            ['ios', 'android'],
-            ['tv_embedded', 'android'],
-            ['android_creator'],
-            ['android'],
             None,
+            ['web', 'default'],
+            ['tv', 'mweb'],
+            ['ios', 'android'],
+            ['android'],
         ]
 
         safari_headers = {
@@ -4437,15 +4437,16 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 elif dim >= 426 or h >= 240: tiers.add(240)
                 elif dim >= 256 or h >= 144: tiers.add(144)
 
-        # Enforce all standard descending tiers based on maximum video resolution
-        detected_max = max([info.get('height') or 0] + [f.get('height') or 0 for f in formats if f.get('vcodec') != 'none'] + list(tiers))
-        max_h = max(detected_max, 1080)  # Always ensure standard HD/SD tiers are available even on slow networks
+        # Enforce all standard descending tiers based on real detected maximum video resolution
+        valid_heights = [info.get('height') or 0] + [f.get('height') or 0 for f in formats if isinstance(f, dict) and f.get('vcodec') != 'none'] + list(tiers)
+        detected_max = max(valid_heights) if valid_heights else 720
+        max_h = detected_max if detected_max > 0 else 720
         standard_tiers = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
         for st in standard_tiers:
             if st <= max_h:
                 tiers.add(st)
         if not tiers:
-            tiers = {1080, 720, 480, 360}
+            tiers = {max_h}
 
         quality_labels = {
             4320: "4320p (8K)",
