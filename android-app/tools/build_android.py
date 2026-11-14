@@ -354,15 +354,15 @@ def configure_sdk_for_gradle(sdk: Path) -> None:
 
 
 def sync_python_engine() -> None:
-    """Keep the checked-in Android engine independent of desktop/CLI modifications."""
-    if PYTHON_ENGINE_DEST.exists():
-        say("Using the checked-in Android engine at android-app/app/src/main/python/dl.py")
-        return
+    """Sync root dl.py to android-app bundled Python engine."""
     if not PYTHON_ENGINE_SOURCE.exists():
         raise BuildError(f"Bundled Python engine source is missing: {PYTHON_ENGINE_SOURCE}")
-    PYTHON_ENGINE_DEST.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)
-    say(f"Bundled Python engine initialized from {PYTHON_ENGINE_SOURCE}")
+    if not PYTHON_ENGINE_DEST.exists() or PYTHON_ENGINE_DEST.read_bytes() != PYTHON_ENGINE_SOURCE.read_bytes():
+        PYTHON_ENGINE_DEST.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)
+        say(f"Bundled Python engine synced from {PYTHON_ENGINE_SOURCE}")
+    else:
+        say("Bundled Python engine is up to date.")
 
     if PYTHON_IGL_SOURCE.exists():
         if not PYTHON_IGL_DEST.exists() or PYTHON_IGL_DEST.read_bytes() != PYTHON_IGL_SOURCE.read_bytes():

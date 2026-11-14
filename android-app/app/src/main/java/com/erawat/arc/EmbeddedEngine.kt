@@ -68,16 +68,28 @@ object EmbeddedEngine {
         return try {
             val vFile = File(videoPath)
             val aFile = File(audioPath)
-            if (!vFile.exists() || !aFile.exists()) return false
+            if (!vFile.exists() || !aFile.exists() || vFile.length() == 0L || aFile.length() == 0L) {
+                android.util.Log.e("EmbeddedEngine", "Mux input file missing or empty: $videoPath (${vFile.length()}b), $audioPath (${aFile.length()}b)")
+                return false
+            }
 
             val outFile = File(outputPath)
             outFile.parentFile?.mkdirs()
             if (outFile.exists()) outFile.delete()
 
-            videoExtractor = MediaExtractor().apply { setDataSource(videoPath) }
-            audioExtractor = MediaExtractor().apply { setDataSource(audioPath) }
+            videoExtractor = MediaExtractor()
+            java.io.FileInputStream(vFile).use { vFis ->
+                videoExtractor.setDataSource(vFis.fd)
+            }
 
-            val outFormat = if (outputPath.endsWith(".webm", ignoreCase = true)) {
+            audioExtractor = MediaExtractor()
+            java.io.FileInputStream(aFile).use { aFis ->
+                audioExtractor.setDataSource(aFis.fd)
+            }
+
+            val isWebm = outputPath.endsWith(".webm", ignoreCase = true) ||
+                         videoPath.endsWith(".webm", ignoreCase = true)
+            val outFormat = if (isWebm) {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
             } else {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
@@ -107,6 +119,7 @@ object EmbeddedEngine {
             }
 
             if (videoTrackIndex == -1 || audioTrackIndex == -1) {
+                android.util.Log.e("EmbeddedEngine", "Tracks not found: vTrack=$videoTrackIndex, aTrack=$audioTrackIndex")
                 return false
             }
 
@@ -147,11 +160,16 @@ object EmbeddedEngine {
                 }
             }
 
-            true
-        } catch (_: Exception) {
+            muxer.stop()
+            val success = outFile.exists() && outFile.length() > 0
+            if (!success) {
+                android.util.Log.e("EmbeddedEngine", "Muxer completed but destination file missing or empty: $outputPath")
+            }
+            success
+        } catch (e: Exception) {
+            android.util.Log.e("EmbeddedEngine", "Native mux failed with exception", e)
             false
         } finally {
-            try { muxer?.stop() } catch (_: Exception) {}
             try { muxer?.release() } catch (_: Exception) {}
             try { videoExtractor?.release() } catch (_: Exception) {}
             try { audioExtractor?.release() } catch (_: Exception) {}

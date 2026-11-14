@@ -1824,6 +1824,8 @@ private fun ArcApp(
                                             JSONObject().apply {
                                                 put("action", "telegram_logout")
                                                 put("session", oldSession)
+                                                put("api_id", telegramApiId)
+                                                put("api_hash", telegramApiHash)
                                             }
                                         )
                                     } catch (_: Exception) {}

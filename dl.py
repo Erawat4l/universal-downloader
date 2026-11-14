@@ -90,6 +90,9 @@ def _patch_ytdlp_muxer():
                             try: os.remove(f)
                             except Exception: pass
                     return files, info
+                else:
+                    print(f"[ERROR] Native muxer failed to mux {v_file} and {a_file}")
+                    raise RuntimeError(f"Native muxer could not combine video and audio streams: {v_file}, {a_file}")
             return orig_merger_run(self, info)
         FFmpegMergerPP.run = custom_merger_run
         _YTDLP_PATCHED = True
@@ -213,30 +216,7 @@ def print_adm_link(file_path):
     start_local_http_server()
     if not file_path or not os.path.exists(file_path): return
     basename = os.path.basename(file_path)
-    ext = os.path.splitext(basename)[1] or ".mp4"
-    dir_name = os.path.dirname(file_path) or "/sdcard/Download"
-    
-    short_name = None
-    for i in range(1, 100):
-        cand = f"v{i}{ext}"
-        cand_p = os.path.join(dir_name, cand)
-        if not os.path.exists(cand_p):
-            try:
-                os.link(file_path, cand_p)
-                short_name = cand
-            except Exception:
-                try:
-                    shutil.copyfile(file_path, cand_p)
-                    short_name = cand
-                except Exception:
-                    pass
-            break
-        elif os.path.exists(cand_p) and os.path.getsize(cand_p) == os.path.getsize(file_path):
-            short_name = cand
-            break
-
-    display_name = short_name or basename
-    encoded = urllib.parse.quote(display_name)
+    encoded = urllib.parse.quote(basename)
     local_url = f"http://localhost:8080/{encoded}"
     my_ip = "127.0.0.1"
     try:
@@ -475,7 +455,7 @@ def start_local_stream_proxy(target_url, custom_headers=None, port=8765):
     if LOCAL_STREAM_PROXY is None:
         for p in [port, 8766, 8767, 8768]:
             try:
-                server = ThreadedStreamProxyServer(('127.0.0.1', p), StreamProxyRequestHandler)
+                server = ThreadedStreamProxyServer(('0.0.0.0', p), StreamProxyRequestHandler)
                 t = threading.Thread(target=server.serve_forever, daemon=True)
                 t.start()
                 LOCAL_STREAM_PROXY = server
@@ -620,12 +600,12 @@ def decrypt_netmirror_tv_url(encrypted_val):
         return None
 
 def clean_filename(title, default_ext=""):
-    title = re.sub(r'[\\/*?:"<>|\'’`"｜#%&{}\\<>*?/$!\'":@+`|=]', '', str(title or ""))
+    title = re.sub(r'[\\/*?:"<>|]', '', str(title or ""))
     title = re.sub(r'[\x00-\x1f\x7f]', '', title)
     title = re.sub(r'[\s_]+', ' ', title).strip('_. ')
     base, ext = os.path.splitext(title)
-    # Strip format tags like .f137, .f398, .part
-    base = re.sub(r'[\._-]f\d+$', '', base, flags=re.I).strip()
+    # Strip format tags like .f137, .f398, .f140-20, .part
+    base = re.sub(r'[\._-]f[a-zA-Z0-9_\-]+$', '', base, flags=re.I).strip()
     # Strip YouTube IDs like [hpwAMSaB28c] or (hpwAMSaB28c)
     base = re.sub(r'\s*\[[a-zA-Z0-9_-]{11}\]$', '', base).strip()
     base = re.sub(r'\s*\([a-zA-Z0-9_-]{11}\)$', '', base).strip()
@@ -672,7 +652,7 @@ def _cleanup_download_cache(cache_dir, target_dir, job_id=None, keep_path=None):
                     continue
                 if (jid_str and jid_str in item and item.startswith(('.temp', '.arc_stage', 'ytdl_raw'))) or \
                    item.endswith(('.part', '.ytdl', '.aria2', '.temp')) or \
-                   re.search(r'[\._-]f\d+\.(mp4|m4a|webm|part)$', item, re.I):
+                   re.search(r'[\._-]f[a-zA-Z0-9_\-]+\.(mp4|m4a|webm|part)$', item, re.I):
                     if os.path.isdir(item_path):
                         shutil.rmtree(item_path, ignore_errors=True)
                     else:
@@ -1319,7 +1299,7 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
     if shutil.which('aria2c'):
         speed_opts['external_downloader'] = {'default': 'aria2c'}
         speed_opts['external_downloader_args'] = {
-            'default': ['-j', '16', '-s', '16', '-x', '16', '-k', '1M', '--min-split-size=1M', '--allow-overwrite=true', '--disable-ipv6=true', '--async-dns=false', '--file-allocation=falloc']
+            'default': ['-j', '16', '-s', '16', '-x', '16', '-k', '1M', '--min-split-size=1M', '--allow-overwrite=true', '--file-allocation=falloc']
         }
 
     opts.update(speed_opts)
@@ -1692,25 +1672,28 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
         if q_match:
             cap = int(q_match.group(1))
-            if cap <= 360:
+            if cap <= 1080:
                 format_spec = (
-                    f"best[height<={cap}][vcodec!=none][acodec!=none]/"
+                    f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={cap}][vcodec^=avc]+bestaudio[ext=m4a]/"
                     f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
                     f"bestvideo[height<={cap}]+bestaudio/"
+                    f"best[height<={cap}][vcodec^=avc]/"
                     f"best[height<={cap}]/"
                     f"best"
                 )
             else:
                 format_spec = (
-                    f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={cap}][ext=webm]+bestaudio[ext=webm]/"
+                    f"bestvideo[height<={cap}][vcodec^=vp9]+bestaudio[ext=webm]/"
                     f"bestvideo[height<={cap}]+bestaudio/"
-                    f"best[height={cap}][vcodec!=none][acodec!=none]/"
-                    f"best[height<={cap}]/"
                     f"best"
                 )
         else:
             format_spec = (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/"
                 "best[vcodec!=none][acodec!=none]/"
                 "best"
@@ -1748,6 +1731,21 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         except Exception: pass
                     return None
 
+                # Verify target file actually exists on disk!
+                if not is_playlist:
+                    if not filename or not os.path.exists(filename) or os.path.getsize(filename) == 0:
+                        base, _ = os.path.splitext(filename or "")
+                        found_path = None
+                        for ext in ('.mp4', '.mkv', '.webm', '.m4a'):
+                            alt = base + ext
+                            if os.path.exists(alt) and os.path.getsize(alt) > 0:
+                                found_path = alt
+                                break
+                        if found_path:
+                            filename = found_path
+                        else:
+                            raise RuntimeError(f"Downloaded media file not found on device: {filename}")
+
                 # Ensure clean filename (strip random IDs in brackets, format tags, version suffixes)
                 if filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
@@ -1760,7 +1758,6 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 # Purge any transient cache or fragment parts
                 _cleanup_download_cache(cache_dir, out_dir, job_id=jid, keep_path=filename)
                 sync_to_sdcard_if_needed(filename)
-                print_adm_link(filename)
             if jid:
                 render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             return filename
@@ -4486,47 +4483,32 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
             if isinstance(f, dict) and f.get("url") and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
         ]
 
-        # Check if Google Video HLS Master Manifest is available
-        hls_manifest_url = None
-        manifest_headers = {}
-        for f in formats:
-            m_u = f.get('manifest_url')
-            if m_u and 'm3u8' in m_u:
-                hls_manifest_url = m_u
-                manifest_headers = f.get('http_headers') or {}
+        # 2. Collect HLS audio and video formats (Google Video HLS manifests)
+        hls_audio_formats = [
+            f for f in formats
+            if isinstance(f, dict) and f.get("url") and
+               ('m3u8' in f.get('protocol', '') or 'm3u8' in str(f.get('url', '')) or 'manifest/hls_playlist' in str(f.get('url', ''))) and
+               f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')
+        ]
+        hls_audio_fmt = None
+        for af in hls_audio_formats:
+            lang = str(af.get('language') or '').lower()
+            note = str(af.get('format_note') or '').lower()
+            if 'en' in lang or 'default' in note or 'original' in note:
+                hls_audio_fmt = af
                 break
+        if not hls_audio_fmt and hls_audio_formats:
+            hls_audio_fmt = hls_audio_formats[0]
 
-        if not manifest_headers:
-            manifest_headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
-            }
-
-        parsed_hls = {}
-        hls_media_header = []
-        if hls_manifest_url:
-            try:
-                hls_resp = requests.get(hls_manifest_url, headers=manifest_headers, timeout=10)
-                if hls_resp.status_code == 200:
-                    hls_text = hls_resp.text
-                    hls_lines = hls_text.splitlines()
-                    for line in hls_lines:
-                        if line.startswith("#EXT-X-MEDIA:"):
-                            hls_media_header.append(line)
-                    for i, line in enumerate(hls_lines):
-                        if 'RESOLUTION=' in line and i + 1 < len(hls_lines):
-                            m_h = re.search(r'RESOLUTION=\d+x(\d+)', line)
-                            if m_h:
-                                h_val = int(m_h.group(1))
-                                if h_val not in parsed_hls:
-                                    parsed_hls[h_val] = {
-                                        'inf': line,
-                                        'v_uri': hls_lines[i + 1],
-                                    }
-            except Exception as e:
-                pass
+        hls_video_formats = [
+            f for f in formats
+            if isinstance(f, dict) and f.get("url") and
+               ('m3u8' in f.get('protocol', '') or 'm3u8' in str(f.get('url', '')) or 'manifest/hls_playlist' in str(f.get('url', ''))) and
+               f.get('vcodec') not in (None, 'none')
+        ]
 
         # Extract REAL video quality tiers in descending order (exclude storyboard/thumbnails like sb0)
-        tiers = set(parsed_hls.keys())
+        tiers = set()
         for f in formats:
             if f.get('vcodec') == 'none':
                 continue
@@ -4546,6 +4528,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                 elif dim >= 640 or h >= 360: tiers.add(360)
                 elif dim >= 426 or h >= 240: tiers.add(240)
                 elif dim >= 256 or h >= 144: tiers.add(144)
+
+        for vf in hls_video_formats:
+            vh = vf.get('height') or 0
+            if vh: tiers.add(vh)
 
         # Enforce all standard descending tiers based on real detected maximum video resolution
         valid_heights = [info.get('height') or 0] + [f.get('height') or 0 for f in formats if isinstance(f, dict) and f.get('vcodec') != 'none'] + list(tiers)
@@ -4579,37 +4565,48 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
         for q_lbl in real_qualities:
             cap_match = re.search(r"(\d+)p", q_lbl)
             target_h = int(cap_match.group(1)) if cap_match else None
-            p_fmt = None
-            if target_h:
-                matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h]
-                if matching_prog:
-                    p_fmt = matching_prog[0]
 
-            if p_fmt and p_fmt.get("url"):
-                quality_urls_map[q_lbl] = p_fmt["url"]
-            elif target_h and target_h in parsed_hls:
-                # Dynamic HLS master playlist locked to this specific resolution with audio
-                variant_m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n"
-                for media_line in hls_media_header:
-                    variant_m3u8 += media_line + "\n"
-                variant_m3u8 += parsed_hls[target_h]['inf'] + "\n"
-                variant_m3u8 += parsed_hls[target_h]['v_uri'] + "\n"
-                quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_hls_{target_h}.m3u8", variant_m3u8)
-            elif hls_manifest_url:
-                quality_urls_map[q_lbl] = hls_manifest_url
-            elif target_h and target_h <= 360 and progressive:
-                # Only 360p or lower gets progressive fallback
+            # 1. If 360p or lower, prefer direct progressive mp4 stream (format 18)
+            if target_h and target_h <= 360 and progressive:
+                matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
+                if matching_prog:
+                    quality_urls_map[q_lbl] = matching_prog[0]["url"]
+                    continue
                 p_fallback = select_progressive_youtube_format(formats, q_lbl)
                 if p_fallback and p_fallback.get("url"):
                     quality_urls_map[q_lbl] = p_fallback["url"]
-            elif target_h:
-                matching_v = [f for f in formats if (f.get("height") or 0) == target_h and f.get("url") and f.get("vcodec") != "none"]
-                if matching_v:
-                    matching_v.sort(key=lambda f: (
-                        1 if (f.get("ext") == "mp4" or "avc" in str(f.get("vcodec", "")).lower()) else 0,
-                        f.get("tbr") or 0
-                    ), reverse=True)
-                    quality_urls_map[q_lbl] = matching_v[0]["url"]
+                    continue
+
+            # 2. For HD tiers (720p, 1080p, 1440p, 2160p), pair HLS video with HLS audio into a streamable Master Playlist
+            if target_h and hls_audio_fmt and hls_audio_fmt.get('url'):
+                matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) == target_h and f.get("url")]
+                if not matching_hls_v:
+                    matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) <= target_h and f.get("url")]
+                    matching_hls_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
+
+                if matching_hls_v:
+                    v_fmt = matching_hls_v[0]
+                    v_w = v_fmt.get('width') or (target_h * 16 // 9)
+                    v_h = v_fmt.get('height') or target_h
+                    bw = int((v_fmt.get('tbr') or (target_h * 3.5)) * 1000)
+                    a_url = hls_audio_fmt['url']
+                    v_url = v_fmt['url']
+                    master_m3u8 = (
+                        "#EXTM3U\n"
+                        "#EXT-X-VERSION:3\n"
+                        "#EXT-X-INDEPENDENT-SEGMENTS\n"
+                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"\n'
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},AUDIO="audio"\n'
+                        f'{v_url}\n'
+                    )
+                    quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_master_{target_h}.m3u8", master_m3u8)
+                    continue
+
+            # 3. Progressive fallback if available
+            if target_h:
+                matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
+                if matching_prog:
+                    quality_urls_map[q_lbl] = matching_prog[0]["url"]
                 elif progressive:
                     quality_urls_map[q_lbl] = progressive[0]["url"]
 
@@ -4617,8 +4614,6 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
         top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_urls_map), None)
         if top_res_key:
             quality_urls_map["Best Available"] = quality_urls_map[top_res_key]
-        elif hls_manifest_url:
-            quality_urls_map["Best Available"] = hls_manifest_url
         elif progressive:
             progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
             quality_urls_map["Best Available"] = progressive_sorted[0].get("url")
@@ -5270,8 +5265,9 @@ def app_telegram_logout(payload):
     _PENDING_TG_CLIENTS.clear()
 
     fb_id, fb_hash, _ = _get_fallback_tg_creds()
-    api_id = re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip()
-    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
+    raw_api_id = str(payload.get("api_id") or fb_id or "30909654").strip()
+    api_id = re.sub(r'\D+', '', raw_api_id) or "30909654"
+    api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash or "d4b340a406c5c1ed1d7f26d44749602b")).strip()
     session = re.sub(r'\s+', '', str(payload.get("session") or payload.get("session_string") or "")).strip()
 
     if not session:
@@ -5304,6 +5300,8 @@ def app_telegram_logout(payload):
         await client.start()
         try:
             await client.log_out()
+        except Exception as e:
+            print(f"[WARN] Telegram client log_out: {e}")
         finally:
             if client.is_connected:
                 await client.stop()
