@@ -1552,12 +1552,17 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         p_total = info.get('n_entries') or info.get('playlist_count')
         is_p = bool(p_total and p_total > 1)
 
+        vcode = info.get('vcodec') or ''
+        acode = info.get('acodec') or ''
+        is_video_only_stream = (vcode != 'none' and acode == 'none')
+        is_audio_only_stream = (vcode == 'none' and acode != 'none')
+
         if status == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes') or 0
             speed = d.get('speed') or 0
             eta = d.get('eta') or 0
-            percent = (downloaded / total * 100) if total > 0 else 0.0
+            raw_percent = (downloaded / total * 100) if total > 0 else 0.0
             mb_done = downloaded / (1024 * 1024)
             mb_total = total / (1024 * 1024) if total > 0 else 0
             speed_mb = (speed / (1024 * 1024)) if speed else 0
@@ -1568,12 +1573,19 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
             if is_p:
                 cur_idx = p_idx or 1
-                item_pct = percent / 100.0
+                item_pct = raw_percent / 100.0
                 overall_pct = round(((cur_idx - 1 + item_pct) / p_total) * 100, 1)
                 p_label = f"[{cur_idx}/{p_total}] {tot_str}"
                 render_download_progress(overall_pct, p_label, spd_str, eta_str, job_id=jid)
             else:
-                render_download_progress(percent, tot_str, spd_str, eta_str, job_id=jid)
+                if is_video_only_stream:
+                    scaled_pct = round(raw_percent * 0.88, 1)
+                    render_download_progress(scaled_pct, tot_str, spd_str, eta_str, job_id=jid)
+                elif is_audio_only_stream:
+                    scaled_pct = round(88.0 + (raw_percent * 0.10), 1)
+                    render_download_progress(scaled_pct, f"Audio {tot_str}", spd_str, eta_str, job_id=jid)
+                else:
+                    render_download_progress(round(raw_percent, 1), tot_str, spd_str, eta_str, job_id=jid)
         elif status == 'finished':
             if is_p:
                 cur_idx = p_idx or 1
@@ -1583,7 +1595,12 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 else:
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             else:
-                render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                if is_video_only_stream:
+                    render_download_progress(88.0, "Processing audio...", "Processing", "--", job_id=jid)
+                elif is_audio_only_stream:
+                    render_download_progress(98.5, "Muxing media...", "Muxing", "--", job_id=jid)
+                else:
+                    render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
 
     if is_playlist:
         p_title = clean_filename(out_name or 'YouTube Playlist')
@@ -1607,12 +1624,16 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             cap = int(q_match.group(1))
             format_spec = (
                 f"best[height<={cap}][vcodec!=none][acodec!=none]/"
-                f"best[vcodec!=none][acodec!=none]/"
+                f"best[height<={cap}][protocol^=m3u8]/"
+                f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={cap}]+bestaudio/"
                 f"best[height<={cap}]/"
                 f"best"
             )
         else:
             format_spec = (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/"
                 "best[vcodec!=none][acodec!=none]/"
                 "best"
             )
@@ -4474,13 +4495,24 @@ def app_resolve(url, quality="best", season=None, episode=None):
                 matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h]
                 if matching_prog:
                     p_fmt = matching_prog[0]
-            if not p_fmt and target_h and target_h <= 720:
-                p_fmt = select_progressive_youtube_format(formats, q_lbl)
 
             if p_fmt and p_fmt.get("url"):
                 quality_urls_map[q_lbl] = p_fmt["url"]
+            elif target_h and target_h in parsed_hls:
+                # Dynamic HLS master playlist locked to this specific resolution with audio
+                variant_m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+                for media_line in hls_media_header:
+                    variant_m3u8 += media_line + "\n"
+                variant_m3u8 += parsed_hls[target_h]['inf'] + "\n"
+                variant_m3u8 += parsed_hls[target_h]['v_uri'] + "\n"
+                quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_hls_{target_h}.m3u8", variant_m3u8)
             elif hls_manifest_url:
                 quality_urls_map[q_lbl] = hls_manifest_url
+            elif target_h and target_h <= 360 and progressive:
+                # Only 360p or lower gets progressive fallback
+                p_fallback = select_progressive_youtube_format(formats, q_lbl)
+                if p_fallback and p_fallback.get("url"):
+                    quality_urls_map[q_lbl] = p_fallback["url"]
             elif target_h:
                 matching_v = [f for f in formats if (f.get("height") or 0) == target_h and f.get("url") and f.get("vcodec") != "none"]
                 if matching_v:
@@ -4493,11 +4525,11 @@ def app_resolve(url, quality="best", season=None, episode=None):
                     quality_urls_map[q_lbl] = progressive[0]["url"]
 
         # Map "Best Available"
-        if progressive:
-            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
-            quality_urls_map["Best Available"] = hls_manifest_url or progressive_sorted[0].get("url")
-        elif hls_manifest_url:
+        if hls_manifest_url:
             quality_urls_map["Best Available"] = hls_manifest_url
+        elif progressive:
+            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+            quality_urls_map["Best Available"] = progressive_sorted[0].get("url")
         else:
             for q_lbl in real_qualities:
                 if q_lbl != "Best Available" and q_lbl in quality_urls_map:
@@ -4980,15 +5012,16 @@ def app_telegram_sign_in(payload):
     }
 
 def app_telegram_password(payload):
+    session_key = str(payload.get("session_key") or "").strip()
     phone = re.sub(r'[\s\-\(\)]+', '', str(payload.get("phone") or "")).strip()
     password = str(payload.get("password") or "").strip()
 
-    if not phone or not password:
-        raise Exception("Phone and 2FA password are required")
+    if not password:
+        raise Exception("2FA password is required")
 
-    entry = _PENDING_TG_CLIENTS.get(phone)
+    entry = _PENDING_TG_CLIENTS.get(session_key) or _PENDING_TG_CLIENTS.get(phone)
     if not entry or not entry.get("client"):
-        raise Exception("No active login session found for this phone.")
+        raise Exception("No active login session found. Please request a new code or QR.")
 
     client = entry["client"]
     loop = entry["loop"]
@@ -5000,7 +5033,10 @@ def app_telegram_password(payload):
     user = loop.run_until_complete(_pwd())
     session_str = _safe_export_session(client, loop)
     user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or "Telegram User")
-    _PENDING_TG_CLIENTS.pop(phone, None)
+    if session_key:
+        _PENDING_TG_CLIENTS.pop(session_key, None)
+    if phone:
+        _PENDING_TG_CLIENTS.pop(phone, None)
 
     return {
         "ok": True,
@@ -5067,14 +5103,44 @@ def app_telegram_qr_check(payload):
     client = entry["client"]
     loop = entry["loop"]
 
-    from pyrogram.raw.functions.auth import ExportLoginToken
-    from pyrogram.raw.types.auth import LoginTokenSuccess
+    from pyrogram.raw.functions.auth import ExportLoginToken, ImportLoginToken
+    from pyrogram.raw.types.auth import LoginTokenSuccess, LoginTokenMigrateTo
+    from pyrogram.session import Auth, Session
+    from pyrogram.errors import SessionPasswordNeeded
 
     async def _chk():
         token_res = await client.invoke(ExportLoginToken(api_id=entry["api_id"], api_hash=entry["api_hash"], except_ids=[]))
+        if isinstance(token_res, LoginTokenMigrateTo):
+            # The user's account is on a different DC (e.g. DC 5 for Asia/India)
+            # Migrate the Pyrogram client session to that DC
+            await client.session.stop()
+            await client.storage.dc_id(token_res.dc_id)
+            await client.storage.auth_key(
+                await Auth(
+                    client, await client.storage.dc_id(),
+                    await client.storage.test_mode()
+                ).create()
+            )
+            client.session = Session(
+                client, await client.storage.dc_id(),
+                await client.storage.auth_key(),
+                await client.storage.test_mode()
+            )
+            await client.session.start()
+            # Import the accepted login token on the migrated DC
+            token_res = await client.invoke(ImportLoginToken(token=token_res.token))
         return token_res
 
-    res = loop.run_until_complete(_chk())
+    try:
+        res = loop.run_until_complete(_chk())
+    except SessionPasswordNeeded:
+        return {"ok": True, "connected": False, "need_password": True, "session_key": session_key}
+    except Exception as e:
+        err_msg = str(e)
+        if "SESSION_PASSWORD_NEEDED" in err_msg:
+            return {"ok": True, "connected": False, "need_password": True, "session_key": session_key}
+        return {"ok": True, "connected": False, "error": err_msg}
+
     if isinstance(res, LoginTokenSuccess):
         session_str = _safe_export_session(client, loop)
         user = getattr(res.authorization, "user", None)

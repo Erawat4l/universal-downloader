@@ -52,6 +52,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -3540,6 +3543,37 @@ private fun DefaultQualityDialog(
     )
 }
 
+private fun generateQrBitmap(content: String, sizePx: Int = 512): Bitmap? {
+    if (content.isBlank()) return null
+    return try {
+        val hints = java.util.EnumMap<com.google.zxing.EncodeHintType, Any>(com.google.zxing.EncodeHintType::class.java).apply {
+            put(com.google.zxing.EncodeHintType.MARGIN, 1)
+            put(com.google.zxing.EncodeHintType.CHARACTER_SET, "UTF-8")
+        }
+        val bitMatrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+            content,
+            com.google.zxing.BarcodeFormat.QR_CODE,
+            sizePx,
+            sizePx,
+            hints
+        )
+        val width = bitMatrix.width
+        val height = bitMatrix.height
+        val pixels = IntArray(width * height)
+        for (y in 0 until height) {
+            val offset = y * width
+            for (x in 0 until width) {
+                pixels[offset + x] = if (bitMatrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+            }
+        }
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap
+    } catch (_: Exception) {
+        null
+    }
+}
+
 @Composable
 private fun TelegramAuthDialog(
     initialSession: String = "",
@@ -3592,6 +3626,11 @@ private fun TelegramAuthDialog(
                     val u = rObj.optString("user")
                     val p = rObj.optString("phone")
                     onSave(defaultApiId, defaultApiHash, sess, u, p)
+                    break
+                } else if (rObj?.optBoolean("need_password", false) == true) {
+                    selectedTab = 0
+                    phoneStep = 2
+                    statusText = "Two-step verification password required."
                     break
                 }
             }
@@ -3772,6 +3811,58 @@ private fun TelegramAuthDialog(
                                 ) {
                                     Text("Verify & Connect", fontWeight = FontWeight.Bold)
                                 }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            isLoading = true
+                                            statusText = "Resending code to Telegram..."
+                                            isError = false
+                                            codeInput = ""
+                                            scope.launch {
+                                                val payload = JSONObject().apply {
+                                                    put("action", "telegram_send_code")
+                                                    put("api_id", defaultApiId)
+                                                    put("api_hash", defaultApiHash)
+                                                    put("phone", phoneInput)
+                                                }
+                                                val res = withContext(Dispatchers.IO) {
+                                                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                                                }
+                                                isLoading = false
+                                                if (res != null && res.optBoolean("ok", false)) {
+                                                    val rObj = res.optJSONObject("result")
+                                                    phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
+                                                    statusText = "New code sent to your Telegram app!"
+                                                } else {
+                                                    isError = true
+                                                    statusText = res?.optString("error") ?: "Failed to resend code"
+                                                }
+                                            }
+                                        },
+                                        enabled = !isLoading,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("Resend Code", fontSize = 11.sp)
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            phoneStep = 0
+                                            codeInput = ""
+                                            statusText = null
+                                            isError = false
+                                        },
+                                        enabled = !isLoading,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("Change Phone", fontSize = 11.sp)
+                                    }
+                                }
                             }
                             2 -> {
                                 Text("Enter your 2FA Two-Step Verification Password.", color = ArcMuted, fontSize = 11.sp)
@@ -3792,6 +3883,7 @@ private fun TelegramAuthDialog(
                                             val payload = JSONObject().apply {
                                                 put("action", "telegram_password")
                                                 put("phone", phoneInput)
+                                                put("session_key", qrSessionKey)
                                                 put("password", passwordInput)
                                             }
                                             val res = withContext(Dispatchers.IO) {
@@ -3817,20 +3909,69 @@ private fun TelegramAuthDialog(
                                 ) {
                                     Text("Submit Password", fontWeight = FontWeight.Bold)
                                 }
+                                OutlinedButton(
+                                    onClick = {
+                                        phoneStep = 1
+                                        passwordInput = ""
+                                        statusText = null
+                                        isError = false
+                                    },
+                                    enabled = !isLoading,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("Back", fontSize = 11.sp)
+                                }
                             }
                         }
                     }
                     1 -> { // QR Code
+                        val qrBitmap = remember(qrUrl) {
+                            if (qrUrl.isNotBlank()) generateQrBitmap(qrUrl, 512) else null
+                        }
+
                         Column(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Text(
-                                "1. Open Telegram on your phone\n2. Settings → Devices → Link Desktop Device\n3. Tap below or scan QR to link",
+                                "1. Open Telegram on your phone\n2. Settings → Devices → Link Desktop Device\n3. Scan QR code below or tap to link",
                                 color = ArcMuted,
                                 fontSize = 11.sp
                             )
+
+                            if (qrLoading) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(200.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(ArcRaised),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(36.dp),
+                                        color = ArcWhite,
+                                        strokeWidth = 3.dp
+                                    )
+                                }
+                            } else if (qrBitmap != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(200.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(Color.White)
+                                        .padding(8.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Image(
+                                        bitmap = qrBitmap.asImageBitmap(),
+                                        contentDescription = "Scan Telegram QR Code",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+
                             if (qrUrl.isNotBlank()) {
                                 Button(
                                     onClick = {
@@ -3848,11 +3989,11 @@ private fun TelegramAuthDialog(
                             }
                             OutlinedButton(
                                 onClick = { initQr() },
-                                enabled = !isLoading,
+                                enabled = !isLoading && !qrLoading,
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(10.dp),
                             ) {
-                                Text("Refresh QR Token", fontSize = 11.sp)
+                                Text("Refresh QR Code", fontSize = 11.sp)
                             }
                         }
                     }
