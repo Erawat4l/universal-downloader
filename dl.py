@@ -4218,7 +4218,7 @@ def select_progressive_youtube_format(formats, quality="best"):
     return None
 
 
-def app_resolve(url, quality="best", season=None, episode=None):
+def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
     if not url:
         raise Exception("A URL is required")
     lower = url.lower()
@@ -4355,13 +4355,13 @@ def app_resolve(url, quality="best", season=None, episode=None):
         }
 
         for client in client_attempts:
-            ydl_opts = {
+            ydl_opts = get_ytdlp_opts({
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
                 "socket_timeout": 12,
-            }
+            }, cookie=cookie)
             if client:
                 ydl_opts["extractor_args"] = {"youtube": {"player_client": client, "skip": ["webpage", "configs"]}}
             try:
@@ -5193,7 +5193,8 @@ def run_app_json_request(payload):
                     payload.get("url", ""),
                     quality=payload.get("quality", "best"),
                     season=payload.get("season"),
-                    episode=payload.get("episode")
+                    episode=payload.get("episode"),
+                    cookie=payload.get("cookie")
                 )
             elif action == "download":
                 result = app_download(payload)
