@@ -4356,7 +4356,8 @@ private fun GoogleLoginDialog(
                                     if (combinedCookies.contains("LOGIN_INFO") || (combinedCookies.contains("SAPISID") && combinedCookies.contains("SSID")) || combinedCookies.contains("__Secure-3PSID")) {
                                         view?.evaluateJavascript("(function() { try { var el = document.querySelector('div[data-email], [aria-label*=\"@\"]'); return el ? (el.getAttribute('data-email') || el.getAttribute('aria-label')) : ''; } catch(e) { return ''; } })()") { evalRes ->
                                             val detectedEmail = evalRes?.replace("\"", "")?.trim()?.takeIf { it.contains("@") } ?: "Google Account"
-                                            onSuccess(detectedEmail, combinedCookies)
+                                            val finalEmail = if (loginHint.isNotBlank()) loginHint else detectedEmail
+                                            onSuccess(finalEmail, combinedCookies)
                                         }
                                     }
                                 }
