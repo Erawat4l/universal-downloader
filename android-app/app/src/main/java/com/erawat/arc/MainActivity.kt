@@ -19,6 +19,7 @@ import android.os.Environment
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.WebChromeClient
@@ -93,6 +94,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.ArrowDropDown
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CheckCircle
@@ -107,6 +109,7 @@ import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Forward10
 import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.NotificationsNone
@@ -120,6 +123,7 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.Subtitles
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -129,6 +133,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.CircularProgressIndicator
@@ -534,8 +539,8 @@ private fun formatUserFriendlyError(rawError: String?): String {
             "Remote server is temporarily unavailable. Please retry shortly"
 
         // YouTube & Video Extraction
-        lower.contains("sign in to confirm you’re not a bot") || lower.contains("confirm you're not a bot") || lower.contains("bot verification") ->
-            "YouTube verification required. Retrying with fallback stream..."
+        lower.contains("sign in to confirm you’re not a bot") || lower.contains("confirm you're not a bot") || lower.contains("confirm you’re not a bot") || lower.contains("confirm you") || lower.contains("bot verification") ->
+            "YouTube verification required. Connect your Google account in Settings."
         lower.contains("private video") || lower.contains("this video is private") ->
             "This video is private and cannot be accessed"
         lower.contains("members-only") || lower.contains("join this channel") ->
@@ -548,34 +553,6 @@ private fun formatUserFriendlyError(rawError: String?): String {
             "This live premiere has not started yet"
         lower.contains("copyright") || lower.contains("dmca") || lower.contains("infringement") ->
             "Media was removed due to a copyright claim"
-
-        // Telegram Auth & RPC errors
-        lower.contains("diff") || lower.contains("padding") || (lower.contains("check") && lower.contains("0")) ->
-            "Invalid Telegram string session"
-        lower.contains("password_hash_invalid") || lower.contains("password_invalid") || (lower.contains("password") && lower.contains("invalid")) || lower.contains("wrong pass") ->
-            "Incorrect 2FA password"
-        lower.contains("phone_code_invalid") || (lower.contains("code") && lower.contains("invalid")) ->
-            "Invalid verification code"
-        lower.contains("phone_code_expired") || (lower.contains("code") && lower.contains("expired")) ->
-            "Verification code expired. Please request a new one"
-        lower.contains("phone_number_invalid") || (lower.contains("phone") && lower.contains("invalid")) ->
-            "Invalid phone number format"
-        lower.contains("phone_number_unregistered") ->
-            "This phone number is not registered on Telegram"
-        lower.contains("flood_wait") -> {
-            val seconds = Regex("""\d+""").find(err)?.value ?: "a few"
-            "Too many attempts. Please wait $seconds seconds"
-        }
-        lower.contains("auth_key_unregistered") || lower.contains("session_revoked") || lower.contains("session expired") ->
-            "Telegram session expired. Please log in again"
-        lower.contains("peer_id_invalid") || lower.contains("channel_invalid") || lower.contains("chat_invalid") || lower.contains("chat_admin_required") ->
-            "Telegram channel or message is private or restricted"
-        lower.contains("message_id_invalid") || lower.contains("message_empty") ->
-            "Telegram message or file not found"
-        lower.contains("file_reference_expired") ->
-            "Telegram file reference expired. Re-fetching..."
-        lower.contains("api_id_invalid") ->
-            "Invalid Telegram API ID or API Hash"
 
         // Catalog & Streaming
         lower.contains("no active streaming servers") || lower.contains("offline") ->
@@ -695,12 +672,10 @@ private fun ArcApp(
     var cancelledJobIds by remember { mutableStateOf(setOf<String>()) }
     val activeCancelledIds = remember { java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>()) }
     var notifications by rememberSaveable { mutableStateOf(preferences.getBoolean("notifications_enabled", true)) }
-    var telegramApiId by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_id", "30909654") ?: "30909654") }
-    var telegramApiHash by rememberSaveable { mutableStateOf(preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b") }
-    var telegramSession by rememberSaveable { mutableStateOf(preferences.getString("telegram_session", "") ?: "") }
-    var telegramUserName by rememberSaveable { mutableStateOf(preferences.getString("telegram_user_name", "") ?: "") }
-    var telegramUserPhone by rememberSaveable { mutableStateOf(preferences.getString("telegram_user_phone", "") ?: "") }
-    var showTelegramSetup by rememberSaveable { mutableStateOf(false) }
+    var googleAccountEmail by rememberSaveable { mutableStateOf(preferences.getString("google_account_email", "") ?: "") }
+    var googleCookies by rememberSaveable { mutableStateOf(preferences.getString("google_cookies", "") ?: "") }
+    var showGoogleInfoDialog by rememberSaveable { mutableStateOf(false) }
+    var showGoogleLoginDialog by rememberSaveable { mutableStateOf(false) }
     val episodeCache = remember { mutableMapOf<String, MediaTarget>() }
 
     var searchTrace by remember { mutableStateOf<CliTrace?>(null) }
@@ -1085,9 +1060,7 @@ private fun ArcApp(
                 searchLoading = false
 
                 // Preload top search results in background in parallel for instant resolution
-                val effPreloadSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
-                val effPreloadId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
-                val effPreloadHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
+                val effPreloadCookie = googleCookies.ifBlank { preferences.getString("google_cookies", "").orEmpty() }
                 resultList.take(5).forEach { hit ->
                     scope.launch(Dispatchers.IO) {
                         val sortedAudio = prioritizeAudioTracks(hit.audio)
@@ -1105,13 +1078,7 @@ private fun ArcApp(
                                     put("url", preUrl)
                                     put("quality", "Best Available")
                                     if (prefLang.isNotBlank()) put("audio_lang", prefLang)
-                                    if (effPreloadSess.isNotBlank()) {
-                                        put("telegram", JSONObject().apply {
-                                            put("api_id", effPreloadId)
-                                            put("api_hash", effPreloadHash)
-                                            put("session", effPreloadSess)
-                                        })
-                                    }
+                                    if (effPreloadCookie.isNotBlank()) put("cookie", effPreloadCookie)
                                 }
                                 val res = runCatching { EmbeddedEngine.execute(context, prePayload) }.getOrNull()
                                 if (res?.optBoolean("ok", false) == true) {
@@ -1278,12 +1245,16 @@ private fun ArcApp(
                 if (aArray != null) {
                     for (i in 0 until aArray.length()) {
                         val aObj = aArray.optJSONObject(i) ?: continue
-                        audioTracksList.add(
-                            AudioChoice(
-                                language = aObj.optString("language", "Default"),
-                                url = aObj.optString("url", target.targetUrl)
-                            )
-                        )
+                        val lang = aObj.optString("language", "Default")
+                        val u = aObj.optString("url", target.targetUrl)
+                        if (lang.isNotBlank() && audioTracksList.none { it.language.equals(lang, ignoreCase = true) }) {
+                            audioTracksList.add(AudioChoice(language = lang, url = u))
+                        }
+                    }
+                }
+                for (existing in target.audioTracks) {
+                    if (existing.language.isNotBlank() && audioTracksList.none { it.language.equals(existing.language, ignoreCase = true) }) {
+                        audioTracksList.add(existing)
                     }
                 }
 
@@ -1300,9 +1271,7 @@ private fun ArcApp(
                     rawSource.contains("Movie", ignoreCase = true) ||
                     target.mediaCategory.contains("MOVIE", ignoreCase = true)
                 val isSeriesResolved = !isExplicitMovie && (seasonsList.isNotEmpty() || target.seasons.isNotEmpty()) && (isSeries || target.isSeries)
-                val isTelegramLink = target.targetUrl.contains("t.me/", ignoreCase = true) || target.targetUrl.contains("telegram.me/", ignoreCase = true) || rawSource.contains("Telegram", ignoreCase = true)
                 val resolvedCategory = when {
-                    isTelegramLink -> "TELEGRAM"
                     isExplicitMovie -> "MOVIE"
                     isSeriesResolved -> "TV SERIES"
                     rawSource.contains("YouTube", ignoreCase = true) || target.targetUrl.contains("youtu", ignoreCase = true) -> "YOUTUBE"
@@ -1312,9 +1281,9 @@ private fun ArcApp(
                     else -> "MOVIE"
                 }
 
-                val finalCanStream = if (isTelegramLink) false else canStream
-                val finalMediaType = if (isTelegramLink) "file" else mediaType
-                val finalSource = if (isTelegramLink) "Telegram" else rawSource
+                val finalCanStream = canStream
+                val finalMediaType = mediaType
+                val finalSource = rawSource
 
                 val sortedQualities = sortQualitiesDescending(qualitiesList)
                 val defaultPref = if (audioOnly) defaultAudioQuality else defaultVideoQuality
@@ -1461,7 +1430,8 @@ private fun ArcApp(
                 pendingActionAfterAudioSelect = null
             }
             showDeleteConfirmJobId != null -> showDeleteConfirmJobId = null
-            showTelegramSetup -> showTelegramSetup = false
+            showGoogleInfoDialog -> showGoogleInfoDialog = false
+            showGoogleLoginDialog -> showGoogleLoginDialog = false
             showQualityDialog -> showQualityDialog = false
             showPathDialog -> showPathDialog = false
             tab != AppTab.HOME -> {
@@ -1531,14 +1501,11 @@ private fun ArcApp(
         val isDirectUrl = clean.startsWith("http://", ignoreCase = true) ||
             clean.startsWith("https://", ignoreCase = true) ||
             clean.startsWith("igl:", ignoreCase = true) ||
-            clean.startsWith("t.me/", ignoreCase = true) ||
-            clean.startsWith("telegram.me/", ignoreCase = true) ||
             clean.startsWith("magnet:", ignoreCase = true)
         if (isDirectUrl) {
             resolveLoading = true
             val isYouTubeClean = clean.contains("youtu", ignoreCase = true)
-            val isTelegramClean = clean.contains("t.me/", ignoreCase = true) || clean.contains("telegram.me/", ignoreCase = true)
-            val isSameShow = !isYouTubeClean && !isTelegramClean && (clean.equals(target.targetUrl, ignoreCase = true) ||
+            val isSameShow = !isYouTubeClean && (clean.equals(target.targetUrl, ignoreCase = true) ||
                              (target.title.isNotBlank() && titleOverride != null && cleanShowTitle(target.title).equals(cleanShowTitle(titleOverride), ignoreCase = true)))
 
             if (!isSameShow) {
@@ -1550,15 +1517,13 @@ private fun ArcApp(
             val titleToUse = when {
                 titleOverride != null -> titleOverride
                 isYouTubeClean -> "YouTube Video"
-                isTelegramClean -> "Telegram Media"
                 else -> clean.split("/").lastOrNull { it.isNotBlank() } ?: "Media stream"
             }
-            val isMovieTitle = !isTelegramClean && (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
-            val detectedSeries = !isTelegramClean && !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
+            val isMovieTitle = (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
+            val detectedSeries = !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
                                  (mediaCategoryOverride?.contains("TV", ignoreCase = true) == true) ||
                                  Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(titleToUse))
             val detectedCategory = when {
-                isTelegramClean -> "TELEGRAM"
                 isMovieTitle -> "MOVIE"
                 detectedSeries -> "TV SERIES"
                 clean.contains("youtu", ignoreCase = true) -> "YOUTUBE"
@@ -1590,8 +1555,8 @@ private fun ArcApp(
             } else {
                 MediaTarget(
                     title = titleToUse,
-                    source = if (isTelegramClean) "Telegram" else if (detectedSeries) "TV Series" else (if (clean.contains("youtu", ignoreCase = true)) "YouTube" else "Movie"),
-                    detail = if (isTelegramClean) "Direct File" else if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else "Analyzing media...",
+                    source = if (detectedSeries) "TV Series" else (if (clean.contains("youtu", ignoreCase = true)) "YouTube" else "Movie"),
+                    detail = if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else "Analyzing media...",
                     size = "Detecting",
                     description = clean,
                     targetUrl = clean,
@@ -1607,8 +1572,8 @@ private fun ArcApp(
                     playlistEntries = emptyList(),
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
-                    canStream = !isTelegramClean,
-                    mediaType = if (isTelegramClean) "file" else "video",
+                    canStream = true,
+                    mediaType = "video",
                     audioTracks = sortedChoices,
                     selectedAudioLang = initialSelectedLang,
                     year = detectedYear,
@@ -1626,15 +1591,9 @@ private fun ArcApp(
                     if (selectedAudioLang.isNotBlank()) put("audio_lang", selectedAudioLang)
                     if (season != null) put("season", season)
                     if (episode != null) put("episode", episode)
-                    val effectiveSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
-                    val effectiveId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
-                    val effectiveHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
-                    if (effectiveSess.isNotBlank()) {
-                        put("telegram", JSONObject().apply {
-                            put("api_id", effectiveId)
-                            put("api_hash", effectiveHash)
-                            put("session", effectiveSess)
-                        })
+                    val effCookie = googleCookies.ifBlank { preferences.getString("google_cookies", "").orEmpty() }
+                    if (effCookie.isNotBlank()) {
+                        put("cookie", effCookie)
                     }
                 },
                 "resolve"
@@ -1728,8 +1687,6 @@ private fun ArcApp(
                     !directToUse.contains("youtube.com") && !directToUse.contains("youtu.be") &&
                     !directToUse.contains("googlevideo.com") &&
                     !targetEngineUrl.contains("youtube.com") && !targetEngineUrl.contains("youtu.be") &&
-                    !targetEngineUrl.contains("t.me/") && !targetEngineUrl.contains("telegram.me/") &&
-                    !targetEngineUrl.contains("telegram.dog/") &&
                     directToUse != targetEngineUrl) {
                     if (!target.isSeries || (sNum == target.selectedSeason && epNum == target.selectedEpisode)) {
                         put("stream_url", directToUse)
@@ -1755,15 +1712,9 @@ private fun ArcApp(
                 put("season", sNum)
                 put("episode", epNum)
             }
-            val effectiveSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
-            val effectiveId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
-            val effectiveHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
-            if (effectiveSess.isNotBlank()) {
-                put("telegram", JSONObject().apply {
-                    put("api_id", effectiveId)
-                    put("api_hash", effectiveHash)
-                    put("session", effectiveSess)
-                })
+            val effGoogleCookie = googleCookies.ifBlank { preferences.getString("google_cookies", "").orEmpty() }
+            if (effGoogleCookie.isNotBlank()) {
+                put("cookie", effGoogleCookie)
             }
         }
         scope.launch {
@@ -1950,7 +1901,7 @@ private fun ArcApp(
                                                 ?: hit.url
                                         }
                                         val pre = preloadedTargets[targetUrl] ?: preloadedTargets[hit.url]
-                                        if (pre != null) {
+                                        if (pre != null && pre.availableQualities.isNotEmpty() && !pre.directStreamUrl.isNullOrBlank()) {
                                             selectedQuality = pre.availableQualities.firstOrNull() ?: "Best Available"
                                             audioOnly = false
                                             target = pre.copy(
@@ -2030,12 +1981,7 @@ private fun ArcApp(
                                         )
                                     },
                                     onDownload = {
-                                        val isTelegram = target.source.contains("Telegram", ignoreCase = true) ||
-                                            target.targetUrl.contains("t.me/", ignoreCase = true) ||
-                                            target.targetUrl.contains("telegram.me/", ignoreCase = true)
-                                        if (isTelegram) {
-                                            startDownload(audioLangOverride = target.selectedAudioLang)
-                                        } else if (target.isSeries) {
+                                        if (target.isSeries) {
                                             showSeriesDownloadDialog = true
                                         } else if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank()) {
                                             pendingActionAfterAudioSelect = "download"
@@ -2288,40 +2234,20 @@ private fun ArcApp(
                                 message("Notifications disabled.")
                             }
                         },
-                        telegramSession = telegramSession,
-                        telegramUserName = telegramUserName,
-                        telegramUserPhone = telegramUserPhone,
-                        onTelegramSetup = { showTelegramSetup = true },
-                        onTelegramDisconnect = {
-                            val oldSession = telegramSession
-                            telegramSession = ""
-                            telegramUserName = ""
-                            telegramUserPhone = ""
+                        googleAccountEmail = googleAccountEmail,
+                        onGoogleInfo = { showGoogleInfoDialog = true },
+                        onGoogleDisconnect = {
+                            googleAccountEmail = ""
+                            googleCookies = ""
                             preferences.edit()
-                                .remove("telegram_session")
-                                .remove("telegram_user_name")
-                                .remove("telegram_user_phone")
+                                .remove("google_account_email")
+                                .remove("google_cookies")
                                 .apply()
                             try {
-                                val f = File(context.filesDir, "telegram_credentials.json")
-                                if (f.exists()) f.delete()
+                                CookieManager.getInstance().removeAllCookies(null)
+                                CookieManager.getInstance().flush()
                             } catch (_: Exception) {}
-                            message("Telegram disconnected.")
-                            if (oldSession.isNotBlank()) {
-                                scope.launch(Dispatchers.IO) {
-                                    try {
-                                        EmbeddedEngine.execute(
-                                            context,
-                                            JSONObject().apply {
-                                                put("action", "telegram_logout")
-                                                put("session", oldSession)
-                                                put("api_id", telegramApiId)
-                                                put("api_hash", telegramApiHash)
-                                            }
-                                        )
-                                    } catch (_: Exception) {}
-                                }
-                            }
+                            message("Google account disconnected.")
                         },
                     )
                 }
@@ -2525,38 +2451,30 @@ private fun ArcApp(
                 )
             }
 
-            // Telegram Auth Dialog
-            if (showTelegramSetup) {
-                TelegramAuthDialog(
-                    initialSession = telegramSession,
-                    onSave = { id, hash, sess, user, phone ->
-                        telegramApiId = id
-                        telegramApiHash = hash
-                        telegramSession = sess
-                        telegramUserName = user
-                        telegramUserPhone = phone
+            // Google Account Info Dialog
+            if (showGoogleInfoDialog) {
+                GoogleAccountInfoDialog(
+                    isConnected = googleAccountEmail.isNotBlank(),
+                    accountEmail = googleAccountEmail,
+                    onLoginClick = { showGoogleLoginDialog = true },
+                    onDismiss = { showGoogleInfoDialog = false },
+                )
+            }
+
+            // Google Account In-App Sign-In Dialog
+            if (showGoogleLoginDialog) {
+                GoogleLoginDialog(
+                    onSuccess = { email, cookies ->
+                        googleAccountEmail = email
+                        googleCookies = cookies
                         preferences.edit()
-                            .putString("telegram_api_id", id)
-                            .putString("telegram_api_hash", hash)
-                            .putString("telegram_session", sess)
-                            .putString("telegram_user_name", user)
-                            .putString("telegram_user_phone", phone)
+                            .putString("google_account_email", email)
+                            .putString("google_cookies", cookies)
                             .apply()
-                        try {
-                            val f = File(context.filesDir, "telegram_credentials.json")
-                            val jobj = JSONObject().apply {
-                                put("api_id", id)
-                                put("api_hash", hash)
-                                put("session", sess)
-                                put("user", user)
-                                put("phone", phone)
-                            }
-                            f.writeText(jobj.toString())
-                        } catch (_: Exception) {}
-                        showTelegramSetup = false
-                        message("Telegram connected as ${user.ifBlank { phone }}")
+                        showGoogleLoginDialog = false
+                        message("Google account connected ($email)")
                     },
-                    onDismiss = { showTelegramSetup = false },
+                    onDismiss = { showGoogleLoginDialog = false },
                 )
             }
     }
@@ -2991,15 +2909,11 @@ private fun AnalysisScreen(
         Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(target.title)
     )
 
-    val isTelegramTarget = target.source.contains("Telegram", ignoreCase = true) ||
-        target.targetUrl.contains("t.me/", ignoreCase = true) ||
-        target.targetUrl.contains("telegram.me/", ignoreCase = true)
-
     val isYouTubeTarget = target.source.contains("YouTube", ignoreCase = true) ||
         target.targetUrl.contains("youtube.com", ignoreCase = true) ||
         target.targetUrl.contains("youtu.be", ignoreCase = true)
 
-    val isMovieTarget = !isSeriesTarget && !isYouTubeTarget && !isTelegramTarget && (
+    val isMovieTarget = !isSeriesTarget && !isYouTubeTarget && (
         target.title.contains("Movie", ignoreCase = true) ||
         target.mediaCategory.contains("MOVIE", ignoreCase = true) ||
         target.source.contains("Movie", ignoreCase = true) ||
@@ -3018,7 +2932,6 @@ private fun AnalysisScreen(
     val providerBadge = if (target.providers.isNotBlank()) " · ${target.providers}" else ""
 
     val categoryBadge = when {
-        isTelegramTarget -> "TELEGRAM FILE"
         isSeriesTarget -> "TV SERIES$yearBadge$providerBadge"
         isMovieTarget -> "MOVIE$yearBadge$providerBadge"
         isYouTubeTarget -> "YOUTUBE"
@@ -3315,7 +3228,7 @@ private fun AnalysisScreen(
                 }
             }
 
-            if (!isTelegramTarget && displayQualities.isNotEmpty()) {
+            if (displayQualities.isNotEmpty()) {
                 item {
                     SectionHeader(if (audioOnly) "Audio Quality" else "Video Quality")
                     Spacer(Modifier.height(8.dp))
@@ -3379,58 +3292,9 @@ private fun AnalysisScreen(
             val hasResolvedMedia = target.directStreamUrl.isNotBlank() ||
                 target.qualityUrls.isNotEmpty() ||
                 target.isPlaylist ||
-                target.targetUrl.startsWith("magnet:", ignoreCase = true) ||
-                isTelegramTarget
+                target.targetUrl.startsWith("magnet:", ignoreCase = true)
 
-            if (isTelegramTarget) {
-                item {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = ArcSurface),
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, Color(0xFF2B2B2B)),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(46.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(Color(0xFF229ED9).copy(alpha = 0.15f)),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Outlined.Send,
-                                    contentDescription = "Telegram",
-                                    tint = Color(0xFF229ED9),
-                                    modifier = Modifier.size(24.dp),
-                                )
-                            }
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Telegram Media File", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = ArcWhite)
-                                Text("Direct Telegram cloud download to device storage", fontSize = 11.sp, color = ArcMuted)
-                            }
-                        }
-                    }
-                }
-                item {
-                    Button(
-                        onClick = onDownload,
-                        modifier = Modifier.fillMaxWidth().height(52.dp),
-                        shape = RoundedCornerShape(15.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                    ) {
-                        Icon(Icons.Outlined.FileDownload, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Download from Telegram", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    }
-                }
-            } else if (!hasResolvedMedia) {
+            if (!hasResolvedMedia) {
                 item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = ArcSurface),
@@ -3847,11 +3711,9 @@ private fun SettingsScreen(
     onOpenQualityDialog: () -> Unit,
     notifications: Boolean,
     onToggleNotifications: (Boolean) -> Unit,
-    telegramSession: String,
-    telegramUserName: String,
-    telegramUserPhone: String,
-    onTelegramSetup: () -> Unit,
-    onTelegramDisconnect: () -> Unit,
+    googleAccountEmail: String,
+    onGoogleInfo: () -> Unit,
+    onGoogleDisconnect: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -3965,12 +3827,11 @@ private fun SettingsScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.fillMaxWidth().padding(14.dp),
                 ) {
-                    MediaGlyph(Icons.AutoMirrored.Outlined.Send, Modifier.size(36.dp))
+                    MediaGlyph(Icons.Outlined.AccountCircle, Modifier.size(36.dp))
                     Column(Modifier.weight(1f)) {
-                        if (telegramSession.isNotBlank()) {
-                            val displayName = telegramUserName.ifBlank { telegramUserPhone.ifBlank { "Telegram Account" } }
+                        if (googleAccountEmail.isNotBlank()) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(displayName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                Text(googleAccountEmail, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                 Box(
                                     modifier = Modifier
                                         .size(7.dp)
@@ -3978,29 +3839,31 @@ private fun SettingsScreen(
                                         .background(Color(0xFF4CAF50))
                                 )
                             }
-                            Text(telegramUserPhone.ifBlank { "Connected" }, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Connected · YouTube playback authenticated", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         } else {
-                            Text("Telegram", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
-                            Text("Direct media downloads", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Google Account", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
+                            Text("Optional · YouTube authentication", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
-                    if (telegramSession.isNotBlank()) {
+                    IconButton(
+                        onClick = onGoogleInfo,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.Info,
+                            contentDescription = "Account info",
+                            tint = ArcMuted,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    if (googleAccountEmail.isNotBlank()) {
                         OutlinedButton(
-                            onClick = onTelegramDisconnect,
+                            onClick = onGoogleDisconnect,
                             shape = RoundedCornerShape(8.dp),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF5252)),
                         ) {
                             Text("Disconnect", fontSize = 11.sp)
-                        }
-                    } else {
-                        Button(
-                            onClick = onTelegramSetup,
-                            shape = RoundedCornerShape(8.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
-                        ) {
-                            Text("Login", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -4279,224 +4142,12 @@ private fun generateQrBitmap(content: String, sizePx: Int = 512): Bitmap? {
 }
 
 @Composable
-private fun TelegramAuthDialog(
-    initialSession: String = "",
-    onSave: (String, String, String, String, String) -> Unit, // apiId, apiHash, session, user, phone
+private fun GoogleAccountInfoDialog(
+    isConnected: Boolean,
+    accountEmail: String,
+    onLoginClick: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val defaultApiId = "30909654"
-    val defaultApiHash = "d4b340a406c5c1ed1d7f26d44749602b"
-
-    var selectedTab by remember { mutableStateOf(0) } // 0: Phone, 1: QR, 2: Session
-    val tabs = listOf("Phone", "QR Code", "Session")
-
-    // Phone state
-    var phoneInput by remember { mutableStateOf("") }
-    var codeInput by remember { mutableStateOf("") }
-    var passwordInput by remember { mutableStateOf("") }
-    var phoneCodeHash by remember { mutableStateOf("") }
-    var phoneStep by remember { mutableStateOf(0) } // 0: Enter phone, 1: Enter code, 2: Enter 2FA pwd
-
-    // QR state
-    var qrSessionKey by remember { mutableStateOf("") }
-    var qrUrl by remember { mutableStateOf("") }
-    var qrLoading by remember { mutableStateOf(false) }
-
-    // Session string state
-    var rawSessionInput by remember { mutableStateOf(initialSession) }
-
-    // Status state
-    var isLoading by remember { mutableStateOf(false) }
-    var statusText by remember { mutableStateOf<String?>(null) }
-    var isError by remember { mutableStateOf(false) }
-
-    // Periodic QR checker
-    LaunchedEffect(selectedTab, qrSessionKey) {
-        if (selectedTab == 1 && qrSessionKey.isNotBlank()) {
-            while (qrSessionKey.isNotBlank()) {
-                delay(2500)
-                val checkPayload = JSONObject().apply {
-                    put("action", "telegram_qr_check")
-                    put("session_key", qrSessionKey)
-                }
-                val res = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, checkPayload) }.getOrNull()
-                }
-                val rObj = res?.optJSONObject("result")
-                if (rObj?.optBoolean("connected", false) == true) {
-                    val sess = rObj.optString("session")
-                    val u = rObj.optString("user")
-                    val p = rObj.optString("phone")
-                    onSave(defaultApiId, defaultApiHash, sess, u, p)
-                    break
-                } else if (rObj?.optBoolean("need_password", false) == true) {
-                    selectedTab = 0
-                    phoneStep = 2
-                    statusText = "Two-step verification password required."
-                    break
-                }
-            }
-        }
-    }
-
-    fun initQr() {
-        qrLoading = true
-        isLoading = true
-        statusText = "Requesting QR login..."
-        isError = false
-        scope.launch {
-            val payload = JSONObject().apply {
-                put("action", "telegram_qr_init")
-                put("api_id", defaultApiId)
-                put("api_hash", defaultApiHash)
-            }
-            val res = withContext(Dispatchers.IO) {
-                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-            }
-            isLoading = false
-            qrLoading = false
-            if (res != null && res.optBoolean("ok", false)) {
-                val rObj = res.optJSONObject("result")
-                qrSessionKey = rObj?.optString("session_key").orEmpty()
-                qrUrl = rObj?.optString("qr_url").orEmpty()
-                statusText = "Scan with your phone or tap below to link"
-            } else {
-                isError = true
-                statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to generate QR token")
-            }
-        }
-    }
-
-    val sendPhoneCode = {
-        if (!isLoading && phoneInput.length >= 8) {
-            isLoading = true
-            statusText = "Sending verification code..."
-            isError = false
-            scope.launch {
-                val payload = JSONObject().apply {
-                    put("action", "telegram_send_code")
-                    put("api_id", defaultApiId)
-                    put("api_hash", defaultApiHash)
-                    put("phone", phoneInput)
-                }
-                val res = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                }
-                isLoading = false
-                if (res != null && res.optBoolean("ok", false)) {
-                    val rObj = res.optJSONObject("result")
-                    phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
-                    phoneStep = 1
-                    statusText = "Code sent to your Telegram app!"
-                } else {
-                    isError = true
-                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to send code")
-                }
-            }
-        }
-    }
-
-    val signInWithCode = {
-        if (!isLoading && codeInput.isNotBlank()) {
-            isLoading = true
-            statusText = "Signing in..."
-            isError = false
-            scope.launch {
-                val payload = JSONObject().apply {
-                    put("action", "telegram_sign_in")
-                    put("phone", phoneInput)
-                    put("code", codeInput)
-                    put("phone_code_hash", phoneCodeHash)
-                }
-                val res = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                }
-                isLoading = false
-                if (res != null && res.optBoolean("ok", false)) {
-                    val rObj = res.optJSONObject("result")
-                    if (rObj?.optBoolean("need_password", false) == true) {
-                        phoneStep = 2
-                        statusText = "Two-step verification password required."
-                    } else {
-                        val sess = rObj?.optString("session").orEmpty()
-                        val u = rObj?.optString("user").orEmpty()
-                        val p = rObj?.optString("phone").orEmpty()
-                        onSave(defaultApiId, defaultApiHash, sess, u, p)
-                    }
-                } else {
-                    isError = true
-                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Sign in failed")
-                }
-            }
-        }
-    }
-
-    val submitPassword = {
-        if (!isLoading && passwordInput.isNotBlank()) {
-            isLoading = true
-            statusText = "Verifying password..."
-            isError = false
-            scope.launch {
-                val payload = JSONObject().apply {
-                    put("action", "telegram_password")
-                    put("phone", phoneInput)
-                    put("session_key", qrSessionKey)
-                    put("password", passwordInput)
-                }
-                val res = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                }
-                isLoading = false
-                if (res != null && res.optBoolean("ok", false)) {
-                    val rObj = res.optJSONObject("result")
-                    val sess = rObj?.optString("session").orEmpty()
-                    val u = rObj?.optString("user").orEmpty()
-                    val p = rObj?.optString("phone").orEmpty()
-                    onSave(defaultApiId, defaultApiHash, sess, u, p)
-                } else {
-                    isError = true
-                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Invalid password")
-                }
-            }
-        }
-    }
-
-    val connectSession = {
-        if (!isLoading && rawSessionInput.length > 20) {
-            isLoading = true
-            statusText = "Verifying string session..."
-            isError = false
-            scope.launch {
-                var cleanSess = rawSessionInput.replace(Regex("""\s+"""), "").trim()
-                val pad = cleanSess.length % 4
-                if (pad != 0) {
-                    cleanSess += "=".repeat(4 - pad)
-                }
-                val payload = JSONObject().apply {
-                    put("action", "telegram_check")
-                    put("api_id", defaultApiId)
-                    put("api_hash", defaultApiHash)
-                    put("session", cleanSess)
-                }
-                val res = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                }
-                isLoading = false
-                if (res != null && res.optBoolean("ok", false)) {
-                    val rObj = res.optJSONObject("result")
-                    val u = rObj?.optString("user", "Account Verified") ?: "Verified"
-                    val p = rObj?.optString("phone", "") ?: ""
-                    onSave(defaultApiId, defaultApiHash, cleanSess, u, p)
-                } else {
-                    isError = true
-                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Connection failed")
-                }
-            }
-        }
-    }
-
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = ArcSurface,
@@ -4504,323 +4155,178 @@ private fun TelegramAuthDialog(
         textContentColor = ArcWhite,
         shape = RoundedCornerShape(20.dp),
         title = {
-            Text("Telegram Login", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Outlined.AccountCircle, contentDescription = null, tint = ArcWhite)
+                Text("Google / YouTube", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+            }
         },
         text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                // Tab Row
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(ArcRaised)
-                        .padding(3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "ARC automatically streams and downloads YouTube without login using optimized direct engines. Signing in is only necessary if YouTube blocks stream manifests with bot-check or 403 errors.",
+                    fontSize = 12.sp,
+                    color = ArcWhite,
+                    lineHeight = 16.sp
+                )
+                Text(
+                    "What this does: Your Google session cookies are stored strictly on-device to authorize YouTube playback directly. Zero personal data leaves your device.",
+                    fontSize = 11.sp,
+                    color = ArcMuted,
+                    lineHeight = 15.sp
+                )
+                Surface(
+                    color = Color(0xFF1E1711),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFF4A3015))
                 ) {
-                    tabs.forEachIndexed { idx, title ->
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (selectedTab == idx) ArcWhite else Color.Transparent)
-                                .clickable {
-                                    selectedTab = idx
-                                    statusText = null
-                                    isError = false
-                                    if (idx == 1 && qrSessionKey.isBlank()) {
-                                        initQr()
-                                    }
-                                }
-                                .padding(vertical = 6.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = title,
-                                color = if (selectedTab == idx) ArcBlack else ArcMuted,
-                                fontSize = 11.sp,
-                                fontWeight = if (selectedTab == idx) FontWeight.Bold else FontWeight.Medium
-                            )
-                        }
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Icon(
+                            Icons.Outlined.WarningAmber,
+                            contentDescription = "Warning",
+                            tint = Color(0xFFFFB74D),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            "Safety Recommendation: Use a secondary or alternate Google account (not your primary personal account) to protect against any automated rate-limit flags.",
+                            fontSize = 11.sp,
+                            color = Color(0xFFFFD59E),
+                            lineHeight = 15.sp
+                        )
                     }
-                }
-
-                // Tab Content
-                when (selectedTab) {
-                    0 -> { // Phone Login
-                        when (phoneStep) {
-                            0 -> {
-                                Text("Enter your phone number with country code.", color = ArcMuted, fontSize = 11.sp)
-                                OutlinedTextField(
-                                    value = phoneInput,
-                                    onValueChange = { phoneInput = it.trim() },
-                                    label = { Text("Phone Number (e.g. +919876543210)") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    colors = arcTextFieldColors(),
-                                    keyboardOptions = KeyboardOptions(
-                                        keyboardType = KeyboardType.Phone,
-                                        imeAction = ImeAction.Send,
-                                    ),
-                                    keyboardActions = KeyboardActions(
-                                        onSend = { sendPhoneCode() }
-                                    ),
-                                )
-                                Button(
-                                    onClick = sendPhoneCode,
-                                    enabled = !isLoading && phoneInput.length >= 8,
-                                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                    shape = RoundedCornerShape(10.dp),
-                                ) {
-                                    Text("Send Code", fontWeight = FontWeight.Bold)
-                                }
-                            }
-                            1 -> {
-                                Text("Enter the 5-digit code sent to your Telegram app.", color = ArcMuted, fontSize = 11.sp)
-                                OutlinedTextField(
-                                    value = codeInput,
-                                    onValueChange = { codeInput = it.trim() },
-                                    label = { Text("Verification Code") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    colors = arcTextFieldColors(),
-                                    keyboardOptions = KeyboardOptions(
-                                        keyboardType = KeyboardType.Number,
-                                        imeAction = ImeAction.Done,
-                                    ),
-                                    keyboardActions = KeyboardActions(
-                                        onDone = { signInWithCode() }
-                                    ),
-                                )
-                                Button(
-                                    onClick = signInWithCode,
-                                    enabled = !isLoading && codeInput.isNotBlank(),
-                                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                    shape = RoundedCornerShape(10.dp),
-                                ) {
-                                    Text("Verify & Connect", fontWeight = FontWeight.Bold)
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    OutlinedButton(
-                                        onClick = {
-                                            isLoading = true
-                                            statusText = "Resending code to Telegram..."
-                                            isError = false
-                                            codeInput = ""
-                                            scope.launch {
-                                                val payload = JSONObject().apply {
-                                                    put("action", "telegram_send_code")
-                                                    put("api_id", defaultApiId)
-                                                    put("api_hash", defaultApiHash)
-                                                    put("phone", phoneInput)
-                                                }
-                                                val res = withContext(Dispatchers.IO) {
-                                                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                                                }
-                                                isLoading = false
-                                                if (res != null && res.optBoolean("ok", false)) {
-                                                    val rObj = res.optJSONObject("result")
-                                                    phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
-                                                    statusText = "New code sent to your Telegram app!"
-                                                } else {
-                                                    isError = true
-                                                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to resend code")
-                                                }
-                                            }
-                                        },
-                                        enabled = !isLoading,
-                                        modifier = Modifier.weight(1f).height(44.dp),
-                                        shape = RoundedCornerShape(10.dp)
-                                    ) {
-                                        Text("Resend Code", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                                    }
-
-                                    OutlinedButton(
-                                        onClick = {
-                                            phoneStep = 0
-                                            codeInput = ""
-                                            statusText = null
-                                            isError = false
-                                        },
-                                        enabled = !isLoading,
-                                        modifier = Modifier.weight(1f).height(44.dp),
-                                        shape = RoundedCornerShape(10.dp)
-                                    ) {
-                                        Text("Change Phone", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                                    }
-                                }
-                            }
-                            2 -> {
-                                Text("Enter your 2FA Two-Step Verification Password.", color = ArcMuted, fontSize = 11.sp)
-                                OutlinedTextField(
-                                    value = passwordInput,
-                                    onValueChange = { passwordInput = it },
-                                    label = { Text("2FA Password") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    colors = arcTextFieldColors(),
-                                    keyboardOptions = KeyboardOptions(
-                                        keyboardType = KeyboardType.Password,
-                                        imeAction = ImeAction.Done,
-                                    ),
-                                    keyboardActions = KeyboardActions(
-                                        onDone = { submitPassword() }
-                                    ),
-                                )
-                                Button(
-                                    onClick = submitPassword,
-                                    enabled = !isLoading && passwordInput.isNotBlank(),
-                                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                    shape = RoundedCornerShape(10.dp),
-                                ) {
-                                    Text("Submit Password", fontWeight = FontWeight.Bold)
-                                }
-                                OutlinedButton(
-                                    onClick = {
-                                        phoneStep = 1
-                                        passwordInput = ""
-                                        statusText = null
-                                        isError = false
-                                    },
-                                    enabled = !isLoading,
-                                    modifier = Modifier.fillMaxWidth().height(44.dp),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Text("Back", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                                }
-                            }
-                        }
-                    }
-                    1 -> { // QR Code
-                        val qrBitmap = remember(qrUrl) {
-                            if (qrUrl.isNotBlank()) generateQrBitmap(qrUrl, 512) else null
-                        }
-
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Text(
-                                "1. Open Telegram on your phone\n2. Settings → Devices → Link Desktop Device\n3. Scan QR code below or tap to link",
-                                color = ArcMuted,
-                                fontSize = 11.sp
-                            )
-
-                            if (qrLoading) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(200.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(ArcRaised),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(36.dp),
-                                        color = ArcWhite,
-                                        strokeWidth = 3.dp
-                                    )
-                                }
-                            } else if (qrBitmap != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(200.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(Color.White)
-                                        .padding(8.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Image(
-                                        bitmap = qrBitmap.asImageBitmap(),
-                                        contentDescription = "Scan Telegram QR Code",
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                }
-                            }
-
-                            if (qrUrl.isNotBlank()) {
-                                Button(
-                                    onClick = {
-                                        try {
-                                            val i = Intent(Intent.ACTION_VIEW, Uri.parse(qrUrl))
-                                            context.startActivity(i)
-                                        } catch (_: Exception) {}
-                                    },
-                                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                    shape = RoundedCornerShape(10.dp),
-                                ) {
-                                    Text("Open in Telegram App", fontWeight = FontWeight.Bold)
-                                }
-                            }
-                            OutlinedButton(
-                                onClick = { initQr() },
-                                enabled = !isLoading && !qrLoading,
-                                modifier = Modifier.fillMaxWidth().height(44.dp),
-                                shape = RoundedCornerShape(10.dp),
-                            ) {
-                                Text("Refresh QR Code", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                        }
-                    }
-                    2 -> { // Session String
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("Paste your Pyrogram String Session directly (spaces, newlines, and padding are cleaned automatically).", color = ArcMuted, fontSize = 11.sp)
-                            OutlinedTextField(
-                                value = rawSessionInput,
-                                onValueChange = { raw ->
-                                    rawSessionInput = raw.replace(Regex("""\s+"""), "")
-                                },
-                                label = { Text("STRING_SESSION") },
-                                singleLine = false,
-                                maxLines = 4,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = arcTextFieldColors(),
-                                keyboardOptions = KeyboardOptions(
-                                    imeAction = ImeAction.Done,
-                                ),
-                                keyboardActions = KeyboardActions(
-                                    onDone = { connectSession() }
-                                ),
-                            )
-                            Button(
-                                onClick = connectSession,
-                                enabled = !isLoading && rawSessionInput.length > 20,
-                                modifier = Modifier.fillMaxWidth().height(48.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                                shape = RoundedCornerShape(10.dp),
-                            ) {
-                                Text("Connect", fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-                }
-
-                if (statusText != null) {
-                    Text(
-                        text = statusText.orEmpty(),
-                        color = if (isError) Color(0xFFFF5252) else Color(0xFF4CAF50),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
                 }
             }
         },
-        confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+        confirmButton = {
+            if (!isConnected) {
+                Button(
+                    onClick = {
+                        onDismiss()
+                        onLoginClick()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                ) {
+                    Text("Sign in with Google", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            } else {
+                TextButton(onClick = onDismiss) {
+                    Text("Done", color = ArcWhite, fontSize = 12.sp)
+                }
+            }
         },
+        dismissButton = {
+            if (!isConnected) {
+                TextButton(onClick = onDismiss) {
+                    Text("Close", color = ArcMuted, fontSize = 12.sp)
+                }
+            }
+        }
     )
+}
+
+@Composable
+private fun GoogleLoginDialog(
+    onSuccess: (email: String, cookies: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var isLoading by remember { mutableStateOf(true) }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = ArcSurface,
+            border = BorderStroke(1.dp, Color(0xFF2A2A2A))
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("Google Sign-In", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = ArcWhite)
+                        Text("Connect YouTube for authenticated streaming", fontSize = 11.sp, color = ArcMuted)
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Outlined.Close, contentDescription = "Close", tint = ArcMuted)
+                    }
+                }
+                HorizontalDivider(color = Color(0xFF222222), thickness = 1.dp)
+
+                if (isLoading) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = ArcWhite, trackColor = ArcSurface)
+                }
+
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                            settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                databaseEnabled = true
+                                setSupportZoom(true)
+                                builtInZoomControls = true
+                                displayZoomControls = false
+                                userAgentString = "Mozilla/5.0 (Linux; Android 14; Redmi Pad Pro 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                            }
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                            webViewClient = object : WebViewClient() {
+                                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                    super.onPageStarted(view, url, favicon)
+                                    isLoading = true
+                                }
+
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    isLoading = false
+                                    val cookieManager = CookieManager.getInstance()
+                                    val ytCookies = cookieManager.getCookie("https://www.youtube.com") ?: ""
+                                    val googleCookies = cookieManager.getCookie("https://accounts.google.com") ?: ""
+                                    val combinedCookies = buildString {
+                                        if (ytCookies.isNotBlank()) append(ytCookies)
+                                        if (googleCookies.isNotBlank()) {
+                                            if (isNotEmpty() && !endsWith("; ")) append("; ")
+                                            append(googleCookies)
+                                        }
+                                    }
+
+                                    if (combinedCookies.contains("LOGIN_INFO") || (combinedCookies.contains("SAPISID") && combinedCookies.contains("SSID")) || combinedCookies.contains("__Secure-3PSID")) {
+                                        view?.evaluateJavascript("(function() { try { var el = document.querySelector('div[data-email], [aria-label*=\"@\"]'); return el ? (el.getAttribute('data-email') || el.getAttribute('aria-label')) : ''; } catch(e) { return ''; } })()") { evalRes ->
+                                            val detectedEmail = evalRes?.replace("\"", "")?.trim()?.takeIf { it.contains("@") } ?: "Google Account"
+                                            onSuccess(detectedEmail, combinedCookies)
+                                        }
+                                    }
+                                }
+                            }
+                            loadUrl("https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/")
+                        }
+                    }
+                )
+            }
+        }
+    }
 }
 
 @Composable

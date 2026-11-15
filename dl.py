@@ -2459,7 +2459,10 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     clean_title = (meta.get('title') or meta.get('name') or title).strip()
     show_base = re.sub(r'[\s\-_]+S\d+(-S\d+)?(\s*E\d+)?.*', '', clean_title, flags=re.I)
     show_base = re.sub(r'[\s\-_]+Season\s*\d+(-S\d+)?.*', '', show_base, flags=re.I)
-    show_base = re.sub(r'[\s\-_]+Complete\s*Series.*', '', show_base, flags=re.I).strip()
+    show_base = re.sub(r'[\s\-_]+Complete\s*Series.*', '', show_base, flags=re.I)
+    show_base = re.sub(r'\[.*?\]', '', show_base)
+    show_base = re.sub(r'\(.*?\)', '', show_base)
+    show_base = re.sub(r'\s+', ' ', show_base).strip()
     if not show_base:
         show_base = clean_title
 
@@ -3016,14 +3019,17 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             try:
                 raw_peers = search_netmirror(show_base)
                 g_peers = group_and_deduplicate_results(raw_peers, query=show_base)
+                seen_langs = set()
                 for g in g_peers:
                     for lang, a_item in g.get("audios", {}).items():
-                        audio_choices_list.append({
-                            "language": lang,
-                            "url": a_item.get("url", ""),
-                            "title": a_item.get("title", ""),
-                            "id": a_item.get("id"),
-                        })
+                        if lang not in seen_langs:
+                            seen_langs.add(lang)
+                            audio_choices_list.append({
+                                "language": lang,
+                                "url": a_item.get("url", ""),
+                                "title": a_item.get("title", ""),
+                                "id": a_item.get("id"),
+                            })
             except Exception:
                 pass
 
