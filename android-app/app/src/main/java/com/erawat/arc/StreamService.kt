@@ -78,8 +78,8 @@ class StreamService : Service() {
             startForeground(NOTIF_ID, notification)
         }
 
-        // Ensure the local stream proxy is active
-        if (url.isNotBlank()) {
+        // Ensure the local stream proxy is active for remote URLs requiring injected headers
+        if (url.isNotBlank() && !url.contains("127.0.0.1") && !url.contains("localhost")) {
             Thread {
                 runCatching {
                     val pPayload = JSONObject().apply {

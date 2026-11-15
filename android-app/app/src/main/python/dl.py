@@ -447,6 +447,20 @@ def start_local_stream_proxy(target_url, custom_headers=None, port=8765):
     if clean_target.startswith("/") and os.path.exists(clean_target):
         is_local_file = True
 
+    if "127.0.0.1" in target_str or "localhost" in target_str:
+        if LOCAL_STREAM_PROXY is None:
+            for p in [port, 8766, 8767, 8768]:
+                try:
+                    server = ThreadedStreamProxyServer(('0.0.0.0', p), StreamProxyRequestHandler)
+                    t = threading.Thread(target=server.serve_forever, daemon=True)
+                    t.start()
+                    LOCAL_STREAM_PROXY = server
+                    LOCAL_PROXY_PORT = p
+                    break
+                except OSError:
+                    continue
+        return target_str
+
     if not is_local_file:
         headers = get_stream_headers_for_url(target_url, custom_headers)
         StreamProxyRequestHandler.target_stream_url = target_url
@@ -1671,10 +1685,12 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             outtmpl_pattern = os.path.join(stage_dir, '%(title)s.%(ext)s')
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
-    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
+    enable_multitrack = False
+    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all"):
         audio_sel = f"bestaudio[language^={clean_audio_lang[:2]}][ext=m4a]/bestaudio[format_note*={clean_audio_lang}][ext=m4a]/bestaudio[language^={clean_audio_lang[:2]}]/bestaudio[format_note*={clean_audio_lang}]/bestaudio[ext=m4a]/bestaudio"
     else:
         audio_sel = "bestaudio[ext=m4a]/bestaudio"
+        enable_multitrack = True
 
     if is_audio_only:
         format_spec = f"{audio_sel}/best"
@@ -1711,7 +1727,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             )
 
     print(f"> Direct YouTube download [{format_spec}]...")
-    ydl_opts = get_ytdlp_opts({
+    yt_opts_dict = {
         'format': format_spec,
         'outtmpl': outtmpl_pattern,
         'quiet': False,
@@ -1724,7 +1740,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'retries': 20,
         'fragment_retries': 20,
         'http_chunk_size': 10485760,
-    }, cookie=cookie)
+    }
+    if enable_multitrack:
+        yt_opts_dict['audio_multitrack'] = True
+    ydl_opts = get_ytdlp_opts(yt_opts_dict, cookie=cookie)
 
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
@@ -1866,31 +1885,6 @@ def handle_studocu(url, out_name=None, custom_headers=None, target_dir=None):
             return None
         raise e
 
-def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
-    print("> Detected Telegram link...")
-    parsed = urllib.parse.urlparse(url)
-    path_parts = [p for p in parsed.path.split('/') if p]
-    
-    chat_id = None
-    msg_id = None
-    
-    if len(path_parts) >= 2:
-        if path_parts[0] == 's':
-            chat_id = path_parts[1]
-            if len(path_parts) >= 3 and path_parts[2].isdigit():
-                msg_id = int(path_parts[2])
-        elif path_parts[0] == 'c' and len(path_parts) >= 3:
-            try:
-                chat_id = int(f"-100{path_parts[1]}")
-            except ValueError:
-                chat_id = path_parts[1]
-            if path_parts[2].isdigit():
-                msg_id = int(path_parts[2])
-        else:
-            chat_id = path_parts[0]
-            if path_parts[1].isdigit():
-                msg_id = int(path_parts[1])
-
 def _get_fallback_tg_creds():
     api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
     api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
@@ -1912,19 +1906,45 @@ def _get_fallback_tg_creds():
                     pass
     return api_id, api_hash, session
 
-    def load_tg_creds():
-        fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
-        provided = telegram_config if isinstance(telegram_config, dict) else {}
-        api_id = str(provided.get("api_id") or fb_id).strip()
-        api_hash = str(provided.get("api_hash") or fb_hash).strip()
-        session = str(provided.get("session") or fb_sess).strip()
-        if session:
-            missing = len(session) % 4
-            if missing:
-                session += '=' * (4 - missing)
-        return api_id, api_hash, session
+def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
+    print("> Detected Telegram link...")
+    parsed = urllib.parse.urlparse(url)
+    path_parts = [p for p in parsed.path.split('/') if p]
+    
+    chat_id = None
+    msg_id = None
+    
+    if len(path_parts) >= 2:
+        if path_parts[0] == 's':
+            chat_id = path_parts[1]
+            if len(path_parts) >= 3 and path_parts[2].isdigit():
+                msg_id = int(path_parts[2])
+        elif path_parts[0] == 'c' and len(path_parts) >= 3:
+            try:
+                raw_c = path_parts[1].lstrip('-')
+                if not raw_c.startswith("100"):
+                    raw_c = f"100{raw_c}"
+                chat_id = int(f"-{raw_c}")
+            except ValueError:
+                chat_id = path_parts[1]
+            if path_parts[2].isdigit():
+                msg_id = int(path_parts[2])
+        else:
+            chat_id = path_parts[0]
+            if path_parts[1].isdigit():
+                msg_id = int(path_parts[1])
 
-    TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION = load_tg_creds()
+    fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
+    provided = telegram_config if isinstance(telegram_config, dict) else {}
+    raw_api_id = str(provided.get("api_id") or fb_id or "30909654").strip()
+    TELEGRAM_API_ID = int(re.sub(r'\D+', '', raw_api_id) or "30909654")
+    TELEGRAM_API_HASH = str(provided.get("api_hash") or fb_hash or "d4b340a406c5c1ed1d7f26d44749602b").strip()
+    raw_sess = str(provided.get("session") or fb_sess or "").strip()
+    if raw_sess:
+        missing = len(raw_sess) % 4
+        if missing:
+            raw_sess += '=' * (4 - missing)
+    TELEGRAM_SESSION = raw_sess
     telegram_credentials_available = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_SESSION)
 
     try:
@@ -4317,7 +4337,7 @@ def select_progressive_youtube_format(formats, quality="best"):
     return None
 
 
-def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
+def app_resolve(url, quality="best", season=None, episode=None, cookie=None, audio_lang=None):
     if not url:
         raise Exception("A URL is required")
     lower = url.lower()
@@ -4516,11 +4536,20 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                (f.get('resolution') == 'audio only' or f.get('height') in (None, 0))
         ]
         hls_audio_fmt = None
-        for af in hls_audio_formats:
-            lang = str(af.get('language') or af.get('format_note') or '').lower()
-            if 'en' in lang or 'default' in lang or 'original' in lang:
-                hls_audio_fmt = af
-                break
+        clean_audio_lang = str(audio_lang or "").strip().lower()
+        if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
+            for af in hls_audio_formats:
+                lang = str(af.get('language') or af.get('format_note') or '').lower()
+                if clean_audio_lang in lang or clean_audio_lang[:2] == lang[:2]:
+                    hls_audio_fmt = af
+                    break
+
+        if not hls_audio_fmt:
+            for af in hls_audio_formats:
+                lang = str(af.get('language') or af.get('format_note') or '').lower()
+                if 'en' in lang or 'default' in lang or 'original' in lang:
+                    hls_audio_fmt = af
+                    break
         if not hls_audio_fmt and hls_audio_formats:
             hls_audio_fmt = hls_audio_formats[0]
 
@@ -4601,12 +4630,14 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                     quality_urls_map[q_lbl] = p_fallback["url"]
                     continue
 
-            # 2. For HD tiers (720p, 1080p, 1440p, 2160p), pair HLS video with HLS audio into a streamable Master Playlist
+            # 2. For HD/SD tiers, pair HLS video with HLS audio into a streamable Master Playlist
             if target_h and hls_audio_fmt and hls_audio_fmt.get('url'):
                 matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) == target_h and f.get("url")]
                 if not matching_hls_v:
                     matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) <= target_h and f.get("url")]
                     matching_hls_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
+                # Universal hardware decoder compatibility: Prefer AVC1 (H.264) over VP9
+                matching_hls_v.sort(key=lambda f: (1 if 'avc1' in str(f.get('vcodec') or '') else 0), reverse=True)
 
                 if matching_hls_v:
                     v_fmt = matching_hls_v[0]
@@ -4615,16 +4646,37 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                     bw = int((v_fmt.get('tbr') or (target_h * 3.5)) * 1000)
                     a_url = hls_audio_fmt['url']
                     v_url = v_fmt['url']
+                    v_codec = v_fmt.get('vcodec') or 'avc1.640028'
+                    codecs_str = f'CODECS="{v_codec},mp4a.40.2",' if v_codec else ''
                     media_audio_lines = []
                     seen_langs = set()
                     for af in hls_audio_formats:
-                        lang = str(af.get('language') or af.get('format_note') or 'Audio').strip().capitalize()
-                        if lang in seen_langs:
+                        lang_code = str(af.get('language') or '').lower()
+                        note = str(af.get('format_note') or '')
+                        if lang_code:
+                            if 'en' in lang_code: lang_display = 'English'
+                            elif 'hi' in lang_code: lang_display = 'Hindi'
+                            elif 'es' in lang_code: lang_display = 'Spanish'
+                            elif 'fr' in lang_code: lang_display = 'French'
+                            elif 'de' in lang_code: lang_display = 'German'
+                            elif 'ja' in lang_code: lang_display = 'Japanese'
+                            elif 'ko' in lang_code: lang_display = 'Korean'
+                            elif 'pt' in lang_code: lang_display = 'Portuguese'
+                            elif 'ru' in lang_code: lang_display = 'Russian'
+                            elif 'zh' in lang_code: lang_display = 'Chinese'
+                            elif 'ar' in lang_code: lang_display = 'Arabic'
+                            else: lang_display = lang_code.upper()
+                        elif 'default' in note.lower() or 'original' in note.lower():
+                            lang_display = 'Original'
+                        else:
+                            lang_display = note.strip().capitalize() or 'Audio'
+
+                        if lang_display in seen_langs:
                             continue
-                        seen_langs.add(lang)
+                        seen_langs.add(lang_display)
                         is_def = "YES" if (af == hls_audio_fmt) else "NO"
                         media_audio_lines.append(
-                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
+                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
                         )
                     if not media_audio_lines:
                         media_audio_lines.append(
@@ -4632,10 +4684,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                         )
                     master_m3u8 = (
                         "#EXTM3U\n"
-                        "#EXT-X-VERSION:3\n"
+                        "#EXT-X-VERSION:6\n"
                         "#EXT-X-INDEPENDENT-SEGMENTS\n" +
                         "\n".join(media_audio_lines) + "\n" +
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},AUDIO="audio"\n'
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},{codecs_str}AUDIO="audio"\n'
                         f'{v_url}\n'
                     )
                     quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_master_{target_h}.m3u8", master_m3u8)
@@ -4767,11 +4819,17 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
         stream_url = None
         can_stream = False
         media_type = "file"
-        if len(path_parts) >= 2:
+        embed_url = None
+        if len(path_parts) >= 3 and path_parts[0] == 'c':
+            msg_id = path_parts[2]
+            title = f"Telegram Document #{msg_id}"
+        elif len(path_parts) >= 2:
             channel = path_parts[1] if path_parts[0] == 's' else path_parts[0]
             msg_id = path_parts[-1]
             title = f"Telegram {channel} #{msg_id}"
             embed_url = f"https://t.me/s/{channel}/{msg_id}"
+
+        if embed_url:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             try:
                 r = requests.get(embed_url, headers=headers, timeout=8)
@@ -5020,9 +5078,10 @@ _PENDING_TG_CLIENTS = {}
 
 def app_telegram_check(payload):
     fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
+    raw_sess = payload.get("session")
+    session = str(raw_sess).strip() if (raw_sess is not None) else fb_sess
     api_id = re.sub(r'\s+', '', str(payload.get("api_id") or fb_id)).strip()
     api_hash = re.sub(r'\s+', '', str(payload.get("api_hash") or fb_hash)).strip()
-    session = re.sub(r'\s+', '', str(payload.get("session") or fb_sess)).strip()
 
     if not api_id or not str(api_id).strip().isdigit():
         raise Exception("API ID must be a numeric integer")
@@ -5390,9 +5449,25 @@ def app_telegram_logout(payload):
 
     try:
         loop.run_until_complete(_do_logout())
+        for p in [
+            os.path.join(os.path.dirname(__file__), "credentials.local.json"),
+            os.path.join(os.path.dirname(__file__), "assets", "credentials.local.json"),
+            os.path.expanduser("~/.telegram_credentials.json"),
+        ]:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
         return {"ok": True, "logged_out": True}
     except Exception as e:
         print(f"[WARN] Telegram logout: {e}")
+        for p in [
+            os.path.join(os.path.dirname(__file__), "credentials.local.json"),
+            os.path.join(os.path.dirname(__file__), "assets", "credentials.local.json"),
+            os.path.expanduser("~/.telegram_credentials.json"),
+        ]:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
         return {"ok": True, "logged_out": True, "error": str(e)}
 
 
@@ -5431,7 +5506,8 @@ def run_app_json_request(payload):
                     quality=payload.get("quality", "best"),
                     season=payload.get("season"),
                     episode=payload.get("episode"),
-                    cookie=payload.get("cookie")
+                    cookie=payload.get("cookie"),
+                    audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang")
                 )
             elif action == "download":
                 result = app_download(payload)

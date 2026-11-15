@@ -547,6 +547,8 @@ private fun ArcApp(
 
     var showDeleteConfirmJobId by remember { mutableStateOf<String?>(null) }
     var showSeriesDownloadDialog by remember { mutableStateOf(false) }
+    var audioPromptShownForDownload by remember { mutableStateOf(false) }
+    var audioPromptShownForStream by remember { mutableStateOf(false) }
 
     val tab = AppTab.entries.firstOrNull { it.name == tabName } ?: AppTab.HOME
 
@@ -753,6 +755,9 @@ private fun ArcApp(
 
             if (playUrl.contains("127.0.0.1")) {
                 StreamService.start(context, streamUrl, headers)
+                try {
+                    Thread.sleep(150)
+                } catch (_: Exception) {}
             }
             val uri = Uri.parse(playUrl)
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -843,7 +848,15 @@ private fun ArcApp(
                 isError = true,
             )
             message(error)
-            if (result.type == "resolve") resolveLoading = false
+            if (result.type == "resolve") {
+                resolveLoading = false
+                target = target.copy(
+                    canStream = false,
+                    directStreamUrl = "",
+                    qualityUrls = emptyMap(),
+                    availableQualities = emptyList()
+                )
+            }
             if (result.type == "search") searchLoading = false
             if (result.type == "download") jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
             return
@@ -994,7 +1007,9 @@ private fun ArcApp(
                     rawSource.contains("Movie", ignoreCase = true) ||
                     target.mediaCategory.contains("MOVIE", ignoreCase = true)
                 val isSeriesResolved = !isExplicitMovie && (seasonsList.isNotEmpty() || target.seasons.isNotEmpty()) && (isSeries || target.isSeries)
+                val isTelegramLink = target.targetUrl.contains("t.me/", ignoreCase = true) || target.targetUrl.contains("telegram.me/", ignoreCase = true) || rawSource.contains("Telegram", ignoreCase = true)
                 val resolvedCategory = when {
+                    isTelegramLink -> "TELEGRAM"
                     isExplicitMovie -> "MOVIE"
                     isSeriesResolved -> "TV SERIES"
                     rawSource.contains("YouTube", ignoreCase = true) || target.targetUrl.contains("youtu", ignoreCase = true) -> "YOUTUBE"
@@ -1003,6 +1018,10 @@ private fun ArcApp(
                     target.mediaCategory.isNotBlank() -> target.mediaCategory
                     else -> "MOVIE"
                 }
+
+                val finalCanStream = if (isTelegramLink) false else canStream
+                val finalMediaType = if (isTelegramLink) "file" else mediaType
+                val finalSource = if (isTelegramLink) "Telegram" else rawSource
 
                 val sortedQualities = sortQualitiesDescending(qualitiesList)
                 val defaultPref = if (audioOnly) defaultAudioQuality else defaultVideoQuality
@@ -1020,8 +1039,8 @@ private fun ArcApp(
 
                 target = target.copy(
                     title = resolvedTitle,
-                    source = rawSource,
-                    detail = if (!canStream || mediaType == "file") "Direct File" else (if (isSeriesResolved) "Season ${data?.optInt("season", target.selectedSeason) ?: target.selectedSeason} · Episode ${data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode}" else (if (audioOnly) "Audio Stream" else "")),
+                    source = finalSource,
+                    detail = if (!finalCanStream || finalMediaType == "file") "Direct File" else (if (isSeriesResolved) "Season ${data?.optInt("season", target.selectedSeason) ?: target.selectedSeason} · Episode ${data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode}" else (if (audioOnly) "Audio Stream" else "")),
                     directStreamUrl = finalDirectUrl,
                     proxyUrl = resolvedProxyUrl,
                     targetUrl = data?.optString("target_url").takeUnless { it.isNullOrBlank() } ?: target.targetUrl,
@@ -1035,8 +1054,8 @@ private fun ArcApp(
                     playlistEntries = playlistEntriesList,
                     selectedSeason = data?.optInt("season", target.selectedSeason) ?: target.selectedSeason,
                     selectedEpisode = data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode,
-                    canStream = canStream,
-                    mediaType = mediaType,
+                    canStream = finalCanStream,
+                    mediaType = finalMediaType,
                     audioTracks = if (audioTracksList.isNotEmpty()) audioTracksList else target.audioTracks,
                     year = resolvedYear,
                     mediaCategory = resolvedCategory,
@@ -1126,6 +1145,36 @@ private fun ArcApp(
         target = MediaTarget("", "", "", "", "")
     }
 
+    val currentActivity = context as? ComponentActivity
+    BackHandler(enabled = true) {
+        when {
+            showSeriesDownloadDialog -> showSeriesDownloadDialog = false
+            showDeleteConfirmJobId != null -> showDeleteConfirmJobId = null
+            showTelegramSetup -> showTelegramSetup = false
+            showQualityDialog -> showQualityDialog = false
+            showPathDialog -> showPathDialog = false
+            tab != AppTab.HOME -> {
+                tabName = AppTab.HOME.name
+            }
+            tab == AppTab.HOME -> {
+                when {
+                    overlay == "analysis" -> {
+                        if (hits.isNotEmpty()) {
+                            overlay = "search"
+                            homeOverlay = "search"
+                        } else {
+                            openHome()
+                        }
+                    }
+                    overlay == "search" -> openHome()
+                    overlay.isNotBlank() -> openHome()
+                    else -> currentActivity?.finish()
+                }
+            }
+            else -> currentActivity?.finish()
+        }
+    }
+
     fun analyze(
         value: String = input,
         titleOverride: String? = null,
@@ -1146,6 +1195,8 @@ private fun ArcApp(
         currentTrace = null
         liveStepText = ""
         elapsedSeconds = 0f
+        audioPromptShownForDownload = false
+        audioPromptShownForStream = false
 
         val isDirectUrl = clean.startsWith("http://", ignoreCase = true) ||
             clean.startsWith("https://", ignoreCase = true) ||
@@ -1156,7 +1207,8 @@ private fun ArcApp(
         if (isDirectUrl) {
             resolveLoading = true
             val isYouTubeClean = clean.contains("youtu", ignoreCase = true)
-            val isSameShow = !isYouTubeClean && (clean.equals(target.targetUrl, ignoreCase = true) ||
+            val isTelegramClean = clean.contains("t.me/", ignoreCase = true) || clean.contains("telegram.me/", ignoreCase = true)
+            val isSameShow = !isYouTubeClean && !isTelegramClean && (clean.equals(target.targetUrl, ignoreCase = true) ||
                              (target.title.isNotBlank() && titleOverride != null && cleanShowTitle(target.title).equals(cleanShowTitle(titleOverride), ignoreCase = true)))
 
             if (!isSameShow) {
@@ -1167,13 +1219,15 @@ private fun ArcApp(
             val titleToUse = when {
                 titleOverride != null -> titleOverride
                 isYouTubeClean -> "YouTube Video"
+                isTelegramClean -> "Telegram Media"
                 else -> clean.split("/").lastOrNull { it.isNotBlank() } ?: "Media stream"
             }
-            val isMovieTitle = titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true
-            val detectedSeries = !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
+            val isMovieTitle = !isTelegramClean && (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
+            val detectedSeries = !isTelegramClean && !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
                                  (mediaCategoryOverride?.contains("TV", ignoreCase = true) == true) ||
                                  Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(titleToUse))
             val detectedCategory = when {
+                isTelegramClean -> "TELEGRAM"
                 isMovieTitle -> "MOVIE"
                 detectedSeries -> "TV SERIES"
                 clean.contains("youtu", ignoreCase = true) -> "YOUTUBE"
@@ -1195,8 +1249,8 @@ private fun ArcApp(
             } else {
                 MediaTarget(
                     title = titleToUse,
-                    source = if (detectedSeries) "TV Series" else (if (clean.contains("youtu", ignoreCase = true)) "YouTube" else "Movie"),
-                    detail = if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else "Analyzing media...",
+                    source = if (isTelegramClean) "Telegram" else if (detectedSeries) "TV Series" else (if (clean.contains("youtu", ignoreCase = true)) "YouTube" else "Movie"),
+                    detail = if (isTelegramClean) "Direct File" else if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else "Analyzing media...",
                     size = "Detecting",
                     description = clean,
                     targetUrl = clean,
@@ -1212,8 +1266,8 @@ private fun ArcApp(
                     playlistEntries = emptyList(),
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
-                    canStream = true,
-                    mediaType = "video",
+                    canStream = !isTelegramClean,
+                    mediaType = if (isTelegramClean) "file" else "video",
                     audioTracks = audioChoices,
                     selectedAudioLang = selectedAudioLang,
                     year = detectedYear,
@@ -1228,6 +1282,7 @@ private fun ArcApp(
                     put("action", "resolve")
                     put("url", clean)
                     put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
+                    if (selectedAudioLang.isNotBlank()) put("audio_lang", selectedAudioLang)
                     if (season != null) put("season", season)
                     if (episode != null) put("episode", episode)
                 },
@@ -1587,71 +1642,84 @@ private fun ArcApp(
                                         )
                                     },
                                     onDownload = {
-                                        if (target.isSeries) {
-                                            showSeriesDownloadDialog = true
+                                        if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank() && !audioPromptShownForDownload) {
+                                            audioPromptShownForDownload = true
+                                            message("Select language, or tap Download again for all languages / default.")
                                         } else {
-                                            startDownload()
+                                            if (target.isSeries) {
+                                                showSeriesDownloadDialog = true
+                                            } else {
+                                                startDownload()
+                                            }
                                         }
                                     },
                                     onStream = {
-                                        val displayTitle = if (target.isSeries) {
-                                            "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
+                                        if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank() && !audioPromptShownForStream) {
+                                            audioPromptShownForStream = true
+                                            message("Select language, or tap Stream again for default language.")
                                         } else {
-                                            target.title
-                                        }
-                                        val qMapped = target.qualityUrls[selectedQuality]
-                                        val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
-                                        val isValidDirectStream = directCandidate.isNotBlank() &&
-                                            !directCandidate.contains("youtube.com") &&
-                                            !directCandidate.contains("youtu.be")
-
-                                        if (isValidDirectStream && !resolveLoading) {
-                                            streamLoading = true
-                                            openStreamExternal(directCandidate, target.streamHeaders, displayTitle)
-                                            scope.launch {
-                                                kotlinx.coroutines.delay(1200)
-                                                streamLoading = false
+                                            val displayTitle = if (target.isSeries) {
+                                                "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
+                                            } else {
+                                                target.title
                                             }
-                                        } else {
-                                            streamLoading = true
-                                            scope.launch {
-                                                val sPayload = JSONObject().apply {
-                                                    put("action", "resolve")
-                                                    put("url", target.targetUrl.ifBlank { input })
-                                                    if (target.isSeries) {
-                                                        put("season", target.selectedSeason)
-                                                        put("episode", target.selectedEpisode)
+                                            val qMapped = target.qualityUrls[selectedQuality]
+                                            val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
+                                            val isValidDirectStream = directCandidate.isNotBlank() &&
+                                                !directCandidate.contains("youtube.com") &&
+                                                !directCandidate.contains("youtu.be")
+
+                                            if (isValidDirectStream && !resolveLoading) {
+                                                streamLoading = true
+                                                openStreamExternal(directCandidate, target.streamHeaders, displayTitle)
+                                                scope.launch {
+                                                    kotlinx.coroutines.delay(1200)
+                                                    streamLoading = false
+                                                }
+                                            } else {
+                                                streamLoading = true
+                                                scope.launch {
+                                                    val sPayload = JSONObject().apply {
+                                                        put("action", "resolve")
+                                                        put("url", target.targetUrl.ifBlank { input })
+                                                        if (target.selectedAudioLang.isNotBlank()) {
+                                                            put("audio_lang", target.selectedAudioLang)
+                                                        }
+                                                        if (target.isSeries) {
+                                                            put("season", target.selectedSeason)
+                                                            put("episode", target.selectedEpisode)
+                                                        }
+                                                        put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
                                                     }
-                                                    put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
+                                                    val res = withContext(Dispatchers.IO) {
+                                                        runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
+                                                    }
+                                                    val data = res?.optJSONObject("result")
+                                                    val qUrlMap = mutableMapOf<String, String>()
+                                                    data?.optJSONObject("quality_urls")?.let { qObj ->
+                                                        qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                                                    }
+                                                    val directUrl = qUrlMap[selectedQuality]
+                                                        ?: data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
+                                                        ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
+                                                        ?: data?.optString("url").orEmpty()
+                                                    val proxyUrl = data?.optString("proxy_url").orEmpty()
+                                                    val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                                                    val hMap = mutableMapOf<String, String>()
+                                                    hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                                                    val playUrl = directUrl.ifBlank { proxyUrl }
+                                                    if (playUrl.isNotBlank() && !playUrl.contains("youtube.com") && !playUrl.contains("youtu.be")) {
+                                                        target = target.copy(
+                                                            directStreamUrl = directUrl,
+                                                            proxyUrl = proxyUrl,
+                                                            streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                        )
+                                                        openStreamExternal(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
+                                                    } else {
+                                                        message("Could not resolve stream for $displayTitle")
+                                                    }
+                                                    streamLoading = false
                                                 }
-                                                val res = withContext(Dispatchers.IO) {
-                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                                }
-                                                val data = res?.optJSONObject("result")
-                                                val qUrlMap = mutableMapOf<String, String>()
-                                                data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                                }
-                                                val directUrl = qUrlMap[selectedQuality]
-                                                    ?: data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
-                                                    ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
-                                                    ?: data?.optString("url").orEmpty()
-                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                                val hMap = mutableMapOf<String, String>()
-                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val playUrl = directUrl.ifBlank { proxyUrl }
-                                                if (playUrl.isNotBlank() && !playUrl.contains("youtube.com") && !playUrl.contains("youtu.be")) {
-                                                    target = target.copy(
-                                                        directStreamUrl = directUrl,
-                                                        proxyUrl = proxyUrl,
-                                                        streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                                    )
-                                                    openStreamExternal(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
-                                                } else {
-                                                    message("Could not resolve stream for $displayTitle")
-                                                }
-                                                streamLoading = false
                                             }
                                         }
                                     },
@@ -2616,12 +2684,12 @@ private fun AnalysisScreen(
         // Multiple Audio Tracks selector if movie or series has multiple languages
         if (!loading && target.audioTracks.size > 1) {
             item {
-                val currentLang = target.selectedAudioLang.ifBlank { target.audioTracks.first().language }
+                val currentLang = target.selectedAudioLang.ifBlank { "Not selected (Tap to choose)" }
                 SectionHeader("Audio Language", currentLang)
                 Spacer(Modifier.height(6.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(target.audioTracks) { aChoice ->
-                        val isAudioSelected = (aChoice.language == target.selectedAudioLang) || (target.selectedAudioLang.isBlank() && aChoice == target.audioTracks.first())
+                        val isAudioSelected = target.selectedAudioLang.isNotBlank() && aChoice.language.equals(target.selectedAudioLang, ignoreCase = true)
                         FilterChip(
                             selected = isAudioSelected,
                             onClick = {
@@ -2829,44 +2897,97 @@ private fun AnalysisScreen(
                     }
                 }
             }
-            item {
-                Button(
-                    onClick = onDownload,
-                    modifier = Modifier.fillMaxWidth().height(50.dp),
-                    shape = RoundedCornerShape(15.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
-                ) {
-                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        if (target.isSeries) "Download $quality"
-                        else if (target.isPlaylist) "Download Playlist ($quality)"
-                        else if (!target.canStream || target.mediaType == "file") "Download File"
-                        else "Download $quality",
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-                if (target.canStream && target.mediaType != "file") {
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = onStream,
-                        enabled = !streamLoading,
-                        modifier = Modifier.fillMaxWidth().height(48.dp),
-                        shape = RoundedCornerShape(14.dp),
+            val hasResolvedMedia = target.directStreamUrl.isNotBlank() ||
+                target.qualityUrls.isNotEmpty() ||
+                target.isPlaylist ||
+                target.targetUrl.startsWith("magnet:", ignoreCase = true) ||
+                target.targetUrl.contains("t.me/", ignoreCase = true) ||
+                target.targetUrl.contains("telegram.me/", ignoreCase = true)
+
+            if (!hasResolvedMedia) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, Color(0xFF333333)),
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        if (streamLoading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                Icons.Outlined.ErrorOutline,
+                                contentDescription = null,
+                                tint = Color(0xFFFF5252),
+                                modifier = Modifier.size(36.dp),
+                            )
+                            Text(
+                                "Stream Unavailable",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
                                 color = ArcWhite,
                             )
-                            Spacer(Modifier.width(10.dp))
-                            Text("Opening Stream...", fontWeight = FontWeight.SemiBold)
-                        } else {
-                            Icon(Icons.Outlined.PlayArrow, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            val streamLabel = if (quality.isNotBlank() && !quality.equals("Best Available", ignoreCase = true)) "Stream $quality" else "Stream"
-                            Text(streamLabel, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "No active streaming servers or direct downloadable sources could be found for this media. CDN nodes may be rate-limiting or offline.",
+                                fontSize = 12.sp,
+                                color = ArcMuted,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = onBack,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth().height(44.dp),
+                            ) {
+                                Text("Go Back", fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
+                }
+            } else {
+                item {
+                    Button(
+                        onClick = onDownload,
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        shape = RoundedCornerShape(15.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                    ) {
+                        Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            if (target.isSeries) "Download $quality"
+                            else if (target.isPlaylist) "Download Playlist ($quality)"
+                            else if (!target.canStream || target.mediaType == "file") "Download File"
+                            else "Download $quality",
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    if (target.canStream && target.mediaType != "file") {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = onStream,
+                            enabled = !streamLoading,
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            if (streamLoading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = ArcWhite,
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text("Opening Stream...", fontWeight = FontWeight.SemiBold)
+                            } else {
+                                Icon(Icons.Outlined.PlayArrow, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                val streamLabel = if (quality.isNotBlank() && !quality.equals("Best Available", ignoreCase = true)) "Stream $quality" else "Stream"
+                                Text(streamLabel, fontWeight = FontWeight.SemiBold)
+                            }
                         }
                     }
                 }
