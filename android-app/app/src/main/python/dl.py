@@ -1802,79 +1802,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             outtmpl_pattern = os.path.join(stage_dir, f"%(title)s({q_tag}).%(ext)s")
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
-    enable_multitrack = False
-    if clean_audio_lang in ("all", "all languages", "multi", "multitrack"):
-        enable_multitrack = True
-        audio_sel = "bestaudio[ext=m4a]/bestaudio"
-    elif clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
+    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
         audio_sel = f"bestaudio[language^={clean_audio_lang[:2]}][ext=m4a]/bestaudio[format_note*={clean_audio_lang}][ext=m4a]/bestaudio[language^={clean_audio_lang[:2]}]/bestaudio[format_note*={clean_audio_lang}]/bestaudio[ext=m4a]/bestaudio"
     else:
         audio_sel = "bestaudio[ext=m4a]/bestaudio"
 
-    multitrack_selector = None
-    if enable_multitrack and not is_audio_only:
-        def multitrack_selector(ctx):
-            formats = ctx.get('formats', [])
-            if not formats:
-                return
-            v_cands = [f for f in formats if f.get('vcodec') not in (None, 'none') and f.get('url')]
-            if not v_cands:
-                return
-            under_cap = [f for f in v_cands if (f.get('height') or 0) <= cap]
-            v_pool = under_cap if under_cap else v_cands
-            v_pool.sort(key=lambda f: (f.get('height') or 0, 1 if 'avc' in str(f.get('vcodec') or '').lower() else 0, 1 if f.get('ext') == 'mp4' else 0), reverse=True)
-            best_v = v_pool[0]
-
-            a_cands = [f for f in formats if f.get('vcodec') in (None, 'none') and f.get('acodec') not in (None, 'none') and f.get('url')]
-            lang_audios = {}
-            for af in a_cands:
-                l = str(af.get('language') or af.get('format_note') or 'default').lower().strip()
-                if 'en' in l or 'orig' in l: l_key = 'en'
-                elif 'hi' in l: l_key = 'hi'
-                elif 'es' in l: l_key = 'es'
-                elif 'fr' in l: l_key = 'fr'
-                elif 'de' in l: l_key = 'de'
-                elif 'ja' in l: l_key = 'ja'
-                elif 'ko' in l: l_key = 'ko'
-                elif 'pt' in l: l_key = 'pt'
-                elif 'ru' in l: l_key = 'ru'
-                elif 'zh' in l: l_key = 'zh'
-                elif 'ar' in l: l_key = 'ar'
-                elif 'ta' in l: l_key = 'ta'
-                elif 'te' in l: l_key = 'te'
-                elif 'bn' in l: l_key = 'bn'
-                elif 'id' in l: l_key = 'id'
-                else: l_key = l[:2] if len(l) >= 2 else l
-                lang_audios.setdefault(l_key, []).append(af)
-
-            selected_audios = []
-            for l_key, af_list in lang_audios.items():
-                m4a_aac = [f for f in af_list if (f.get('ext') == 'm4a' or 'mp4a' in str(f.get('acodec') or '').lower())]
-                if m4a_aac:
-                    m4a_aac.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
-                    selected_audios.append(m4a_aac[0])
-                else:
-                    af_list.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
-                    selected_audios.append(af_list[0])
-
-            if not selected_audios and a_cands:
-                selected_audios = [a_cands[0]]
-
-            fmt_ids = [best_v['format_id']] + [a['format_id'] for a in selected_audios]
-            res = dict(best_v)
-            res.update({
-                'format_id': '+'.join(fmt_ids),
-                'ext': best_v.get('ext') or 'mp4',
-                'vcodec': best_v.get('vcodec'),
-                'acodec': 'multitrack',
-                'requested_formats': [best_v] + selected_audios
-            })
-            yield res
-
     if is_audio_only:
         format_spec = f"{audio_sel}/best"
-    elif enable_multitrack:
-        format_spec = multitrack_selector
     else:
         if cap <= 1080:
             format_spec = (
@@ -1894,7 +1828,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 f"best"
             )
 
-    print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'multitrack-aac'}]...")
+    print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'audio+video'}]...")
     yt_opts_dict = {
         'format': format_spec,
         'outtmpl': outtmpl_pattern,
@@ -1910,8 +1844,6 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'http_chunk_size': 10485760,
         'merge_output_format': 'mp4',
     }
-    if enable_multitrack and not is_audio_only:
-        yt_opts_dict['audio_multistreams'] = True
     ydl_opts = get_ytdlp_opts(yt_opts_dict, cookie=cookie)
 
     max_attempts = 5
@@ -2143,39 +2075,24 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         mb_done = current / (1024 * 1024)
                         render_download_progress(100.0, f"{mb_done:.1f}MB", job_id=jid)
 
-                # Prime peer cache with user's dialogs so private channels have their access_hash cached in memory
+                # Prime peer cache if needed so private channels have their access_hash cached in memory
                 if chat_id:
                     try:
                         import pyrogram.raw as raw
-                        from pyrogram import utils as py_utils
-                        offset_date = 0
-                        offset_id = 0
-                        offset_peer = raw.types.InputPeerEmpty()
-                        for _ in range(5):
+                        try:
+                            await app.storage.get_peer_by_id(chat_id)
+                        except KeyError:
                             r = await app.invoke(
                                 raw.functions.messages.GetDialogs(
-                                    offset_date=offset_date,
-                                    offset_id=offset_id,
-                                    offset_peer=offset_peer,
+                                    offset_date=0,
+                                    offset_id=0,
+                                    offset_peer=raw.types.InputPeerEmpty(),
                                     limit=100,
                                     hash=0
                                 )
                             )
-                            if not r.dialogs:
-                                break
-                            await app.fetch_peers(r.chats + r.users)
-                            try:
-                                await app.storage.get_peer_by_id(chat_id)
-                                break
-                            except KeyError:
-                                pass
-                            last_d = r.dialogs[-1]
-                            last_m = next((m for m in r.messages if getattr(m, 'id', None) == getattr(last_d, 'top_message', None)), None)
-                            if not last_m:
-                                break
-                            offset_date = getattr(last_m, 'date', 0)
-                            offset_id = getattr(last_m, 'id', 0)
-                            offset_peer = await app.resolve_peer(py_utils.get_peer_id(last_d.peer))
+                            if r and (r.chats or r.users):
+                                await app.fetch_peers(r.chats + r.users)
                     except Exception as d_err:
                         print(f"[DEBUG] Telegram peer priming notice: {d_err}")
 
@@ -4834,7 +4751,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         )
         hls_audio_fmt = None
         clean_audio_lang = str(audio_lang or "").strip().lower()
-        if clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all", "all languages", "multi", "multitrack"):
+        if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
             for af in hls_audio_formats:
                 lang = str(af.get('language') or af.get('format_note') or '').lower()
                 if clean_audio_lang in lang or clean_audio_lang[:2] == lang[:2]:
@@ -4917,7 +4834,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             target_h = int(cap_match.group(1)) if cap_match else None
 
             # 1. If 360p or lower, prefer direct progressive mp4 stream (format 18) only if user didn't pick a specific audio language
-            if target_h and target_h <= 360 and progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all", "all languages", "multi", "multitrack")):
+            if target_h and target_h <= 360 and progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none")):
                 matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
                 if matching_prog:
                     quality_urls_map[q_lbl] = matching_prog[0]["url"]
@@ -4945,53 +4862,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     v_url = v_fmt['url']
                     v_codec = v_fmt.get('vcodec') or 'avc1.640028'
                     codecs_str = f'CODECS="{v_codec},mp4a.40.2",' if v_codec else ''
-                    media_audio_lines = []
-                    seen_langs = set()
-
-                    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all", "all languages", "multi", "multitrack"):
-                        # User selected a specific audio language: serve ONLY this audio track in the master playlist
-                        # This prevents VLC PTS clock desync/freeze when switching between Google Video fMP4 and TS audio
-                        selected_lang_name = clean_audio_lang.capitalize()
-                        media_audio_lines.append(
-                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",LANGUAGE="{clean_audio_lang[:2]}",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{hls_audio_fmt["url"]}"'
-                        )
-                    else:
-                        for af in hls_audio_formats:
-                            lang_code = str(af.get('language') or '').lower()
-                            note = str(af.get('format_note') or '')
-                            if lang_code:
-                                if 'en' in lang_code: lang_display = 'English'
-                                elif 'hi' in lang_code: lang_display = 'Hindi'
-                                elif 'es' in lang_code: lang_display = 'Spanish'
-                                elif 'fr' in lang_code: lang_display = 'French'
-                                elif 'de' in lang_code: lang_display = 'German'
-                                elif 'ja' in lang_code: lang_display = 'Japanese'
-                                elif 'ko' in lang_code: lang_display = 'Korean'
-                                elif 'pt' in lang_code: lang_display = 'Portuguese'
-                                elif 'ru' in lang_code: lang_display = 'Russian'
-                                elif 'zh' in lang_code: lang_display = 'Chinese'
-                                elif 'ar' in lang_code: lang_display = 'Arabic'
-                                elif 'ta' in lang_code: lang_display = 'Tamil'
-                                elif 'te' in lang_code: lang_display = 'Telugu'
-                                elif 'bn' in lang_code: lang_display = 'Bengali'
-                                elif 'id' in lang_code: lang_display = 'Indonesian'
-                                else: lang_display = lang_code.upper()
-                            elif 'default' in note.lower() or 'original' in note.lower():
-                                lang_display = 'Original'
-                            else:
-                                lang_display = note.strip().capitalize() or 'Audio'
-
-                            if lang_display in seen_langs:
-                                continue
-                            seen_langs.add(lang_display)
-                            is_def = "YES" if (af == hls_audio_fmt) else "NO"
-                            media_audio_lines.append(
-                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",LANGUAGE="{lang_code or "en"}",DEFAULT={is_def},AUTOSELECT=YES,CHANNELS="2",URI="{af["url"]}"'
-                            )
-                        if not media_audio_lines:
-                            media_audio_lines.append(
-                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{a_url}"'
-                            )
+                    selected_lang_name = (hls_audio_fmt.get('language') or clean_audio_lang or 'Audio').capitalize()
+                    media_audio_lines = [
+                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",LANGUAGE="{clean_audio_lang[:2] if clean_audio_lang else "en"}",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{hls_audio_fmt["url"]}"'
+                    ]
                     master_m3u8 = (
                         "#EXTM3U\n"
                         "#EXT-X-VERSION:6\n"
@@ -5015,7 +4889,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_urls_map), None)
         if top_res_key:
             quality_urls_map["Best Available"] = quality_urls_map[top_res_key]
-        elif progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all", "all languages", "multi", "multitrack")):
+        elif progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none")):
             progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
             quality_urls_map["Best Available"] = progressive_sorted[0].get("url")
         else:
@@ -5069,9 +4943,6 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 "language": lang_display,
                 "url": url,
             })
-
-        if len(audio_choices) > 1:
-            audio_choices = [{"language": "All Languages", "url": url}] + audio_choices
 
         stream_url = None
         if clean_quality in quality_urls_map:
@@ -5138,133 +5009,19 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         media_type = "file"
         embed_url = None
 
-        chat_id = None
-        msg_id = None
-        if len(path_parts) >= 2:
-            if path_parts[0] == 's':
-                chat_id = path_parts[1]
-                if len(path_parts) >= 3 and path_parts[2].isdigit():
-                    msg_id = int(path_parts[2])
-            elif path_parts[0] == 'c' and len(path_parts) >= 3:
-                try:
-                    raw_c = path_parts[1].lstrip('-')
-                    if not raw_c.startswith("100"):
-                        raw_c = f"100{raw_c}"
-                    chat_id = int(f"-{raw_c}")
-                except ValueError:
-                    chat_id = path_parts[1]
-                if path_parts[-1].isdigit():
-                    msg_id = int(path_parts[-1])
-            else:
-                chat_id = path_parts[0]
-                if path_parts[1].isdigit():
-                    msg_id = int(path_parts[1])
-
-        # Attempt resolving through authenticated Telegram client if configured
-        fb_id, fb_hash, fb_sess = _get_fallback_tg_creds()
-        provided = telegram_config if isinstance(telegram_config, dict) else {}
-        tg_id = int(re.sub(r'\D+', '', str(provided.get("api_id") or fb_id or "30909654")) or "30909654")
-        tg_hash = str(provided.get("api_hash") or fb_hash or "d4b340a406c5c1ed1d7f26d44749602b").strip()
-        tg_sess = str(provided.get("session") or fb_sess or "").strip()
-        if tg_sess and len(tg_sess) % 4 != 0:
-            tg_sess += '=' * (4 - (len(tg_sess) % 4))
-
-        if tg_sess and chat_id and msg_id:
-            try:
-                from pyrogram import Client
-                async def _pyrogram_resolve():
-                    app = Client("d_py_tg_res", api_id=tg_id, api_hash=tg_hash, session_string=tg_sess, in_memory=True)
-                    await app.start()
-                    try:
-                        import pyrogram.raw as raw
-                        from pyrogram import utils as py_utils
-                        offset_date, offset_id = 0, 0
-                        offset_peer = raw.types.InputPeerEmpty()
-                        for _ in range(5):
-                            r = await app.invoke(
-                                raw.functions.messages.GetDialogs(
-                                    offset_date=offset_date, offset_id=offset_id, offset_peer=offset_peer, limit=100, hash=0
-                                )
-                            )
-                            if not r.dialogs: break
-                            await app.fetch_peers(r.chats + r.users)
-                            try:
-                                await app.storage.get_peer_by_id(chat_id)
-                                break
-                            except KeyError:
-                                pass
-                            last_d = r.dialogs[-1]
-                            last_m = next((m for m in r.messages if getattr(m, 'id', None) == getattr(last_d, 'top_message', None)), None)
-                            if not last_m: break
-                            offset_date = getattr(last_m, 'date', 0)
-                            offset_id = getattr(last_m, 'id', 0)
-                            offset_peer = await app.resolve_peer(py_utils.get_peer_id(last_d.peer))
-
-                        msg = await app.get_messages(chat_id, msg_id)
-                        if getattr(msg, "empty", False) or not msg:
-                            return {"is_empty": True}
-                        meta = {}
-                        if msg.document:
-                            meta["fname"] = msg.document.file_name
-                            meta["fsize"] = msg.document.file_size
-                            meta["type"] = "file"
-                        elif msg.video:
-                            meta["fname"] = msg.video.file_name or f"video_{msg_id}.mp4"
-                            meta["fsize"] = msg.video.file_size
-                            meta["type"] = "video"
-                        elif msg.photo:
-                            meta["fname"] = f"photo_{msg_id}.jpg"
-                            meta["type"] = "file"
-                        elif msg.audio:
-                            meta["fname"] = msg.audio.file_name or f"audio_{msg_id}.mp3"
-                            meta["fsize"] = msg.audio.file_size
-                            meta["type"] = "audio"
-                        return meta
-                    finally:
-                        try: await app.stop()
-                        except Exception: pass
-                        try:
-                            for t in asyncio.all_tasks():
-                                if t is not asyncio.current_task(): t.cancel()
-                        except Exception: pass
-
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                tg_meta = loop.run_until_complete(_pyrogram_resolve())
-                if tg_meta:
-                    if tg_meta.get("is_empty"):
-                        print(f"[FAIL] Telegram Message #{msg_id} was deleted or does not exist.")
-                        return {
-                            "url": url,
-                            "title": f"Telegram #{msg_id} (Deleted / Not Found)",
-                            "source": "Telegram",
-                            "quality": "Best",
-                            "qualities": ["Best"],
-                            "can_stream": False,
-                            "media_type": "file",
-                        }
-                    if tg_meta.get("fname"):
-                        title = tg_meta["fname"]
-                        media_type = tg_meta.get("type", "file")
-                        can_stream = (media_type == "video")
-            except Exception as tg_err:
-                print(f"[DEBUG] Telegram resolve inspection notice: {tg_err}")
-
         if len(path_parts) >= 3 and path_parts[0] == 'c':
             msg_id = path_parts[2]
-            if title == "Telegram media":
-                title = f"Telegram Document #{msg_id}"
+            title = f"Telegram Document #{msg_id}"
         elif len(path_parts) >= 2:
             channel = path_parts[1] if path_parts[0] == 's' else path_parts[0]
             msg_id = path_parts[-1]
-            if title == "Telegram media":
-                title = f"Telegram {channel} #{msg_id}"
+            title = f"Telegram {channel} #{msg_id}"
             embed_url = f"https://t.me/s/{channel}/{msg_id}"
 
         if embed_url:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             try:
-                r = requests.get(embed_url, headers=headers, timeout=8)
+                r = requests.get(embed_url, headers=headers, timeout=2)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.text, 'html.parser')
                     video = soup.find('video')

@@ -548,8 +548,6 @@ private fun ArcApp(
 
     var showDeleteConfirmJobId by remember { mutableStateOf<String?>(null) }
     var showSeriesDownloadDialog by remember { mutableStateOf(false) }
-    var audioPromptShownForDownload by remember { mutableStateOf(false) }
-    var audioPromptShownForStream by remember { mutableStateOf(false) }
 
     val tab = AppTab.entries.firstOrNull { it.name == tabName } ?: AppTab.HOME
 
@@ -1196,8 +1194,6 @@ private fun ArcApp(
         currentTrace = null
         liveStepText = ""
         elapsedSeconds = 0f
-        audioPromptShownForDownload = false
-        audioPromptShownForStream = false
 
         val isDirectUrl = clean.startsWith("http://", ignoreCase = true) ||
             clean.startsWith("https://", ignoreCase = true) ||
@@ -1658,88 +1654,74 @@ private fun ArcApp(
                                         )
                                     },
                                     onDownload = {
-                                        if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank() && !audioPromptShownForDownload) {
-                                            audioPromptShownForDownload = true
-                                            message("Select language, or tap Download again for all languages / default.")
+                                        if (target.isSeries) {
+                                            showSeriesDownloadDialog = true
                                         } else {
-                                            val dlLang = if (target.selectedAudioLang.isBlank() && audioPromptShownForDownload && target.audioTracks.size > 1) "all" else target.selectedAudioLang
-                                            if (dlLang.isNotBlank() && target.selectedAudioLang != dlLang) {
-                                                target = target.copy(selectedAudioLang = dlLang)
-                                            }
-                                            if (target.isSeries) {
-                                                showSeriesDownloadDialog = true
-                                            } else {
-                                                startDownload(audioLangOverride = dlLang)
-                                            }
+                                            startDownload(audioLangOverride = target.selectedAudioLang)
                                         }
                                     },
                                     onStream = {
-                                        if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank() && !audioPromptShownForStream) {
-                                            audioPromptShownForStream = true
-                                            message("Select language, or tap Stream again for default language.")
+                                        val displayTitle = if (target.isSeries) {
+                                            "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
                                         } else {
-                                            val displayTitle = if (target.isSeries) {
-                                                "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
-                                            } else {
-                                                target.title
-                                            }
-                                            val qMapped = target.qualityUrls[selectedQuality]
-                                            val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
-                                            val isValidDirectStream = directCandidate.isNotBlank() &&
-                                                !directCandidate.contains("youtube.com") &&
-                                                !directCandidate.contains("youtu.be")
+                                            target.title
+                                        }
+                                        val qMapped = target.qualityUrls[selectedQuality]
+                                        val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
+                                        val isValidDirectStream = directCandidate.isNotBlank() &&
+                                            !directCandidate.contains("youtube.com") &&
+                                            !directCandidate.contains("youtu.be")
 
-                                            if (isValidDirectStream && !resolveLoading) {
-                                                streamLoading = true
-                                                openStreamExternal(directCandidate, target.streamHeaders, displayTitle)
-                                                scope.launch {
-                                                    kotlinx.coroutines.delay(1200)
-                                                    streamLoading = false
+                                        if (isValidDirectStream && !resolveLoading) {
+                                            streamLoading = true
+                                            openStreamExternal(directCandidate, target.streamHeaders, displayTitle)
+                                            scope.launch {
+                                                kotlinx.coroutines.delay(1200)
+                                                streamLoading = false
+                                            }
+                                        } else {
+                                            streamLoading = true
+                                            scope.launch {
+                                                val sPayload = JSONObject().apply {
+                                                    put("action", "resolve")
+                                                    put("url", target.targetUrl.ifBlank { input })
+                                                    if (target.selectedAudioLang.isNotBlank()) {
+                                                        put("audio_lang", target.selectedAudioLang)
+                                                    }
+                                                    if (target.isSeries) {
+                                                        put("season", target.selectedSeason)
+                                                        put("episode", target.selectedEpisode)
+                                                    }
+                                                    put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
                                                 }
-                                            } else {
-                                                streamLoading = true
-                                                scope.launch {
-                                                    val sPayload = JSONObject().apply {
-                                                        put("action", "resolve")
-                                                        put("url", target.targetUrl.ifBlank { input })
-                                                        if (target.selectedAudioLang.isNotBlank()) {
-                                                            put("audio_lang", target.selectedAudioLang)
-                                                        }
-                                                        if (target.isSeries) {
-                                                            put("season", target.selectedSeason)
-                                                            put("episode", target.selectedEpisode)
-                                                        }
-                                                        put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
-                                                    }
-                                                    val res = withContext(Dispatchers.IO) {
-                                                        runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                                    }
-                                                    val data = res?.optJSONObject("result")
-                                                    val qUrlMap = mutableMapOf<String, String>()
-                                                    data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                        qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                                    }
-                                                    val directUrl = qUrlMap[selectedQuality]
-                                                        ?: data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
-                                                        ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
-                                                        ?: data?.optString("url").orEmpty()
-                                                    val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                                    val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                                    val hMap = mutableMapOf<String, String>()
-                                                    hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                    val playUrl = directUrl.ifBlank { proxyUrl }
-                                                    if (playUrl.isNotBlank() && !playUrl.contains("youtube.com") && !playUrl.contains("youtu.be")) {
-                                                        target = target.copy(
-                                                            directStreamUrl = directUrl,
-                                                            proxyUrl = proxyUrl,
-                                                            streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                                        )
-                                                        openStreamExternal(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
-                                                    } else {
-                                                        message("Could not resolve stream for $displayTitle")
-                                                    }
-                                                    streamLoading = false
+                                                val res = withContext(Dispatchers.IO) {
+                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
                                                 }
+                                                val data = res?.optJSONObject("result")
+                                                val qUrlMap = mutableMapOf<String, String>()
+                                                data?.optJSONObject("quality_urls")?.let { qObj ->
+                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                                                }
+                                                val directUrl = qUrlMap[selectedQuality]
+                                                    ?: data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
+                                                    ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
+                                                    ?: data?.optString("url").orEmpty()
+                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
+                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                                                val hMap = mutableMapOf<String, String>()
+                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                                                val playUrl = directUrl.ifBlank { proxyUrl }
+                                                if (playUrl.isNotBlank() && !playUrl.contains("youtube.com") && !playUrl.contains("youtu.be")) {
+                                                    target = target.copy(
+                                                        directStreamUrl = directUrl,
+                                                        proxyUrl = proxyUrl,
+                                                        streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                    )
+                                                    openStreamExternal(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
+                                                } else {
+                                                    message("Could not resolve stream for $displayTitle")
+                                                }
+                                                streamLoading = false
                                             }
                                         }
                                     },
