@@ -1835,7 +1835,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'quiet': False,
         'no_warnings': True,
         'progress_hooks': [ytdlp_progress_hook],
-        'extractor_args': {'youtube': {'player_client': ['visionos', 'android'], 'skip': ['webpage', 'configs']}},
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios'], 'skip': ['webpage', 'configs']}},
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
         'nopart': True,
         'socket_timeout': 30,
@@ -1940,7 +1940,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
             if '403' in err_str or 'Forbidden' in err_str or 'bot' in err_str.lower():
                 print("[WARN] Retrying with fallback player clients...")
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['visionos', 'android', 'tv_samsung']}}
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'android', 'ios']}}
                 continue
 
             if attempt < max_attempts:
@@ -2379,12 +2379,12 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     ep_count = sum(int(s.get('ep', 1)) for s in season_list) if season_list else (len(embed_json) if embed_json else 0)
     has_seasons = bool(season_list and (len(season_list) > 1 or int(season_list[0].get('ep', 1)) > 1 or int(season_list[0].get('se', 1)) > 1))
 
-    if api_media_type == 'tv' or has_seasons or ep_count > 1 or media_type == 'tv' or target_season is not None or target_episode is not None or bool(re.search(r'\bS\d+\b', title, re.I)):
-        is_tv_series = True
-        media_type = 'tv'
-    elif api_media_type == 'movie' or media_type == 'movie':
+    if api_media_type == 'movie' or media_type == 'movie':
         is_tv_series = False
         media_type = 'movie'
+    elif api_media_type == 'tv' or media_type == 'tv' or has_seasons or ep_count > 1 or bool(re.search(r'\bS\d+\b', title, re.I)):
+        is_tv_series = True
+        media_type = 'tv'
     else:
         is_tv_series = False
 
@@ -2591,9 +2591,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         candidate_streams = []
         qualities_dict = {}
 
-        # Step 2: Primary Gateway with 3.5s timeout
+        # Step 2: Primary Indian Stream Gateways (Vidsync & Hindi nodes)
         if tm_id:
-            sys.stdout.write("  [2/4]  Connecting to primary stream gateway... ")
+            sys.stdout.write("  [2/4]  Querying primary Indian stream nodes (Vidsync & Hindi servers)... ")
             sys.stdout.flush()
             try:
                 if is_tv_series:
@@ -2623,17 +2623,21 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                 qualities_dict[q_k] = {'label': lbl, 'url': u, 'dom': 'https://vidsync.pro', 'headers': s.get('headers')}
                                 if u not in [c[0] for c in candidate_streams]:
                                     candidate_streams.append((u, 'https://vidsync.pro'))
-                        print(f"[OK] Found {len(matching)} source(s)")
+                        print(f"[OK] Found {len(matching)} Indian source(s)")
                     else:
-                        print("[FAIL] (no stream sources)")
+                        print("[FAIL] (no Indian stream sources)")
                 else:
                     print(f"[FAIL] (status {v_res.status_code})")
             except Exception:
                 print("[FAIL] (offline/timed out)")
 
-        # Step 3: Multi-Server CDN manifests
+        # Step 3: Multi-Server CDN manifests (Queried only after Indian nodes or as fallback)
         if tm_id:
-            sys.stdout.write("  [3/4]  Querying multi-server CDN manifests... ")
+            if candidate_streams:
+                sys.stdout.write("  [3/4]  Querying multi-server CDN manifests... ")
+            else:
+                print("  [WARN] Primary Indian stream nodes offline or rate-limiting. Searching multi-server global CDN fallback manifests...")
+                sys.stdout.write("  [3/4]  Querying multi-server global CDN fallback manifests... ")
             sys.stdout.flush()
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
             sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -3556,24 +3560,53 @@ def group_and_deduplicate_results(results, query=None):
             except Exception:
                 yr = 0
                 
-        # Detect audio
+        # Detect audio with full language coverage and title tag priority
         t_lower = t.lower()
         cn = str(it.get('cn') or it.get('country') or '').lower().strip()
-        if 'hindi' in t_lower: aud = 'Hindi'
-        elif 'tamil' in t_lower: aud = 'Tamil'
-        elif 'telugu' in t_lower: aud = 'Telugu'
-        elif 'bengali' in t_lower: aud = 'Bengali'
-        elif 'malayalam' in t_lower: aud = 'Malayalam'
-        elif 'kannada' in t_lower: aud = 'Kannada'
-        elif 'japanese' in t_lower: aud = 'Japanese'
-        elif 'korean' in t_lower: aud = 'Korean'
-        elif 'french' in t_lower: aud = 'French'
-        elif 'spanish' in t_lower: aud = 'Spanish'
-        elif 'english' in t_lower: aud = 'English'
-        elif cn in ('india', 'in'): aud = 'Hindi'
-        elif cn in ('japan', 'jp'): aud = 'Japanese'
-        elif cn in ('south korea', 'korea', 'kr'): aud = 'Korean'
-        else: aud = 'English'
+        if any(h in t_lower for h in ('[hindi]', ' hindi', '(hindi)', 'hindi audio', 'dual audio')):
+            aud = 'Hindi'
+        elif any(ta in t_lower for ta in ('[tamil]', ' tamil', '(tamil)')):
+            aud = 'Tamil'
+        elif any(te in t_lower for te in ('[telugu]', ' telugu', '(telugu)')):
+            aud = 'Telugu'
+        elif any(b in t_lower for b in ('[bengali]', ' bengali', '(bengali)')):
+            aud = 'Bengali'
+        elif any(m in t_lower for m in ('[malayalam]', ' malayalam', '(malayalam)')):
+            aud = 'Malayalam'
+        elif any(k in t_lower for k in ('[kannada]', ' kannada', '(kannada)')):
+            aud = 'Kannada'
+        elif any(i in t_lower for i in ('[indonesian]', ' indonesian', '(indonesian)')):
+            aud = 'Indonesian'
+        elif any(j in t_lower for j in ('[japanese]', ' japanese', '(japanese)')):
+            aud = 'Japanese'
+        elif any(ko in t_lower for ko in ('[korean]', ' korean', '(korean)')):
+            aud = 'Korean'
+        elif any(s in t_lower for s in ('[spanish]', ' spanish', '(spanish)')):
+            aud = 'Spanish'
+        elif any(f in t_lower for f in ('[french]', ' french', '(french)')):
+            aud = 'French'
+        elif any(g in t_lower for g in ('[german]', ' german', '(german)')):
+            aud = 'German'
+        elif any(r in t_lower for r in ('[russian]', ' russian', '(russian)')):
+            aud = 'Russian'
+        elif any(p in t_lower for p in ('[portuguese]', ' portuguese', '(portuguese)')):
+            aud = 'Portuguese'
+        elif any(a in t_lower for a in ('[arabic]', ' arabic', '(arabic)')):
+            aud = 'Arabic'
+        elif any(e in t_lower for e in ('[english]', ' english', '(english)')):
+            aud = 'English'
+        elif cn in ('india', 'in'):
+            aud = 'Hindi'
+        elif cn in ('japan', 'jp'):
+            aud = 'Japanese'
+        elif cn in ('south korea', 'korea', 'kr'):
+            aud = 'Korean'
+        elif cn in ('indonesia', 'id'):
+            aud = 'Indonesian'
+        elif '[' not in t:
+            aud = 'English'
+        else:
+            aud = 'Other'
 
         if m_type in ('tv', 'series'):
             clean_show = re.sub(r'[\s\-_]+(S\d+|Season\s*\d+|Complete\s*Series).*', '', clean_t, flags=re.I).strip()
@@ -3596,12 +3629,15 @@ def group_and_deduplicate_results(results, query=None):
         elif not groups[key].get('poster') and poster_url:
             groups[key]['poster'] = poster_url
 
-        groups[key]['audios'][aud] = {
-            'id': m_id,
-            'title': t,
-            'url': it.get('url') or f"https://netmirror.center/{m_type}/{m_id}",
-            'poster': poster_url,
-        }
+        existing = groups[key]['audios'].get(aud)
+        # Never allow a bracketed / dubbed version to overwrite a clean original release
+        if not (existing and '[' not in existing.get('title', '') and '[' in t):
+            groups[key]['audios'][aud] = {
+                'id': m_id,
+                'title': t,
+                'url': it.get('url') or f"https://netmirror.center/{m_type}/{m_id}",
+                'poster': poster_url,
+            }
         groups[key]['items'].append(it)
 
     # Fetch OTT providers in parallel
@@ -4451,9 +4487,20 @@ def app_search(query, platform="netmirror"):
     print(f"> Found {len(raw_results)} catalog match(es). Grouping multi-audio streams and ranking by relevance...")
     groups = group_and_deduplicate_results(raw_results, query=str(query).strip())
     results = []
+    def aud_prio(k):
+        kl = k.lower()
+        if 'hindi' in kl: return 1
+        if 'english' in kl: return 2
+        if 'original' in kl: return 3
+        world = ['tamil', 'telugu', 'bengali', 'spanish', 'french', 'arabic', 'portuguese', 'russian', 'german', 'japanese', 'korean', 'chinese', 'indonesian']
+        for i, w in enumerate(world):
+            if w in kl: return 10 + i
+        return 100
+
     for group in groups[:10]:
         audio_items = []
-        for language, item in group.get("audios", {}).items():
+        sorted_auds = sorted(group.get("audios", {}).items(), key=lambda x: aud_prio(x[0]))
+        for language, item in sorted_auds:
             audio_items.append({
                 "language": language,
                 "title": item.get("title", ""),
@@ -4668,11 +4715,11 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         last_err = None
 
         client_attempts = [
-            None,
             ['android', 'ios'],
-            ['web', 'default'],
+            ['tv_embedded', 'android'],
             ['visionos', 'android'],
-            ['tv', 'mweb'],
+            ['ios'],
+            ['web', 'default'],
         ]
 
         safari_headers = {
@@ -4759,6 +4806,14 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     break
 
         if not hls_audio_fmt:
+            # Priority 1: Hindi
+            for af in hls_audio_formats:
+                lang = str(af.get('language') or af.get('format_note') or '').lower()
+                if 'hi' in lang or 'hindi' in lang:
+                    hls_audio_fmt = af
+                    break
+        if not hls_audio_fmt:
+            # Priority 2: English / Original / Default
             for af in hls_audio_formats:
                 lang = str(af.get('language') or af.get('format_note') or '').lower()
                 if 'en' in lang or 'default' in lang or 'original' in lang:
@@ -4943,6 +4998,21 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 "language": lang_display,
                 "url": url,
             })
+
+        def get_audio_priority(choice):
+            lang = choice.get("language", "").lower()
+            if "hindi" in lang: return 1
+            if "english" in lang: return 2
+            if "original" in lang or "default" in lang: return 3
+            world_prio = [
+                "tamil", "telugu", "bengali", "spanish", "french", "arabic",
+                "portuguese", "russian", "german", "japanese", "korean", "chinese", "indonesian"
+            ]
+            for i, w in enumerate(world_prio):
+                if w in lang: return 10 + i
+            return 100
+
+        audio_choices.sort(key=get_audio_priority)
 
         stream_url = None
         if clean_quality in quality_urls_map:

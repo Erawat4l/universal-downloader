@@ -548,6 +548,9 @@ private fun ArcApp(
 
     var showDeleteConfirmJobId by remember { mutableStateOf<String?>(null) }
     var showSeriesDownloadDialog by remember { mutableStateOf(false) }
+    var showAudioSelectDialog by remember { mutableStateOf(false) }
+    var pendingActionAfterAudioSelect by remember { mutableStateOf<String?>(null) }
+    val preloadedTargets = remember { mutableMapOf<String, MediaTarget>() }
 
     val tab = AppTab.entries.firstOrNull { it.name == tabName } ?: AppTab.HOME
 
@@ -894,6 +897,93 @@ private fun ArcApp(
                 hits = resultList
                 searchLoading = false
 
+                // Preload top search results in background for instant resolution
+                scope.launch(Dispatchers.IO) {
+                    resultList.take(3).forEach { hit ->
+                        val preUrl = hit.audio.firstOrNull()?.url?.ifEmpty { hit.url } ?: hit.url
+                        val prefLang = hit.audio.firstOrNull()?.language.orEmpty()
+                        if (preUrl.isNotBlank() && !preloadedTargets.containsKey(preUrl)) {
+                            try {
+                                val prePayload = JSONObject().apply {
+                                    put("action", "resolve")
+                                    put("url", preUrl)
+                                    put("quality", "Best Available")
+                                    if (prefLang.isNotBlank()) put("audio_lang", prefLang)
+                                    if (telegramSession.isNotBlank()) {
+                                        put("telegram", JSONObject().apply {
+                                            put("api_id", telegramApiId)
+                                            put("api_hash", telegramApiHash)
+                                            put("session", telegramSession)
+                                        })
+                                    }
+                                }
+                                val res = runCatching { EmbeddedEngine.execute(context, prePayload) }.getOrNull()
+                                if (res?.optBoolean("ok", false) == true) {
+                                    val rData = res.optJSONObject("result")
+                                    if (rData != null) {
+                                        val rTitle = rData.optString("title", hit.title)
+                                        val rDirect = rData.optString("direct_url").ifBlank { rData.optString("stream_url") }
+                                        val rProxy = rData.optString("proxy_url")
+                                        val rPoster = rData.optString("poster", hit.poster)
+                                        val isSeries = rData.optBoolean("is_series", false)
+                                        val qList = mutableListOf<String>()
+                                        rData.optJSONArray("qualities")?.let { qArr ->
+                                            for (qi in 0 until qArr.length()) qList.add(qArr.optString(qi))
+                                        }
+                                        val qUrls = mutableMapOf<String, String>()
+                                        rData.optJSONObject("quality_urls")?.let { qObj ->
+                                            qObj.keys().forEach { k -> qUrls[k] = qObj.optString(k) }
+                                        }
+                                        val aList = mutableListOf<AudioChoice>()
+                                        rData.optJSONArray("audio_choices")?.let { aArr ->
+                                            for (ai in 0 until aArr.length()) {
+                                                val aItem = aArr.optJSONObject(ai) ?: continue
+                                                aList.add(AudioChoice(aItem.optString("language"), aItem.optString("url")))
+                                            }
+                                        }
+                                        val seasonsList = mutableListOf<SeasonInfo>()
+                                        rData.optJSONArray("seasons")?.let { sArr ->
+                                            for (si in 0 until sArr.length()) {
+                                                val sObj = sArr.optJSONObject(si) ?: continue
+                                                seasonsList.add(SeasonInfo(sObj.optInt("season"), sObj.optInt("episodes")))
+                                            }
+                                        }
+                                        val hMap = mutableMapOf<String, String>()
+                                        (rData.optJSONObject("stream_headers") ?: rData.optJSONObject("headers"))?.let { hObj ->
+                                            hObj.keys().forEach { k -> hMap[k] = hObj.optString(k) }
+                                        }
+                                        val resolvedTarget = MediaTarget(
+                                            title = rTitle,
+                                            source = rData.optString("source", hit.source),
+                                            detail = if (isSeries) "TV Series" else "Movie",
+                                            size = "",
+                                            description = rData.optString("description", ""),
+                                            targetUrl = preUrl,
+                                            directStreamUrl = rDirect,
+                                            proxyUrl = rProxy,
+                                            availableQualities = if (qList.isNotEmpty()) qList else listOf("Best Available"),
+                                            qualityUrls = qUrls,
+                                            poster = rPoster,
+                                            streamHeaders = hMap,
+                                            isSeries = isSeries,
+                                            seasons = seasonsList,
+                                            audioTracks = if (aList.isNotEmpty()) aList else hit.audio,
+                                            selectedAudioLang = prefLang,
+                                            mediaCategory = if (isSeries) "TV SERIES" else "MOVIE",
+                                            year = hit.year,
+                                            providers = hit.providers,
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            preloadedTargets[preUrl] = resolvedTarget
+                                            preloadedTargets[hit.url] = resolvedTarget
+                                        }
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+
                 currentTrace = CliTrace(
                     action = actionLabel,
                     target = query,
@@ -1148,6 +1238,10 @@ private fun ArcApp(
     BackHandler(enabled = true) {
         when {
             showSeriesDownloadDialog -> showSeriesDownloadDialog = false
+            showAudioSelectDialog -> {
+                showAudioSelectDialog = false
+                pendingActionAfterAudioSelect = null
+            }
             showDeleteConfirmJobId != null -> showDeleteConfirmJobId = null
             showTelegramSetup -> showTelegramSetup = false
             showQualityDialog -> showQualityDialog = false
@@ -1587,18 +1681,30 @@ private fun ArcApp(
                                     onBack = ::openHome,
                                     onSelect = { hit, audio ->
                                         val targetUrl = audio.url.ifEmpty { hit.url }
-                                        selectedQuality = "Best Available"
-                                        audioOnly = false
-                                        analyze(
-                                            value = targetUrl,
-                                            titleOverride = hit.title,
-                                            posterOverride = hit.poster,
-                                            audioChoices = hit.audio,
-                                            selectedAudioLang = audio.language,
-                                            mediaCategoryOverride = if (hit.type.contains("SERIES", ignoreCase = true) || hit.type.contains("TV", ignoreCase = true)) "TV SERIES" else "MOVIE",
-                                            yearOverride = hit.year,
-                                            providersOverride = hit.providers,
-                                        )
+                                        val pre = preloadedTargets[targetUrl] ?: preloadedTargets[hit.url]
+                                        if (pre != null) {
+                                            selectedQuality = pre.availableQualities.firstOrNull() ?: "Best Available"
+                                            audioOnly = false
+                                            target = pre.copy(
+                                                selectedAudioLang = audio.language.ifBlank { pre.selectedAudioLang }
+                                            )
+                                            overlay = "analysis"
+                                            homeOverlay = "analysis"
+                                            resolveLoading = false
+                                        } else {
+                                            selectedQuality = "Best Available"
+                                            audioOnly = false
+                                            analyze(
+                                                value = targetUrl,
+                                                titleOverride = hit.title,
+                                                posterOverride = hit.poster,
+                                                audioChoices = hit.audio,
+                                                selectedAudioLang = audio.language,
+                                                mediaCategoryOverride = if (hit.type.contains("SERIES", ignoreCase = true) || hit.type.contains("TV", ignoreCase = true)) "TV SERIES" else "MOVIE",
+                                                yearOverride = hit.year,
+                                                providersOverride = hit.providers,
+                                            )
+                                        }
                                     },
                                 )
                                 "analysis" -> AnalysisScreen(
@@ -1644,8 +1750,8 @@ private fun ArcApp(
                                             value = newUrl,
                                             titleOverride = target.title,
                                             posterOverride = target.poster,
-                                            season = target.selectedSeason,
-                                            episode = target.selectedEpisode,
+                                            season = if (target.isSeries) target.selectedSeason else null,
+                                            episode = if (target.isSeries) target.selectedEpisode else null,
                                             audioChoices = target.audioTracks,
                                             selectedAudioLang = audio.language,
                                             mediaCategoryOverride = target.mediaCategory,
@@ -1656,16 +1762,23 @@ private fun ArcApp(
                                     onDownload = {
                                         if (target.isSeries) {
                                             showSeriesDownloadDialog = true
+                                        } else if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank()) {
+                                            pendingActionAfterAudioSelect = "download"
+                                            showAudioSelectDialog = true
                                         } else {
                                             startDownload(audioLangOverride = target.selectedAudioLang)
                                         }
                                     },
                                     onStream = {
-                                        val displayTitle = if (target.isSeries) {
-                                            "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
+                                        if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank()) {
+                                            pendingActionAfterAudioSelect = "stream"
+                                            showAudioSelectDialog = true
                                         } else {
-                                            target.title
-                                        }
+                                            val displayTitle = if (target.isSeries) {
+                                                "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
+                                            } else {
+                                                target.title
+                                            }
                                         val qMapped = target.qualityUrls[selectedQuality]
                                         val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
                                         val isValidDirectStream = directCandidate.isNotBlank() &&
@@ -1723,6 +1836,7 @@ private fun ArcApp(
                                                 }
                                                 streamLoading = false
                                             }
+                                        }
                                         }
                                     },
                                     onSelectSeason = { s ->
@@ -1996,6 +2110,80 @@ private fun ArcApp(
                     confirmButton = {},
                     dismissButton = {
                         TextButton(onClick = { showSeriesDownloadDialog = false }) { Text("Cancel") }
+                    }
+                )
+            }
+
+            // Select Audio Track Dialog
+            if (showAudioSelectDialog) {
+                AlertDialog(
+                    onDismissRequest = {
+                        showAudioSelectDialog = false
+                        pendingActionAfterAudioSelect = null
+                    },
+                    containerColor = ArcSurface,
+                    titleContentColor = ArcWhite,
+                    textContentColor = ArcWhite,
+                    shape = RoundedCornerShape(20.dp),
+                    title = { Text("Select Audio Language") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Please select an audio language to continue:", color = ArcMuted, fontSize = 12.sp)
+                            LazyColumn(
+                                modifier = Modifier.fillMaxWidth().heightIn(max = 280.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(target.audioTracks) { track ->
+                                    Button(
+                                        onClick = {
+                                            val chosenLang = track.language
+                                            target = target.copy(selectedAudioLang = chosenLang)
+                                            showAudioSelectDialog = false
+                                            val action = pendingActionAfterAudioSelect
+                                            pendingActionAfterAudioSelect = null
+                                            if (action == "download") {
+                                                startDownload(audioLangOverride = chosenLang)
+                                            } else if (action == "stream") {
+                                                val newUrl = track.url.ifEmpty { target.targetUrl }
+                                                analyze(
+                                                    value = newUrl,
+                                                    titleOverride = target.title,
+                                                    posterOverride = target.poster,
+                                                    season = if (target.isSeries) target.selectedSeason else null,
+                                                    episode = if (target.isSeries) target.selectedEpisode else null,
+                                                    audioChoices = target.audioTracks,
+                                                    selectedAudioLang = chosenLang,
+                                                    mediaCategoryOverride = target.mediaCategory,
+                                                    yearOverride = target.year,
+                                                    providersOverride = target.providers,
+                                                )
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                                        shape = RoundedCornerShape(10.dp),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(track.language)
+                                            Text("Select", color = ArcWhite, fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = {
+                            showAudioSelectDialog = false
+                            pendingActionAfterAudioSelect = null
+                        }) {
+                            Text("Cancel")
+                        }
                     }
                 )
             }
