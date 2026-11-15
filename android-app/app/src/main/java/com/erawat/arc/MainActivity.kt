@@ -1,5 +1,6 @@
 package com.erawat.arc
 
+import android.accounts.AccountManager
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -725,6 +726,37 @@ private fun ArcApp(
             }
         }
     )
+
+    var googleLoginHint by rememberSaveable { mutableStateOf("") }
+
+    val googleAccountPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+        onResult = { result ->
+            val selectedEmail = if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+                result.data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)?.trim()
+            } else null
+            googleLoginHint = selectedEmail.orEmpty()
+            showGoogleLoginDialog = true
+        }
+    )
+
+    val launchGoogleLogin = {
+        try {
+            val pickerIntent = AccountManager.newChooseAccountIntent(
+                null,
+                null,
+                arrayOf("com.google"),
+                null,
+                null,
+                null,
+                null
+            )
+            googleAccountPickerLauncher.launch(pickerIntent)
+        } catch (_: Exception) {
+            googleLoginHint = ""
+            showGoogleLoginDialog = true
+        }
+    }
 
     fun copyToClipboard(text: String, label: String = "Copied") {
         clipboard.setText(AnnotatedString(text))
@@ -2456,7 +2488,10 @@ private fun ArcApp(
                 GoogleAccountInfoDialog(
                     isConnected = googleAccountEmail.isNotBlank(),
                     accountEmail = googleAccountEmail,
-                    onLoginClick = { showGoogleLoginDialog = true },
+                    onLoginClick = {
+                        showGoogleInfoDialog = false
+                        launchGoogleLogin()
+                    },
                     onDismiss = { showGoogleInfoDialog = false },
                 )
             }
@@ -2464,6 +2499,7 @@ private fun ArcApp(
             // Google Account In-App Sign-In Dialog
             if (showGoogleLoginDialog) {
                 GoogleLoginDialog(
+                    loginHint = googleLoginHint,
                     onSuccess = { email, cookies ->
                         googleAccountEmail = email
                         googleCookies = cookies
@@ -2472,9 +2508,13 @@ private fun ArcApp(
                             .putString("google_cookies", cookies)
                             .apply()
                         showGoogleLoginDialog = false
+                        googleLoginHint = ""
                         message("Google account connected ($email)")
                     },
-                    onDismiss = { showGoogleLoginDialog = false },
+                    onDismiss = {
+                        showGoogleLoginDialog = false
+                        googleLoginHint = ""
+                    },
                 )
             }
     }
@@ -4231,6 +4271,7 @@ private fun GoogleAccountInfoDialog(
 
 @Composable
 private fun GoogleLoginDialog(
+    loginHint: String = "",
     onSuccess: (email: String, cookies: String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -4320,7 +4361,13 @@ private fun GoogleLoginDialog(
                                     }
                                 }
                             }
-                            loadUrl("https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/")
+                            val encodedHint = if (loginHint.isNotBlank()) java.net.URLEncoder.encode(loginHint, "UTF-8") else ""
+                            val startUrl = if (encodedHint.isNotBlank()) {
+                                "https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/&login_hint=$encodedHint&Email=$encodedHint"
+                            } else {
+                                "https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/"
+                            }
+                            loadUrl(startUrl)
                         }
                     }
                 )

@@ -386,22 +386,26 @@ def get_next_build_number() -> int:
 def number_and_send_artifact(artifact: Path, build_num: int) -> Path:
     output_dir = artifact.parent
     sdcard_downloads = Path("/sdcard/Download")
+    arc_apk = output_dir / "ARC.apk"
     numbered = output_dir / f"ARC {build_num}.apk"
+    shutil.copy2(artifact, arc_apk)
     shutil.copy2(artifact, numbered)
-    say(f"Numbered APK: {numbered}")
+    say(f"Built APK: {arc_apk} (build {build_num})")
 
     if sdcard_downloads.exists():
-        sdcard_apk = sdcard_downloads / f"ARC {build_num}.apk"
-        shutil.copy2(artifact, sdcard_apk)
-        say(f"Saved to public Downloads: {sdcard_apk}")
-        send_target = sdcard_apk
+        sdcard_arc = sdcard_downloads / "ARC.apk"
+        sdcard_numbered = sdcard_downloads / f"ARC {build_num}.apk"
+        shutil.copy2(artifact, sdcard_arc)
+        shutil.copy2(artifact, sdcard_numbered)
+        say(f"Saved to public Downloads: {sdcard_arc}")
+        send_target = sdcard_arc
     else:
-        send_target = numbered
+        send_target = arc_apk
 
     tt = shutil.which("tt")
     if not tt:
         say("tt was not found on PATH; skipped transfer.")
-        return numbered
+        return arc_apk
 
     say(f"Sending {send_target.name} to Dell desktop (device 3 Desktop/ARC)...")
     try:
@@ -458,7 +462,7 @@ def main() -> int:
     sync_python_engine()
     wrapper = ensure_wrapper()
     next_build_num = get_next_build_number()
-    version_name = f"Arc {next_build_num}"
+    version_name = "ARC"
     version_code = str(1000 + next_build_num)
 
     gradle_arguments = [
