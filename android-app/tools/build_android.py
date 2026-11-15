@@ -403,6 +403,17 @@ def number_and_send_artifact(artifact: Path, build_num: int) -> Path:
         say("tt was not found on PATH; skipped transfer.")
         return numbered
 
+    say(f"Sending {send_target.name} to Dell desktop (device 3 Desktop/ARC)...")
+    try:
+        cmd = f'sshpass -p 0811 scp -O -P 22 "{send_target}" kavi@10.126.103.200:"Desktop/ARC/"'
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if r.returncode == 0:
+            say("Dell desktop transfer to Desktop/ARC completed.")
+        else:
+            say(f"Dell scp failed: {r.stderr.strip()}")
+    except Exception as e:
+        say(f"Dell desktop transfer notice: {e}")
+
     say(f"Sending {send_target.name} to device 2 with tt…")
     try:
         result = subprocess.run(
@@ -414,7 +425,7 @@ def number_and_send_artifact(artifact: Path, build_num: int) -> Path:
             errors="replace",
         )
         if result.returncode == 0:
-            say("tt transfer completed.")
+            say("tt transfer to device 2 completed.")
         else:
             say(f"tt transfer failed with exit code {result.returncode}; the APK is still available locally.")
             if result.stdout.strip():

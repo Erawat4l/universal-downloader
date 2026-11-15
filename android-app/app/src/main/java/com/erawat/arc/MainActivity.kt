@@ -1239,10 +1239,13 @@ private fun ArcApp(
             }
             val detectedYear = yearOverride ?: extractYear(titleToUse)
 
+            resolvedUrl = ""
             target = if (isSameShow) {
                 target.copy(
                     targetUrl = clean,
                     directStreamUrl = "",
+                    qualityUrls = emptyMap(),
+                    availableQualities = emptyList(),
                     selectedSeason = season ?: target.selectedSeason,
                     selectedEpisode = episode ?: target.selectedEpisode,
                     audioTracks = if (audioChoices.isNotEmpty()) audioChoices else target.audioTracks,
@@ -1650,6 +1653,10 @@ private fun ArcApp(
                                             audioPromptShownForDownload = true
                                             message("Select language, or tap Download again for all languages / default.")
                                         } else {
+                                            val dlLang = if (target.selectedAudioLang.isBlank() && audioPromptShownForDownload && target.audioTracks.size > 1) "all" else target.selectedAudioLang
+                                            if (dlLang.isNotBlank() && target.selectedAudioLang != dlLang) {
+                                                target = target.copy(selectedAudioLang = dlLang)
+                                            }
                                             if (target.isSeries) {
                                                 showSeriesDownloadDialog = true
                                             } else {

@@ -133,12 +133,16 @@ object EmbeddedEngine {
                         val format = aExt.getTrackFormat(i)
                         val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
                         if (mime.startsWith("audio/")) {
-                            aExt.selectTrack(i)
-                            val tIdx = muxer.addTrack(format)
-                            audioTrackIndices.add(tIdx)
-                            audioExtractors.add(aExt)
-                            trackAdded = true
-                            break
+                            try {
+                                val tIdx = muxer.addTrack(format)
+                                aExt.selectTrack(i)
+                                audioTrackIndices.add(tIdx)
+                                audioExtractors.add(aExt)
+                                trackAdded = true
+                                break
+                            } catch (te: Exception) {
+                                android.util.Log.w("EmbeddedEngine", "Skip incompatible audio track format: $format", te)
+                            }
                         }
                     }
                     if (!trackAdded) {

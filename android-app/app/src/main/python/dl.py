@@ -104,9 +104,12 @@ def _patch_ytdlp_muxer():
                     if len(audio_files) == 1:
                         success = mux_video_and_audio(v_file, audio_files[0], temp_out)
                     else:
-                        success = mux_multiple_audio_tracks(v_file, audio_files, temp_out)
+                        m4a_audios = [a for a in audio_files if os.path.splitext(a)[1].lower() in ('.m4a', '.aac', '.mp4')]
+                        audios_to_mux = m4a_audios if m4a_audios else audio_files
+                        success = mux_multiple_audio_tracks(v_file, audios_to_mux, temp_out)
                         if not success:
-                            success = mux_video_and_audio(v_file, audio_files[0], temp_out)
+                            first_audio = audios_to_mux[0] if audios_to_mux else audio_files[0]
+                            success = mux_video_and_audio(v_file, first_audio, temp_out)
 
                     if success and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
                         if os.path.exists(target_out):
@@ -1800,16 +1803,73 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
     enable_multitrack = False
-    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all"):
+    if clean_audio_lang in ("all", "all languages", "multi", "multitrack"):
+        enable_multitrack = True
+        audio_sel = "bestaudio[ext=m4a]/bestaudio"
+    elif clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
         audio_sel = f"bestaudio[language^={clean_audio_lang[:2]}][ext=m4a]/bestaudio[format_note*={clean_audio_lang}][ext=m4a]/bestaudio[language^={clean_audio_lang[:2]}]/bestaudio[format_note*={clean_audio_lang}]/bestaudio[ext=m4a]/bestaudio"
     else:
         audio_sel = "bestaudio[ext=m4a]/bestaudio"
-        enable_multitrack = True
+
+    multitrack_selector = None
+    if enable_multitrack and not is_audio_only:
+        def multitrack_selector(ctx):
+            formats = ctx.get('formats', [])
+            if not formats:
+                return
+            v_cands = [f for f in formats if f.get('vcodec') not in (None, 'none') and f.get('url')]
+            if not v_cands:
+                return
+            under_cap = [f for f in v_cands if (f.get('height') or 0) <= cap]
+            v_pool = under_cap if under_cap else v_cands
+            v_pool.sort(key=lambda f: (f.get('height') or 0, 1 if 'avc' in str(f.get('vcodec') or '').lower() else 0, 1 if f.get('ext') == 'mp4' else 0), reverse=True)
+            best_v = v_pool[0]
+
+            a_cands = [f for f in formats if f.get('vcodec') in (None, 'none') and f.get('acodec') not in (None, 'none') and f.get('url')]
+            lang_audios = {}
+            for af in a_cands:
+                l = str(af.get('language') or af.get('format_note') or 'default').lower().strip()
+                if 'en' in l or 'orig' in l: l_key = 'en'
+                elif 'hi' in l: l_key = 'hi'
+                elif 'es' in l: l_key = 'es'
+                elif 'fr' in l: l_key = 'fr'
+                elif 'de' in l: l_key = 'de'
+                elif 'ja' in l: l_key = 'ja'
+                elif 'ko' in l: l_key = 'ko'
+                elif 'pt' in l: l_key = 'pt'
+                elif 'ru' in l: l_key = 'ru'
+                elif 'zh' in l: l_key = 'zh'
+                elif 'ar' in l: l_key = 'ar'
+                elif 'ta' in l: l_key = 'ta'
+                elif 'te' in l: l_key = 'te'
+                elif 'bn' in l: l_key = 'bn'
+                elif 'id' in l: l_key = 'id'
+                else: l_key = l[:2] if len(l) >= 2 else l
+                lang_audios.setdefault(l_key, []).append(af)
+
+            selected_audios = []
+            for l_key, af_list in lang_audios.items():
+                m4a_aac = [f for f in af_list if (f.get('ext') == 'm4a' or 'mp4a' in str(f.get('acodec') or '').lower())]
+                if m4a_aac:
+                    m4a_aac.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+                    selected_audios.append(m4a_aac[0])
+                else:
+                    af_list.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+                    selected_audios.append(af_list[0])
+
+            if not selected_audios and a_cands:
+                selected_audios = [a_cands[0]]
+
+            fmt_ids = [best_v['format_id']] + [a['format_id'] for a in selected_audios]
+            yield {
+                'format_id': '+'.join(fmt_ids),
+                'requested_formats': [best_v] + selected_audios
+            }
 
     if is_audio_only:
         format_spec = f"{audio_sel}/best"
     elif enable_multitrack:
-        format_spec = f"bestvideo[height<={cap}]+mergeall[vcodec=none]/bestvideo[height<={cap}]+bestaudio/best"
+        format_spec = multitrack_selector
     else:
         if cap <= 1080:
             format_spec = (
@@ -1829,7 +1889,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 f"best"
             )
 
-    print(f"> Direct YouTube download [{format_spec}]...")
+    print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'multitrack-aac'}]...")
     yt_opts_dict = {
         'format': format_spec,
         'outtmpl': outtmpl_pattern,
@@ -1843,12 +1903,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'retries': 20,
         'fragment_retries': 20,
         'http_chunk_size': 10485760,
+        'merge_output_format': 'mp4',
     }
     if enable_multitrack and not is_audio_only:
         yt_opts_dict['audio_multistreams'] = True
-        yt_opts_dict['merge_output_format'] = 'mkv'
-    else:
-        yt_opts_dict['merge_output_format'] = 'mp4'
     ydl_opts = get_ytdlp_opts(yt_opts_dict, cookie=cookie)
 
     max_attempts = 5
@@ -2012,7 +2070,8 @@ def _get_fallback_tg_creds():
                     pass
     return api_id, api_hash, session
 
-def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
+def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, job_id=None):
+    jid = job_id or get_current_job_id()
     print("> Detected Telegram link...")
     parsed = urllib.parse.urlparse(url)
     path_parts = [p for p in parsed.path.split('/') if p]
@@ -2074,18 +2133,63 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                         percent = (current / total) * 100
                         mb_done = current / (1024 * 1024)
                         mb_total = total / (1024 * 1024)
-                        render_download_progress(percent, f"{mb_done:.1f}/{mb_total:.1f}MB")
+                        render_download_progress(percent, f"{mb_done:.1f}/{mb_total:.1f}MB", job_id=jid)
                     else:
                         mb_done = current / (1024 * 1024)
-                        render_download_progress(100.0, f"{mb_done:.1f}MB")
+                        render_download_progress(100.0, f"{mb_done:.1f}MB", job_id=jid)
 
-                msg = await app.get_messages(chat_id, msg_id) if msg_id else None
+                # Prime peer cache if dealing with a private channel or numeric chat_id
+                if chat_id:
+                    try:
+                        found_target = False
+                        async for dialog in app.get_dialogs(limit=250):
+                            if dialog.chat and (dialog.chat.id == chat_id or str(dialog.chat.id).endswith(str(abs(chat_id)))):
+                                found_target = True
+                                break
+                    except Exception as d_err:
+                        print(f"[DEBUG] Telegram peer priming notice: {d_err}")
+
+                msg = None
+                if msg_id:
+                    try:
+                        msg = await app.get_messages(chat_id, msg_id)
+                    except Exception as gm_err:
+                        print(f"[WARN] Direct get_messages notice: {gm_err}")
+                        try:
+                            c = await app.get_chat(chat_id)
+                            if c:
+                                msg = await app.get_messages(c.id, msg_id)
+                        except Exception:
+                            pass
+
                 if msg and msg.media:
                     out_dir = target_dir or DEFAULT_DIR
                     os.makedirs(out_dir, exist_ok=True)
-                    target_file = os.path.join(out_dir, out_name) if out_name else (out_dir + "/")
 
-                    print(f"> Fetching Telegram media from {chat_id}/{msg_id} via Pyrogram...")
+                    # Extract real filename and extension from Telegram media metadata
+                    real_fname = None
+                    if msg.document and msg.document.file_name:
+                        real_fname = msg.document.file_name
+                    elif msg.video and msg.video.file_name:
+                        real_fname = msg.video.file_name
+                    elif msg.audio and msg.audio.file_name:
+                        real_fname = msg.audio.file_name
+
+                    if real_fname:
+                        if not out_name or any(gen in out_name.lower() for gen in ["telegram document", "telegram media", "telegram file", "resolved video"]) or not os.path.splitext(out_name)[1]:
+                            final_fname = real_fname
+                        else:
+                            final_fname = out_name
+                    else:
+                        final_fname = out_name or f"telegram_file_{msg_id}"
+
+                    # For video files, format name according to user rule: NAME(QUALITY).extension
+                    base, ext = os.path.splitext(final_fname)
+                    if ext.lower() in ('.mp4', '.mkv', '.webm', '.mov', '.avi'):
+                        final_fname = f"{base}(Best){ext}"
+
+                    target_file = os.path.join(out_dir, final_fname)
+                    print(f"> Fetching Telegram media '{final_fname}' from {chat_id}/{msg_id} via Pyrogram...")
                     file_path = None
                     try:
                         file_path = await app.download_media(msg, file_name=target_file, progress=progress_cb)
@@ -2105,6 +2209,8 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                     if file_path:
                         print(f"\n[OK] Telegram media downloaded to: {file_path}")
                         sync_to_sdcard_if_needed(file_path)
+                        if jid:
+                            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
                         return file_path
                 elif msg:
                     # Message exists but has no direct media attachment (e.g. text/update post)
@@ -2156,6 +2262,8 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                                 if fpath:
                                     print(f"\n[OK] Telegram media downloaded to: {fpath}")
                                     sync_to_sdcard_if_needed(fpath)
+                                    if jid:
+                                        render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
                                     return fpath
                         except (KeyboardInterrupt, EOFError):
                             pass
@@ -2177,6 +2285,8 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
             raise Exception("Telegram session has expired or was revoked. Please log in again in ARC Settings.")
         if "channel_private" in err_lower or "user_not_participant" in err_lower or "chat_admin_required" in err_lower:
             raise Exception("This Telegram channel is private and your account is not a member of it.")
+        if "peer_id_invalid" in err_lower or "channel_invalid" in err_lower:
+            raise Exception("Telegram private channel could not be accessed. Please ensure your connected Telegram account has joined this channel/group.")
         if path_parts and path_parts[0] == 'c':
             raise Exception(f"Failed to access private Telegram media: {err_str}")
         print(f"[WARN] Pyrogram unavailable or not configured ({e}). Using Telegram web embed fallback...")
@@ -2219,7 +2329,7 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
 
 _NETMIRROR_META_CACHE = {}
 
-def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None, download_scope="episode", job_id=None, cache_dir=None):
+def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None, download_scope="episode", job_id=None, cache_dir=None, audio_lang=None):
     jid = job_id or get_current_job_id()
     if direct_link_only:
         action_mode = 'direct_link_only'
@@ -2478,17 +2588,27 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         print(f"\n> Resolving direct stream for {kind_label}: {display_title}")
         
         target_lang = None
-        title_lower = title.lower()
-        if '[hindi]' in title_lower or 'hindi' in title_lower:
-            target_lang = 'hi'
-        elif '[tamil]' in title_lower or 'tamil' in title_lower:
-            target_lang = 'ta'
-        elif '[telugu]' in title_lower or 'telugu' in title_lower:
-            target_lang = 'te'
-        elif '[bengali]' in title_lower or 'bengali' in title_lower:
-            target_lang = 'bn'
-        elif '[indonesian]' in title_lower or 'indonesian' in title_lower:
-            target_lang = 'id'
+        clean_alang = str(audio_lang or "").strip().lower()
+        if clean_alang and clean_alang not in ("default", "original", "none", "all"):
+            if 'hi' in clean_alang or 'hin' in clean_alang: target_lang = 'hi'
+            elif 'ta' in clean_alang or 'tam' in clean_alang: target_lang = 'ta'
+            elif 'te' in clean_alang or 'tel' in clean_alang: target_lang = 'te'
+            elif 'bn' in clean_alang or 'ben' in clean_alang: target_lang = 'bn'
+            elif 'id' in clean_alang or 'ind' in clean_alang: target_lang = 'id'
+            elif 'en' in clean_alang or 'eng' in clean_alang: target_lang = 'en'
+            else: target_lang = clean_alang[:2]
+        if not target_lang:
+            title_lower = title.lower()
+            if '[hindi]' in title_lower or 'hindi' in title_lower:
+                target_lang = 'hi'
+            elif '[tamil]' in title_lower or 'tamil' in title_lower:
+                target_lang = 'ta'
+            elif '[telugu]' in title_lower or 'telugu' in title_lower:
+                target_lang = 'te'
+            elif '[bengali]' in title_lower or 'bengali' in title_lower:
+                target_lang = 'bn'
+            elif '[indonesian]' in title_lower or 'indonesian' in title_lower:
+                target_lang = 'id'
 
         tm_id = meta.get('tm_id') or media_id
         subjectid = meta.get('subjectid') or media_id
@@ -4509,6 +4629,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             quality_arg=clean_quality,
             target_season=season,
             target_episode=episode,
+            audio_lang=audio_lang,
         )
         if not res:
             raise Exception("No active stream was found for this NetMirror link")
@@ -4649,6 +4770,14 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                f.get('vcodec') in (None, 'none') and
                (f.get('resolution') == 'audio only' or f.get('height') in (None, 0))
         ]
+        # Prefer 128k (itag 234) over 48k (itag 233)
+        hls_audio_formats.sort(
+            key=lambda f: (
+                1 if ('234' in str(f.get('format_id') or '') or '234' in str(f.get('url') or '')) else 0,
+                f.get('tbr') or f.get('abr') or 0
+            ),
+            reverse=True
+        )
         hls_audio_fmt = None
         clean_audio_lang = str(audio_lang or "").strip().lower()
         if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
@@ -4770,7 +4899,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                         # This prevents VLC PTS clock desync/freeze when switching between Google Video fMP4 and TS audio
                         selected_lang_name = clean_audio_lang.capitalize()
                         media_audio_lines.append(
-                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",DEFAULT=YES,AUTOSELECT=YES,URI="{hls_audio_fmt["url"]}"'
+                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{hls_audio_fmt["url"]}"'
                         )
                     else:
                         for af in hls_audio_formats:
@@ -4788,6 +4917,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                                 elif 'ru' in lang_code: lang_display = 'Russian'
                                 elif 'zh' in lang_code: lang_display = 'Chinese'
                                 elif 'ar' in lang_code: lang_display = 'Arabic'
+                                elif 'ta' in lang_code: lang_display = 'Tamil'
+                                elif 'te' in lang_code: lang_display = 'Telugu'
+                                elif 'bn' in lang_code: lang_display = 'Bengali'
+                                elif 'id' in lang_code: lang_display = 'Indonesian'
                                 else: lang_display = lang_code.upper()
                             elif 'default' in note.lower() or 'original' in note.lower():
                                 lang_display = 'Original'
@@ -4799,16 +4932,15 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                             seen_langs.add(lang_display)
                             is_def = "YES" if (af == hls_audio_fmt) else "NO"
                             media_audio_lines.append(
-                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
+                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",DEFAULT={is_def},AUTOSELECT=YES,CHANNELS="2",URI="{af["url"]}"'
                             )
                         if not media_audio_lines:
                             media_audio_lines.append(
-                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"'
+                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{a_url}"'
                             )
                     master_m3u8 = (
                         "#EXTM3U\n"
-                        "#EXT-X-VERSION:6\n"
-                        "#EXT-X-INDEPENDENT-SEGMENTS\n" +
+                        "#EXT-X-VERSION:3\n" +
                         "\n".join(media_audio_lines) + "\n" +
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},{codecs_str}AUDIO="audio"\n'
                         f'{v_url}\n'
@@ -4865,6 +4997,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 elif 'ru' in lang_code: lang_display = 'Russian'
                 elif 'zh' in lang_code: lang_display = 'Chinese'
                 elif 'ar' in lang_code: lang_display = 'Arabic'
+                elif 'ta' in lang_code: lang_display = 'Tamil'
+                elif 'te' in lang_code: lang_display = 'Telugu'
+                elif 'bn' in lang_code: lang_display = 'Bengali'
+                elif 'id' in lang_code: lang_display = 'Indonesian'
                 else: lang_display = lang_code.upper()
             elif 'default' in note.lower() or 'original' in note.lower():
                 lang_display = 'Original'
@@ -4878,6 +5014,9 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 "language": lang_display,
                 "url": url,
             })
+
+        if len(audio_choices) > 1:
+            audio_choices = [{"language": "All Languages", "url": url}] + audio_choices
 
         stream_url = None
         if clean_quality in quality_urls_map:
@@ -5124,6 +5263,7 @@ def app_download(payload):
             target_episode=int(episode) if episode is not None else None,
             download_scope=scope,
             job_id=CURRENT_DOWNLOAD_JOB_ID,
+            audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang") or payload.get("audio"),
         )
 
     # Priority 3: YouTube and supported video platforms
@@ -5147,6 +5287,7 @@ def app_download(payload):
             out_name=out_name,
             target_dir=target_dir,
             telegram_config=telegram_config,
+            job_id=CURRENT_DOWNLOAD_JOB_ID,
         )
 
     # Priority 5: Direct CDN stream URL or direct file download
