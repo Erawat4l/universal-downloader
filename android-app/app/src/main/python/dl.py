@@ -69,30 +69,58 @@ def _patch_ytdlp_muxer():
                 except Exception as e:
                     print(f"[WARN] FFmpeg merge failed: {e}, falling back to native muxer")
             files = info.get('__files_to_merge', [])
-            if len(files) == 2:
+            if len(files) >= 2:
                 target_out = info.get('filepath') or ''
-                v_file, a_file = files[0], files[1]
                 req = info.get('requested_formats', [])
-                if len(req) == 2 and req[0].get('vcodec') == 'none':
-                    v_file, a_file = files[1], files[0]
-                temp_out = prepend_extension(target_out, 'muxed')
-                if os.path.exists(temp_out):
-                    try: os.remove(temp_out)
-                    except Exception: pass
-                success = mux_video_and_audio(v_file, a_file, temp_out)
-                if success and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
-                    if os.path.exists(target_out):
-                        try: os.remove(target_out)
+                video_files = []
+                audio_files = []
+                for idx, f in enumerate(files):
+                    f_ext = os.path.splitext(f)[1].lower()
+                    fmt = req[idx] if idx < len(req) else {}
+                    if fmt.get('vcodec') and fmt.get('vcodec') != 'none':
+                        video_files.append(f)
+                    elif f_ext in ('.m4a', '.mp3', '.aac', '.opus', '.ogg', '.flac', '.wav'):
+                        audio_files.append(f)
+                    elif not video_files:
+                        video_files.append(f)
+                    else:
+                        audio_files.append(f)
+
+                if not video_files and files:
+                    video_files = [files[0]]
+                    audio_files = files[1:]
+                elif len(video_files) > 1:
+                    audio_files.extend(video_files[1:])
+                    video_files = [video_files[0]]
+
+                v_file = video_files[0] if video_files else None
+                if v_file and audio_files:
+                    temp_out = prepend_extension(target_out, 'muxed')
+                    if os.path.exists(temp_out):
+                        try: os.remove(temp_out)
                         except Exception: pass
-                    os.rename(temp_out, target_out)
-                    for f in files:
-                        if f != target_out and os.path.exists(f):
-                            try: os.remove(f)
+
+                    success = False
+                    if len(audio_files) == 1:
+                        success = mux_video_and_audio(v_file, audio_files[0], temp_out)
+                    else:
+                        success = mux_multiple_audio_tracks(v_file, audio_files, temp_out)
+                        if not success:
+                            success = mux_video_and_audio(v_file, audio_files[0], temp_out)
+
+                    if success and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                        if os.path.exists(target_out):
+                            try: os.remove(target_out)
                             except Exception: pass
-                    return files, info
-                else:
-                    print(f"[ERROR] Native muxer failed to mux {v_file} and {a_file}")
-                    raise RuntimeError(f"Native muxer could not combine video and audio streams: {v_file}, {a_file}")
+                        os.rename(temp_out, target_out)
+                        for f in files:
+                            if f != target_out and os.path.exists(f):
+                                try: os.remove(f)
+                                except Exception: pass
+                        return files, info
+                    else:
+                        print(f"[ERROR] Native muxer failed to mux {files}")
+                        raise RuntimeError(f"Native muxer could not combine video and audio streams: {files}")
             return orig_merger_run(self, info)
         FFmpegMergerPP.run = custom_merger_run
         _YTDLP_PATCHED = True
@@ -613,7 +641,20 @@ def decrypt_netmirror_tv_url(encrypted_val):
     except Exception:
         return None
 
-def clean_filename(title, default_ext=""):
+def extract_quality_tag(q_val):
+    if not q_val:
+        return ""
+    qs = str(q_val).strip()
+    m = re.search(r'(4320p|2160p|1440p|1080p|720p|480p|360p|240p|144p|4K|2K|HD|SD)', qs, re.I)
+    if m:
+        val = m.group(1).lower()
+        return val if 'p' in val else val.upper()
+    first_w = qs.split()[0]
+    if first_w.lower() not in ("best", "ask", "audio", "default", "none"):
+        return first_w
+    return ""
+
+def clean_filename(title, default_ext="", quality=None):
     title = re.sub(r'[\\/*?:"<>|]', '', str(title or ""))
     title = re.sub(r'[\x00-\x1f\x7f]', '', title)
     title = re.sub(r'[\s_]+', ' ', title).strip('_. ')
@@ -626,6 +667,13 @@ def clean_filename(title, default_ext=""):
     # Strip version suffixes like _v1, v2, (v1), [v1]
     base = re.sub(r'[\s._-]+(v\d+|\bv\d+\b|f\d+|part\d+)$', '', base, flags=re.I).strip()
     base = re.sub(r'\s*[\(\[]v\d+[\)\]]$', '', base, flags=re.I).strip()
+
+    # Enforce NAME(QUALITY) for video outputs
+    q_tag = extract_quality_tag(quality)
+    if q_tag and not (ext and ext.lower() in ('.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg')):
+        base = re.sub(r'\s*[\(\[](?:4320p|2160p|1440p|1080p|720p|480p|360p|240p|144p|4K|2K|HD|SD)[\)\]]', '', base, flags=re.I).strip()
+        base = f"{base}({q_tag})"
+
     if ext:
         title = base + ext
     else:
@@ -1556,6 +1604,67 @@ def mux_video_and_audio(video_path, audio_path, output_path):
         except Exception: pass
     return False
 
+def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
+    """Mux a video track with multiple audio tracks into a single container."""
+    if not os.path.exists(video_path) or not audio_paths:
+        return False
+    valid_audios = [p for p in audio_paths if os.path.exists(p) and os.path.getsize(p) > 0]
+    if not valid_audios:
+        return False
+
+    temp_out = output_path
+    needs_rename = False
+    if output_path in ([video_path] + valid_audios):
+        temp_out = output_path + ".mux_multi_temp.mp4"
+        needs_rename = True
+
+    muxed = False
+    # 1. Try Android Native MediaMuxer via EmbeddedEngine
+    try:
+        from com.erawat.arc import EmbeddedEngine
+        mux_fn = getattr(EmbeddedEngine, 'muxMultiple', None) or getattr(getattr(EmbeddedEngine, 'INSTANCE', None), 'muxMultiple', None)
+        if mux_fn:
+            # Pass as Python list which Chaquopy marshals to java.util.List
+            if mux_fn(str(video_path), [str(p) for p in valid_audios], str(temp_out)):
+                if os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                    muxed = True
+    except Exception as e:
+        print(f"[WARN] Native Android multi-track muxing: {e}")
+
+    # 2. Try FFmpeg (Desktop / CLI / Termux)
+    if not muxed and shutil.which("ffmpeg"):
+        try:
+            cmd = ["ffmpeg", "-y", "-i", video_path]
+            for a in valid_audios:
+                cmd.extend(["-i", a])
+            cmd.extend(["-map", "0:v"])
+            for idx in range(len(valid_audios)):
+                cmd.extend(["-map", f"{idx + 1}:a"])
+            cmd.extend(["-c", "copy", temp_out])
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                muxed = True
+        except Exception as e:
+            print(f"[WARN] FFmpeg multi-muxing: {e}")
+
+    if muxed:
+        try: os.remove(video_path)
+        except Exception: pass
+        for a in valid_audios:
+            try: os.remove(a)
+            except Exception: pass
+        if needs_rename:
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except Exception: pass
+            os.rename(temp_out, output_path)
+        return True
+
+    if needs_rename and os.path.exists(temp_out):
+        try: os.remove(temp_out)
+        except Exception: pass
+    return False
+
 def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None):
     if not HAS_YTDLP:
         print("[WARN] yt-dlp is not installed. Falling back to generic download...")
@@ -1678,11 +1787,16 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
     else:
         stage_dir = os.path.join(out_dir, ".arc_stage")
         os.makedirs(stage_dir, exist_ok=True)
+        q_text = str(quality_arg or "").lower()
+        q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
+        cap = int(q_match.group(1)) if q_match else 1080
+        q_tag = f"{cap}p"
+
         if out_name and not any(out_name.lower().startswith(p) for p in ('youtube video', 'video', 'download', 'stream')):
-            clean_base = clean_filename(out_name, default_ext="")
+            clean_base = clean_filename(out_name, default_ext="", quality=q_tag)
             outtmpl_pattern = os.path.join(stage_dir, f"{clean_base}.%(ext)s")
         else:
-            outtmpl_pattern = os.path.join(stage_dir, '%(title)s.%(ext)s')
+            outtmpl_pattern = os.path.join(stage_dir, f"%(title)s({q_tag}).%(ext)s")
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
     enable_multitrack = False
@@ -1694,35 +1808,24 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
     if is_audio_only:
         format_spec = f"{audio_sel}/best"
+    elif enable_multitrack:
+        format_spec = f"bestvideo[height<={cap}]+mergeall[vcodec=none]/bestvideo[height<={cap}]+bestaudio/best"
     else:
-        q_text = str(quality_arg or "").lower()
-        q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
-        if q_match:
-            cap = int(q_match.group(1))
-            if cap <= 1080:
-                format_spec = (
-                    f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
-                    f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
-                    f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
-                    f"bestvideo[height<={cap}]+{audio_sel}/"
-                    f"best[height<={cap}][vcodec^=avc]/"
-                    f"best[height<={cap}]/"
-                    f"best"
-                )
-            else:
-                format_spec = (
-                    f"bestvideo[height<={cap}][ext=webm]+{audio_sel}/"
-                    f"bestvideo[height<={cap}][vcodec^=vp9]+{audio_sel}/"
-                    f"bestvideo[height<={cap}]+{audio_sel}/"
-                    f"best"
-                )
+        if cap <= 1080:
+            format_spec = (
+                f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
+                f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
+                f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
+                f"bestvideo[height<={cap}]+{audio_sel}/"
+                f"best[height<={cap}][vcodec^=avc]/"
+                f"best[height<={cap}]/"
+                f"best"
+            )
         else:
             format_spec = (
-                f"bestvideo[height<=1080][vcodec^=avc][ext=mp4]+{audio_sel}/"
-                f"bestvideo[height<=1080][ext=mp4]+{audio_sel}/"
-                f"bestvideo[vcodec^=avc]+{audio_sel}/"
-                f"bestvideo+{audio_sel}/"
-                f"best[vcodec!=none][acodec!=none]/"
+                f"bestvideo[height<={cap}][ext=webm]+{audio_sel}/"
+                f"bestvideo[height<={cap}][vcodec^=vp9]+{audio_sel}/"
+                f"bestvideo[height<={cap}]+{audio_sel}/"
                 f"best"
             )
 
@@ -1741,8 +1844,11 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'fragment_retries': 20,
         'http_chunk_size': 10485760,
     }
-    if enable_multitrack:
-        yt_opts_dict['audio_multitrack'] = True
+    if enable_multitrack and not is_audio_only:
+        yt_opts_dict['audio_multistreams'] = True
+        yt_opts_dict['merge_output_format'] = 'mkv'
+    else:
+        yt_opts_dict['merge_output_format'] = 'mp4'
     ydl_opts = get_ytdlp_opts(yt_opts_dict, cookie=cookie)
 
     max_attempts = 5
@@ -1783,14 +1889,14 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 # Move from stage_dir to out_dir and ensure clean filename
                 if stage_dir and filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
-                    cleaned_fn = clean_filename(cur_fn)
+                    cleaned_fn = clean_filename(cur_fn, quality=q_tag if not is_audio_only else None)
                     final_dest = os.path.join(out_dir, cleaned_fn)
                     safe_move(filename, final_dest)
                     filename = final_dest
                     shutil.rmtree(stage_dir, ignore_errors=True)
                 elif filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
-                    cleaned_fn = clean_filename(cur_fn)
+                    cleaned_fn = clean_filename(cur_fn, quality=q_tag if not is_audio_only else None)
                     if cleaned_fn != cur_fn:
                         cleaned_path = os.path.join(cur_dir, cleaned_fn)
                         safe_move(filename, cleaned_path)
@@ -1927,8 +2033,8 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
                 chat_id = int(f"-{raw_c}")
             except ValueError:
                 chat_id = path_parts[1]
-            if path_parts[2].isdigit():
-                msg_id = int(path_parts[2])
+            if path_parts[-1].isdigit():
+                msg_id = int(path_parts[-1])
         else:
             chat_id = path_parts[0]
             if path_parts[1].isdigit():
@@ -2065,7 +2171,15 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None):
         if res_path:
             return res_path
     except Exception as e:
-        print(f"[WARN] Pyrogram unavailable or not configured. Using Telegram web embed fallback...")
+        err_str = str(e)
+        err_lower = err_str.lower()
+        if "session_revoked" in err_lower or "auth_key_unregistered" in err_lower or "401 session_revoked" in err_lower:
+            raise Exception("Telegram session has expired or was revoked. Please log in again in ARC Settings.")
+        if "channel_private" in err_lower or "user_not_participant" in err_lower or "chat_admin_required" in err_lower:
+            raise Exception("This Telegram channel is private and your account is not a member of it.")
+        if path_parts and path_parts[0] == 'c':
+            raise Exception(f"Failed to access private Telegram media: {err_str}")
+        print(f"[WARN] Pyrogram unavailable or not configured ({e}). Using Telegram web embed fallback...")
 
     try:
         parsed_url = urllib.parse.urlparse(url)
@@ -2313,7 +2427,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
             season_dir = os.path.join(series_dir, f"Season {s_n:02d}")
             os.makedirs(season_dir, exist_ok=True)
-            ep_clean_name = f"{show_base} S{s_n:02d}E{ep_n:02d}.mp4"
+            ep_clean_name = clean_filename(f"{show_base} S{s_n:02d}E{ep_n:02d}", default_ext=".mp4", quality=quality_arg)
             print(f"[{idx}/{total_items}] Downloading {ep_clean_name} into {season_dir}...")
             ep_path = download_file_stream(
                 ep_url,
@@ -2608,7 +2722,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             print("="*65)
             return None
 
-        clean_name = out_name or clean_filename(display_title, default_ext=".mp4")
+        clean_name = clean_filename(out_name or display_title, default_ext=".mp4", quality=quality_arg)
 
     else:
         # TV show with multiple episodes
@@ -2687,7 +2801,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             print("="*65)
             return None
 
-        clean_name = out_name or clean_filename(display_title, default_ext=".mp4")
+        clean_name = clean_filename(out_name or display_title, default_ext=".mp4", quality=quality_arg)
 
     if action_mode in ('direct_link_only', 'direct'):
         print(f"> Stream verified: {display_title}")
@@ -4619,8 +4733,8 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             cap_match = re.search(r"(\d+)p", q_lbl)
             target_h = int(cap_match.group(1)) if cap_match else None
 
-            # 1. If 360p or lower, prefer direct progressive mp4 stream (format 18)
-            if target_h and target_h <= 360 and progressive:
+            # 1. If 360p or lower, prefer direct progressive mp4 stream (format 18) only if user didn't pick a specific audio language
+            if target_h and target_h <= 360 and progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all")):
                 matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
                 if matching_prog:
                     quality_urls_map[q_lbl] = matching_prog[0]["url"]
@@ -4650,38 +4764,47 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     codecs_str = f'CODECS="{v_codec},mp4a.40.2",' if v_codec else ''
                     media_audio_lines = []
                     seen_langs = set()
-                    for af in hls_audio_formats:
-                        lang_code = str(af.get('language') or '').lower()
-                        note = str(af.get('format_note') or '')
-                        if lang_code:
-                            if 'en' in lang_code: lang_display = 'English'
-                            elif 'hi' in lang_code: lang_display = 'Hindi'
-                            elif 'es' in lang_code: lang_display = 'Spanish'
-                            elif 'fr' in lang_code: lang_display = 'French'
-                            elif 'de' in lang_code: lang_display = 'German'
-                            elif 'ja' in lang_code: lang_display = 'Japanese'
-                            elif 'ko' in lang_code: lang_display = 'Korean'
-                            elif 'pt' in lang_code: lang_display = 'Portuguese'
-                            elif 'ru' in lang_code: lang_display = 'Russian'
-                            elif 'zh' in lang_code: lang_display = 'Chinese'
-                            elif 'ar' in lang_code: lang_display = 'Arabic'
-                            else: lang_display = lang_code.upper()
-                        elif 'default' in note.lower() or 'original' in note.lower():
-                            lang_display = 'Original'
-                        else:
-                            lang_display = note.strip().capitalize() or 'Audio'
 
-                        if lang_display in seen_langs:
-                            continue
-                        seen_langs.add(lang_display)
-                        is_def = "YES" if (af == hls_audio_fmt) else "NO"
+                    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all"):
+                        # User selected a specific audio language: serve ONLY this audio track in the master playlist
+                        # This prevents VLC PTS clock desync/freeze when switching between Google Video fMP4 and TS audio
+                        selected_lang_name = clean_audio_lang.capitalize()
                         media_audio_lines.append(
-                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
+                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",DEFAULT=YES,AUTOSELECT=YES,URI="{hls_audio_fmt["url"]}"'
                         )
-                    if not media_audio_lines:
-                        media_audio_lines.append(
-                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"'
-                        )
+                    else:
+                        for af in hls_audio_formats:
+                            lang_code = str(af.get('language') or '').lower()
+                            note = str(af.get('format_note') or '')
+                            if lang_code:
+                                if 'en' in lang_code: lang_display = 'English'
+                                elif 'hi' in lang_code: lang_display = 'Hindi'
+                                elif 'es' in lang_code: lang_display = 'Spanish'
+                                elif 'fr' in lang_code: lang_display = 'French'
+                                elif 'de' in lang_code: lang_display = 'German'
+                                elif 'ja' in lang_code: lang_display = 'Japanese'
+                                elif 'ko' in lang_code: lang_display = 'Korean'
+                                elif 'pt' in lang_code: lang_display = 'Portuguese'
+                                elif 'ru' in lang_code: lang_display = 'Russian'
+                                elif 'zh' in lang_code: lang_display = 'Chinese'
+                                elif 'ar' in lang_code: lang_display = 'Arabic'
+                                else: lang_display = lang_code.upper()
+                            elif 'default' in note.lower() or 'original' in note.lower():
+                                lang_display = 'Original'
+                            else:
+                                lang_display = note.strip().capitalize() or 'Audio'
+
+                            if lang_display in seen_langs:
+                                continue
+                            seen_langs.add(lang_display)
+                            is_def = "YES" if (af == hls_audio_fmt) else "NO"
+                            media_audio_lines.append(
+                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang_display}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
+                            )
+                        if not media_audio_lines:
+                            media_audio_lines.append(
+                                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"'
+                            )
                     master_m3u8 = (
                         "#EXTM3U\n"
                         "#EXT-X-VERSION:6\n"
@@ -4705,7 +4828,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_urls_map), None)
         if top_res_key:
             quality_urls_map["Best Available"] = quality_urls_map[top_res_key]
-        elif progressive:
+        elif progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none", "all")):
             progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
             quality_urls_map["Best Available"] = progressive_sorted[0].get("url")
         else:
@@ -4963,20 +5086,17 @@ def app_download(payload):
     # Priority 1: India's Got Latent
     if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
         igl_res = app_igl_resolve(url, quality=quality)
-        clean_name = out_name or clean_filename(title, default_ext=".mp4")
+        clean_name = clean_filename(out_name or title, default_ext=".mp4", quality=quality)
         if not clean_name.lower().endswith(".mp4"):
             clean_name += ".mp4"
         dest_path = get_dest_path(clean_name, target_dir)
         path = download_file_stream(igl_res["url"], clean_name, custom_headers=igl_res.get("headers"), target_dir=target_dir, cache_dir=cache_dir, job_id=CURRENT_DOWNLOAD_JOB_ID)
 
     # Priority 1.5: Direct pre-resolved stream URL (Instant Single Movie / Episode Download)
-    elif stream_url and stream_url.startswith(("http://", "https://")) and scope not in ("season", "series") and not any(h in lower or h in stream_lower for h in ["youtube.com", "youtu.be", "googlevideo.com"]):
-        clean_name = out_name or clean_filename(title, default_ext="")
+    elif stream_url and stream_url.startswith(("http://", "https://")) and scope not in ("season", "series") and not any(h in lower or h in stream_lower for h in ["youtube.com", "youtu.be", "googlevideo.com", "t.me/", "telegram.me/", "telegram.dog/"]):
         path_ext = os.path.splitext(urllib.parse.urlparse(stream_url).path)[1].lower()
-        if not os.path.splitext(clean_name)[1] and path_ext:
-            clean_name += path_ext
-        elif not os.path.splitext(clean_name)[1]:
-            clean_name += '.mp4'
+        default_ext = path_ext if path_ext else ".mp4"
+        clean_name = clean_filename(out_name or title, default_ext=default_ext, quality=quality)
         dest_path = get_dest_path(clean_name, target_dir)
         s_headers = get_stream_headers_for_url(stream_url, custom_headers)
 
@@ -5032,12 +5152,9 @@ def app_download(payload):
     # Priority 5: Direct CDN stream URL or direct file download
     else:
         target_direct = stream_url if (stream_url and stream_url.startswith(("http://", "https://"))) else url
-        clean_name = out_name or clean_filename(title, default_ext="")
         path_ext = os.path.splitext(urllib.parse.urlparse(target_direct).path)[1].lower()
-        if not os.path.splitext(clean_name)[1] and path_ext:
-            clean_name += path_ext
-        elif not os.path.splitext(clean_name)[1]:
-            clean_name += '.mp4'
+        default_ext = path_ext if path_ext else ".mp4"
+        clean_name = clean_filename(out_name or title, default_ext=default_ext, quality=quality)
         dest_path = get_dest_path(clean_name, target_dir)
         s_headers = get_stream_headers_for_url(target_direct, custom_headers)
 

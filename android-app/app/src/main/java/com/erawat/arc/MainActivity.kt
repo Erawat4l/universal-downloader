@@ -89,6 +89,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.ArrowDropDown
@@ -1214,6 +1215,7 @@ private fun ArcApp(
             if (!isSameShow) {
                 selectedQuality = "Best Available"
                 audioOnly = false
+                resolvedUrl = ""
             }
 
             val titleToUse = when {
@@ -1372,6 +1374,8 @@ private fun ArcApp(
                     !directToUse.contains("youtube.com") && !directToUse.contains("youtu.be") &&
                     !directToUse.contains("googlevideo.com") &&
                     !targetEngineUrl.contains("youtube.com") && !targetEngineUrl.contains("youtu.be") &&
+                    !targetEngineUrl.contains("t.me/") && !targetEngineUrl.contains("telegram.me/") &&
+                    !targetEngineUrl.contains("telegram.dog/") &&
                     directToUse != targetEngineUrl) {
                     if (!target.isSeries || (sNum == target.selectedSeason && epNum == target.selectedEpisode)) {
                         put("stream_url", directToUse)
@@ -2429,59 +2433,44 @@ private fun SearchScreen(
                     .clip(RoundedCornerShape(18.dp))
                     .clickable(onClick = chooseHit),
             ) {
-                Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(onClick = chooseHit),
-                    ) {
-                        if (hit.poster.isNotBlank()) {
-                            AsyncImage(
-                                model = hit.poster,
-                                contentDescription = hit.title,
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .size(44.dp, 60.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF222222)),
-                            )
-                        } else {
-                            MediaGlyph(Icons.Outlined.Movie, Modifier.size(44.dp))
-                        }
-                        Spacer(Modifier.width(11.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(hit.title, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            val metaParts = buildList {
-                                add(hit.type)
-                                if (hit.year.isNotBlank()) add(hit.year)
-                                if (hit.providers.isNotBlank()) add(hit.providers)
-                                if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
-                            }
-                            Text(metaParts.joinToString(" · "), color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                ) {
+                    if (hit.poster.isNotBlank()) {
+                        AsyncImage(
+                            model = hit.poster,
+                            contentDescription = hit.title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(46.dp, 64.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF222222)),
+                        )
+                    } else {
+                        MediaGlyph(Icons.Outlined.Movie, Modifier.size(46.dp))
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                        if (hit.audio.isEmpty()) {
-                            FilterChip(
-                                selected = false,
-                                onClick = { onSelect(hit, AudioChoice("Video", hit.url)) },
-                                label = { Text("Use result") },
-                                colors = arcFilterChipColors(),
-                                border = arcFilterChipBorder(false),
-                            )
-                        } else {
-                            hit.audio.forEach { audio ->
-                                FilterChip(
-                                    selected = false,
-                                    onClick = { onSelect(hit, audio) },
-                                    label = { Text(audio.language) },
-                                    colors = arcFilterChipColors(),
-                                    border = arcFilterChipBorder(false),
-                                )
-                            }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(hit.title, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Spacer(Modifier.height(3.dp))
+                        val metaParts = buildList {
+                            add(hit.type)
+                            if (hit.year.isNotBlank()) add(hit.year)
+                            if (hit.providers.isNotBlank()) add(hit.providers)
+                            if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
                         }
+                        Text(metaParts.joinToString(" · "), color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        Icons.AutoMirrored.Outlined.ArrowForward,
+                        contentDescription = "Open",
+                        tint = ArcMuted,
+                        modifier = Modifier.size(18.dp),
+                    )
                 }
             }
         }
@@ -3444,7 +3433,7 @@ private fun SettingsScreen(
                         if (telegramSession.isNotBlank()) {
                             val displayName = telegramUserName.ifBlank { telegramUserPhone.ifBlank { "Telegram Account" } }
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(displayName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                Text(displayName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                 Box(
                                     modifier = Modifier
                                         .size(7.dp)
@@ -3452,10 +3441,10 @@ private fun SettingsScreen(
                                         .background(Color(0xFF4CAF50))
                                 )
                             }
-                            Text(telegramUserPhone.ifBlank { "Connected · Ready for downloads" }, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(telegramUserPhone.ifBlank { "Connected" }, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         } else {
-                            Text("Telegram", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                            Text("Direct Telegram media downloads", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Telegram", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
+                            Text("Direct media downloads", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     if (telegramSession.isNotBlank()) {
