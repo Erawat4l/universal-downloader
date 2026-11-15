@@ -703,10 +703,14 @@ private fun ArcApp(
     var showTelegramSetup by rememberSaveable { mutableStateOf(false) }
     val episodeCache = remember { mutableMapOf<String, MediaTarget>() }
 
-    var currentTrace by remember { mutableStateOf<CliTrace?>(null) }
-    var isTraceExpanded by rememberSaveable { mutableStateOf(false) }
-    var elapsedSeconds by remember { mutableFloatStateOf(0f) }
-    var liveStepText by remember { mutableStateOf("") }
+    var searchTrace by remember { mutableStateOf<CliTrace?>(null) }
+    var analysisTrace by remember { mutableStateOf<CliTrace?>(null) }
+    var isSearchTraceExpanded by rememberSaveable { mutableStateOf(false) }
+    var isAnalysisTraceExpanded by rememberSaveable { mutableStateOf(false) }
+    var searchElapsedSeconds by remember { mutableFloatStateOf(0f) }
+    var searchLiveStepText by remember { mutableStateOf("") }
+    var analysisElapsedSeconds by remember { mutableFloatStateOf(0f) }
+    var analysisLiveStepText by remember { mutableStateOf("") }
     var currentTaskJob by remember { mutableStateOf<Job?>(null) }
     var currentTaskJobId by remember { mutableStateOf<String?>(null) }
 
@@ -808,16 +812,30 @@ private fun ArcApp(
         }
     }
 
-    LaunchedEffect(searchLoading, resolveLoading) {
-        if (searchLoading || resolveLoading) {
-            elapsedSeconds = 0f
-            val baseText = if (searchLoading) "Searching media catalog" else "Resolving media stream"
+    LaunchedEffect(searchLoading) {
+        if (searchLoading) {
+            searchElapsedSeconds = 0f
             val startTime = System.currentTimeMillis()
             var dotCount = 0
-            while (searchLoading || resolveLoading) {
-                elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f
+            while (searchLoading) {
+                searchElapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f
                 val dots = ".".repeat(1 + (dotCount % 3))
-                liveStepText = "$baseText$dots"
+                searchLiveStepText = "Searching media catalog$dots"
+                delay(350)
+                dotCount++
+            }
+        }
+    }
+
+    LaunchedEffect(resolveLoading) {
+        if (resolveLoading) {
+            analysisElapsedSeconds = 0f
+            val startTime = System.currentTimeMillis()
+            var dotCount = 0
+            while (resolveLoading) {
+                analysisElapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f
+                val dots = ".".repeat(1 + (dotCount % 3))
+                analysisLiveStepText = "Resolving media stream$dots"
                 delay(350)
                 dotCount++
             }
@@ -991,7 +1009,7 @@ private fun ArcApp(
         val logs = response.optString("logs", "").trim()
         val error = response.optString("error", "The media engine encountered an issue.")
 
-        val duration = elapsedSeconds.coerceAtLeast(0.4f)
+        val duration = (if (result.type == "search") searchElapsedSeconds else analysisElapsedSeconds).coerceAtLeast(0.4f)
         val actionLabel = when (result.type) {
             "search" -> "Search: \"$query\""
             "resolve" -> "Resolve media"
@@ -1001,7 +1019,7 @@ private fun ArcApp(
 
         if (!isOk) {
             val friendlyError = formatUserFriendlyError(error)
-            currentTrace = CliTrace(
+            val errTrace = CliTrace(
                 action = actionLabel,
                 target = if (result.type == "search") query else input,
                 durationSeconds = duration,
@@ -1014,8 +1032,11 @@ private fun ArcApp(
                 status = "Failed",
                 isError = true,
             )
-            message(friendlyError)
-            if (result.type == "resolve") {
+            if (result.type == "search") {
+                searchTrace = errTrace
+                searchLoading = false
+            } else if (result.type == "resolve") {
+                analysisTrace = errTrace
                 resolveLoading = false
                 target = target.copy(
                     canStream = false,
@@ -1024,7 +1045,7 @@ private fun ArcApp(
                     availableQualities = emptyList()
                 )
             }
-            if (result.type == "search") searchLoading = false
+            message(friendlyError)
             if (result.type == "download") jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
             return
         }
@@ -1159,7 +1180,7 @@ private fun ArcApp(
                     }
                 }
 
-                currentTrace = CliTrace(
+                searchTrace = CliTrace(
                     action = actionLabel,
                     target = query,
                     durationSeconds = duration,
@@ -1343,7 +1364,7 @@ private fun ArcApp(
                 overlay = "analysis"
                 homeOverlay = "analysis"
 
-                currentTrace = CliTrace(
+                analysisTrace = CliTrace(
                     action = actionLabel,
                     target = resolvedTitle,
                     durationSeconds = duration,
@@ -1422,6 +1443,8 @@ private fun ArcApp(
         tabName = AppTab.HOME.name
         overlay = ""
         homeOverlay = ""
+        isSearchTraceExpanded = false
+        isAnalysisTraceExpanded = false
         searchLoading = false
         resolveLoading = false
         selectedQuality = "Best Available"
@@ -1452,6 +1475,8 @@ private fun ArcApp(
                     currentTaskJobId = null
                     resolveLoading = false
                     searchLoading = false
+                    isSearchTraceExpanded = false
+                    isAnalysisTraceExpanded = false
                     if (hits.isNotEmpty() && overlay == "analysis") {
                         overlay = "search"
                         homeOverlay = "search"
@@ -1463,6 +1488,8 @@ private fun ArcApp(
                 }
                 when {
                     overlay == "analysis" -> {
+                        isSearchTraceExpanded = false
+                        isAnalysisTraceExpanded = false
                         if (hits.isNotEmpty()) {
                             overlay = "search"
                             homeOverlay = "search"
@@ -1496,9 +1523,10 @@ private fun ArcApp(
             message("Paste a link or enter a search.")
             return
         }
-        currentTrace = null
-        liveStepText = ""
-        elapsedSeconds = 0f
+        analysisTrace = null
+        analysisLiveStepText = ""
+        analysisElapsedSeconds = 0f
+        isAnalysisTraceExpanded = false
 
         val isDirectUrl = clean.startsWith("http://", ignoreCase = true) ||
             clean.startsWith("https://", ignoreCase = true) ||
@@ -1613,6 +1641,10 @@ private fun ArcApp(
             )
         } else {
             query = clean
+            searchTrace = null
+            searchLiveStepText = ""
+            searchElapsedSeconds = 0f
+            isSearchTraceExpanded = false
             searchLoading = true
             hits = emptyList()
             selectedQuality = "Best Available"
@@ -1896,14 +1928,15 @@ private fun ArcApp(
                                     query = query,
                                     loading = searchLoading,
                                     hits = hits,
-                                    trace = currentTrace,
-                                    elapsedSeconds = elapsedSeconds,
-                                    liveStep = liveStepText,
-                                    isExpanded = isTraceExpanded,
-                                    onToggleExpand = { isTraceExpanded = !isTraceExpanded },
-                                    onCopyLogs = { copyToClipboard(currentTrace?.stdoutLogs.orEmpty(), "Process logs") },
+                                    trace = searchTrace,
+                                    elapsedSeconds = searchElapsedSeconds,
+                                    liveStep = searchLiveStepText,
+                                    isExpanded = isSearchTraceExpanded,
+                                    onToggleExpand = { isSearchTraceExpanded = !isSearchTraceExpanded },
+                                    onCopyLogs = { copyToClipboard(searchTrace?.stdoutLogs.orEmpty(), "Search logs") },
                                     onBack = ::openHome,
                                     onSelect = { hit, audio ->
+                                        isAnalysisTraceExpanded = false
                                         val sortedAudios = prioritizeAudioTracks(hit.audio)
                                         val chosenLang = audio.language.ifBlank {
                                             sortedAudios.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
@@ -1948,15 +1981,16 @@ private fun ArcApp(
                                     loading = resolveLoading,
                                     streamLoading = streamLoading,
                                     episodeLoading = episodeLoading,
-                                    trace = currentTrace,
-                                    elapsedSeconds = elapsedSeconds,
-                                    liveStep = liveStepText,
-                                    isExpanded = isTraceExpanded,
-                                    onToggleExpand = { isTraceExpanded = !isTraceExpanded },
-                                    onCopyLogs = { copyToClipboard(currentTrace?.stdoutLogs.orEmpty(), "Process logs") },
+                                    trace = analysisTrace,
+                                    elapsedSeconds = analysisElapsedSeconds,
+                                    liveStep = analysisLiveStepText,
+                                    isExpanded = isAnalysisTraceExpanded,
+                                    onToggleExpand = { isAnalysisTraceExpanded = !isAnalysisTraceExpanded },
+                                    onCopyLogs = { copyToClipboard(analysisTrace?.stdoutLogs.orEmpty(), "Media logs") },
                                     quality = selectedQuality,
                                     audioOnly = audioOnly,
                                     onBack = {
+                                        isSearchTraceExpanded = false
                                         if (hits.isNotEmpty()) {
                                             overlay = "search"
                                             homeOverlay = "search"
@@ -3121,8 +3155,8 @@ private fun AnalysisScreen(
             }
         }
 
-        // Audio Tracks selector: visible immediately when audio tracks exist, even while loading
-        if (target.audioTracks.isNotEmpty()) {
+        // Audio Tracks selector: visible when analysis finishes alongside quality profile
+        if (!loading && target.audioTracks.isNotEmpty()) {
             item {
                 val sortedTracks = remember(target.audioTracks) { prioritizeAudioTracks(target.audioTracks) }
                 val currentLang = target.selectedAudioLang.ifBlank {
