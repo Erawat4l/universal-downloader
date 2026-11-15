@@ -1290,6 +1290,13 @@ private fun ArcApp(
                     if (selectedAudioLang.isNotBlank()) put("audio_lang", selectedAudioLang)
                     if (season != null) put("season", season)
                     if (episode != null) put("episode", episode)
+                    if (telegramSession.isNotBlank()) {
+                        put("telegram", JSONObject().apply {
+                            put("api_id", telegramApiId)
+                            put("api_hash", telegramApiHash)
+                            put("session", telegramSession)
+                        })
+                    }
                 },
                 "resolve"
             )

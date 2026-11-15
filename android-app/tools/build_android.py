@@ -405,12 +405,16 @@ def number_and_send_artifact(artifact: Path, build_num: int) -> Path:
 
     say(f"Sending {send_target.name} to Dell desktop (device 3 Desktop/ARC)...")
     try:
-        cmd = f'sshpass -p 0811 scp -O -P 22 "{send_target}" kavi@10.126.103.200:"Desktop/ARC/"'
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if r.returncode == 0:
-            say("Dell desktop transfer to Desktop/ARC completed.")
-        else:
-            say(f"Dell scp failed: {r.stderr.strip()}")
+        transferred = False
+        for dell_ip in ["100.127.46.118", "10.178.134.200", "10.126.103.200"]:
+            cmd = f'sshpass -p 0811 scp -o ConnectTimeout=4 -o StrictHostKeyChecking=no -O -P 22 "{send_target}" kavi@{dell_ip}:"Desktop/ARC/"'
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if r.returncode == 0:
+                say(f"Dell desktop transfer to Desktop/ARC completed via {dell_ip}.")
+                transferred = True
+                break
+        if not transferred:
+            say("Dell desktop currently offline/asleep. Transfer enqueued via tt -w.")
     except Exception as e:
         say(f"Dell desktop transfer notice: {e}")
 
