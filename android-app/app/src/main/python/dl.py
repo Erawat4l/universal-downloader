@@ -215,18 +215,29 @@ def get_default_dir():
 DEFAULT_DIR = get_default_dir()
 
 def sync_to_sdcard_if_needed(file_path):
-    """If saved outside /sdcard/Download, attempt pushing to /sdcard/Download via ADB if available."""
-    if file_path and not file_path.startswith("/sdcard"):
-        filename = os.path.basename(file_path)
-        dest_sdcard = f"/sdcard/Download/{filename}"
-        try:
-            res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=5)
-            if "device" in res.stdout and "emulator" in res.stdout or len(res.stdout.strip().splitlines()) > 1:
-                push_res = subprocess.run(["adb", "push", file_path, dest_sdcard], capture_output=True, text=True, timeout=60)
-                if push_res.returncode == 0:
-                    print(f"[OK] Synced to: {dest_sdcard}")
-        except Exception:
-            pass
+    """If saved outside /sdcard/Download, attempt pushing to /sdcard/Download via ADB if available in Termux CLI."""
+    if not file_path:
+        return
+    clean_p = os.path.abspath(file_path)
+    # Never push if already on sdcard or primary Android storage
+    if clean_p.startswith("/sdcard") or clean_p.startswith("/storage/emulated/0") or "com.erawat.arc" in clean_p:
+        return
+    # Only for standalone CLI outside Android app
+    try:
+        import com.chaquo.python
+        return
+    except Exception:
+        pass
+    filename = os.path.basename(file_path)
+    dest_sdcard = f"/sdcard/Download/{filename}"
+    try:
+        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=2)
+        if "device" in res.stdout and ("emulator" in res.stdout or len(res.stdout.strip().splitlines()) > 1):
+            push_res = subprocess.run(["adb", "push", file_path, dest_sdcard], capture_output=True, text=True, timeout=30)
+            if push_res.returncode == 0:
+                print(f"[OK] Synced to: {dest_sdcard}")
+    except Exception:
+        pass
 
 SERVER_STARTED = False
 def start_local_http_server():
@@ -694,18 +705,20 @@ def clean_filename(title, default_ext="", quality=None):
     return title
 
 def _cleanup_download_cache(cache_dir, target_dir, job_id=None, keep_path=None):
-    """Purge all temporary fragment files, .part, .ytdl, and staging folders so ONLY the final downloaded media file remains."""
+    """Purge temporary fragment files, .part, .ytdl, and staging folders for this specific job only."""
     jid_str = str(job_id or "").strip()
+    if not jid_str:
+        return
     keep_norm = os.path.abspath(keep_path) if keep_path else None
 
-    # Clean cache directory if specified
+    # Clean cache directory for this specific job
     if cache_dir and os.path.exists(cache_dir):
         try:
             for item in os.listdir(cache_dir):
-                item_path = os.path.join(cache_dir, item)
-                if item_path == keep_norm:
-                    continue
-                if (jid_str and jid_str in item) or item.endswith(('.part', '.ytdl', '.aria2', '.temp')) or item.startswith(('.temp', '.arc_stage', 'ytdl_raw')):
+                if jid_str in item:
+                    item_path = os.path.join(cache_dir, item)
+                    if keep_norm and os.path.abspath(item_path) == keep_norm:
+                        continue
                     if os.path.isdir(item_path):
                         shutil.rmtree(item_path, ignore_errors=True)
                     else:
@@ -714,16 +727,19 @@ def _cleanup_download_cache(cache_dir, target_dir, job_id=None, keep_path=None):
         except Exception:
             pass
 
-    # Clean target directory of any left-over stage dirs, temp files or fragment parts
+    # Clean target directory for this specific job only
     if target_dir and os.path.exists(target_dir):
         try:
+            # Clean this job's unique stage dir if present
+            job_stage = os.path.join(target_dir, f".arc_stage_{jid_str}")
+            if os.path.exists(job_stage) and (not keep_norm or os.path.abspath(job_stage) != keep_norm):
+                shutil.rmtree(job_stage, ignore_errors=True)
+
             for item in os.listdir(target_dir):
-                item_path = os.path.join(target_dir, item)
-                if item_path == keep_norm:
-                    continue
-                if (jid_str and jid_str in item and item.startswith(('.temp', '.arc_stage', 'ytdl_raw'))) or \
-                   item.endswith(('.part', '.ytdl', '.aria2', '.temp')) or \
-                   re.search(r'[\._-]f[a-zA-Z0-9_\-]+\.(mp4|m4a|webm|part)$', item, re.I):
+                if jid_str in item and item.startswith(('.temp', '.arc_stage', 'ytdl_raw')):
+                    item_path = os.path.join(target_dir, item)
+                    if keep_norm and os.path.abspath(item_path) == keep_norm:
+                        continue
                     if os.path.isdir(item_path):
                         shutil.rmtree(item_path, ignore_errors=True)
                     else:
@@ -1352,7 +1368,8 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
             pass
 
     speed_opts = {
-        'nopart': True,
+        'nopart': False,
+        'continuedl': True,
         'noplaylist': True,
         'windowsfilenames': True,
         'socket_timeout': 30,
@@ -1794,7 +1811,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         out_dir = playlist_dir
         outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
     else:
-        stage_dir = os.path.join(out_dir, ".arc_stage")
+        stage_dir = os.path.join(out_dir, f".arc_stage_{jid}")
         os.makedirs(stage_dir, exist_ok=True)
         q_text = str(quality_arg or "").lower()
         q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
@@ -1842,7 +1859,12 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'no_warnings': True,
         'progress_hooks': [ytdlp_progress_hook],
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
-        'nopart': True,
+        'nopart': False,
+        'continuedl': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en', 'hi', 'en-orig', 'en-US'],
+        'subtitlesformat': 'srt/vtt/best',
         'socket_timeout': 30,
         'retries': 20,
         'fragment_retries': 20,
@@ -1893,6 +1915,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                     final_dest = os.path.join(out_dir, cleaned_fn)
                     safe_move(filename, final_dest)
                     filename = final_dest
+
+                    # Also move any downloaded subtitle / caption files (.srt, .vtt)
+                    base_dest, _ = os.path.splitext(final_dest)
+                    try:
+                        for sf in os.listdir(stage_dir):
+                            if sf.endswith(('.srt', '.vtt')):
+                                src_sub = os.path.join(stage_dir, sf)
+                                m_sub = re.search(r'\.([a-zA-Z0-9_-]+)\.(srt|vtt)$', sf, re.I)
+                                if m_sub:
+                                    sub_dest = f"{base_dest}.{m_sub.group(1)}.{m_sub.group(2)}"
+                                else:
+                                    _, sub_ext = os.path.splitext(sf)
+                                    sub_dest = f"{base_dest}{sub_ext}"
+                                safe_move(src_sub, sub_dest)
+                    except Exception:
+                        pass
                     shutil.rmtree(stage_dir, ignore_errors=True)
                 elif filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
@@ -1909,11 +1947,9 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             return filename
         except Exception as e:
-            if stage_dir and os.path.exists(stage_dir):
-                shutil.rmtree(stage_dir, ignore_errors=True)
             if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
-                if ytdl_stage and os.path.exists(ytdl_stage):
-                    shutil.rmtree(ytdl_stage, ignore_errors=True)
+                if stage_dir and os.path.exists(stage_dir):
+                    shutil.rmtree(stage_dir, ignore_errors=True)
                 return None
             err_str = str(e)
             print(f"\n[FAIL] Download error encountered: {err_str}")
@@ -1952,6 +1988,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 print(f"> Retrying download (attempt {attempt}/{max_attempts})...")
                 time.sleep(3)
             else:
+                if stage_dir and os.path.exists(stage_dir):
+                    shutil.rmtree(stage_dir, ignore_errors=True)
                 print("[FAIL] Download failed after retries.")
                 return False
     return False
@@ -5249,9 +5287,8 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
 
 
 def app_download(payload):
-    global CURRENT_DOWNLOAD_JOB_ID
-    CURRENT_DOWNLOAD_JOB_ID = str(payload.get("job_id") or payload.get("id") or "job")
-    set_current_job_id(CURRENT_DOWNLOAD_JOB_ID)
+    jid = str(payload.get("job_id") or payload.get("id") or "job")
+    set_current_job_id(jid)
     url = str(payload.get("url", "")).strip()
     stream_url = str(payload.get("stream_url", "")).strip()
     quality = str(payload.get("quality", "best")).strip() or "best"
@@ -5271,7 +5308,7 @@ def app_download(payload):
     lower = url.lower()
     stream_lower = stream_url.lower()
 
-    ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
+    ACTIVE_DOWNLOAD_PROGRESS[jid] = {
         "percent": 0.0,
         "downloaded_str": "0 MB",
         "total_str": "--",
@@ -5307,7 +5344,7 @@ def app_download(payload):
         if not clean_name.lower().endswith(".mp4"):
             clean_name += ".mp4"
         dest_path = get_dest_path(clean_name, target_dir)
-        path = download_file_stream(igl_res["url"], clean_name, custom_headers=igl_res.get("headers"), target_dir=target_dir, cache_dir=cache_dir, job_id=CURRENT_DOWNLOAD_JOB_ID)
+        path = download_file_stream(igl_res["url"], clean_name, custom_headers=igl_res.get("headers"), target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
 
     # Priority 1.5: Direct pre-resolved stream URL (Instant Single Movie / Episode Download)
     elif stream_url and stream_url.startswith(("http://", "https://")) and scope not in ("season", "series") and not any(h in lower or h in stream_lower for h in ["youtube.com", "youtu.be", "googlevideo.com", "t.me/", "telegram.me/", "telegram.dog/"]):
@@ -5326,7 +5363,7 @@ def app_download(payload):
                 raise Exception("HLS stream download failed or produced empty file")
         else:
             print(f"> Downloading direct media stream: {stream_url[:70]}...")
-            path = download_file_stream(stream_url, clean_name, custom_headers=s_headers, target_dir=target_dir, cache_dir=cache_dir, job_id=CURRENT_DOWNLOAD_JOB_ID)
+            path = download_file_stream(stream_url, clean_name, custom_headers=s_headers, target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
 
     # Priority 2: NetMirror movies and series (for batch season/series scope or fallback)
     elif any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]) or season is not None:
@@ -5340,7 +5377,7 @@ def app_download(payload):
             target_season=int(season) if season is not None else None,
             target_episode=int(episode) if episode is not None else None,
             download_scope=scope,
-            job_id=CURRENT_DOWNLOAD_JOB_ID,
+            job_id=jid,
             audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang") or payload.get("audio"),
         )
 
@@ -5352,7 +5389,7 @@ def app_download(payload):
             quality_arg=quality,
             cookie=cookie,
             standalone=True,
-            job_id=CURRENT_DOWNLOAD_JOB_ID,
+            job_id=jid,
             cache_dir=cache_dir,
             out_name=out_name or title,
             audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang") or payload.get("audio"),
@@ -5365,7 +5402,7 @@ def app_download(payload):
             out_name=out_name,
             target_dir=target_dir,
             telegram_config=telegram_config,
-            job_id=CURRENT_DOWNLOAD_JOB_ID,
+            job_id=jid,
         )
 
     # Priority 5: Direct CDN stream URL or direct file download
@@ -5386,19 +5423,19 @@ def app_download(payload):
                 raise Exception("HLS stream download failed or produced empty file")
         else:
             print(f"> Downloading direct media stream: {target_direct[:70]}...")
-            path = download_file_stream(target_direct, clean_name, custom_headers=s_headers, target_dir=target_dir, cache_dir=cache_dir, job_id=CURRENT_DOWNLOAD_JOB_ID)
+            path = download_file_stream(target_direct, clean_name, custom_headers=s_headers, target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
 
-    if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
-        return {"cancelled": True, "status": "Cancelled"}
+    if jid in CANCELLED_DOWNLOAD_JOBS:
+        return {"cancelled": True, "status": "Cancelled", "job_id": jid}
 
     if not path:
-        if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
-            return {"cancelled": True, "status": "Cancelled"}
+        if jid in CANCELLED_DOWNLOAD_JOBS:
+            return {"cancelled": True, "status": "Cancelled", "job_id": jid}
         raise Exception("The downloader returned no output file")
 
-    _cleanup_download_cache(cache_dir, target_dir, CURRENT_DOWNLOAD_JOB_ID, keep_path=path)
+    _cleanup_download_cache(cache_dir, target_dir, jid, keep_path=path)
 
-    ACTIVE_DOWNLOAD_PROGRESS[CURRENT_DOWNLOAD_JOB_ID] = {
+    ACTIVE_DOWNLOAD_PROGRESS[jid] = {
         "percent": 100.0,
         "downloaded_str": "Done",
         "total_str": "Done",
@@ -5407,7 +5444,7 @@ def app_download(payload):
         "status": "Complete",
         "path": path,
     }
-    return {"path": path, "quality": quality, "target_dir": target_dir}
+    return {"path": path, "quality": quality, "target_dir": target_dir, "job_id": jid, "status": "Complete"}
 
 
 _PENDING_TG_CLIENTS = {}

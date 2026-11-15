@@ -334,22 +334,6 @@ private fun sortQualitiesDescending(rawList: List<String>): List<String> {
     return rawList.distinct().sortedWith(compareByDescending { rank(it) })
 }
 
-private data class DownloadJob(
-    val id: String,
-    val title: String,
-    val source: String,
-    val detail: String,
-    val status: String,
-    val path: String = "",
-    val progress: Float = 0f,
-    val downloaded: String = "0 MB",
-    val total: String = "--",
-    val speed: String = "--",
-    val eta: String = "--",
-    val poster: String = "",
-    val url: String = "",
-    val headers: Map<String, String> = emptyMap(),
-)
 
 private data class EngineResult(
     val jobId: String,
@@ -671,7 +655,10 @@ private fun ArcApp(
     var resolvedUrl by rememberSaveable { mutableStateOf("") }
     var target by remember { mutableStateOf(MediaTarget("", "", "", "", "")) }
     var hits by remember { mutableStateOf(emptyList<SearchHit>()) }
-    var jobs by remember { mutableStateOf(emptyList<DownloadJob>()) }
+    LaunchedEffect(Unit) {
+        DownloadManager.init(context)
+    }
+    val jobs by DownloadManager.jobsState
     var cancelledJobIds by remember { mutableStateOf(setOf<String>()) }
     val activeCancelledIds = remember { java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>()) }
     var notifications by rememberSaveable { mutableStateOf(preferences.getBoolean("notifications_enabled", true)) }
@@ -859,30 +846,7 @@ private fun ArcApp(
                 EmbeddedEngine.getProgress()
             }
             if (progressObj.length() > 0) {
-                jobs = jobs.map { job ->
-                    val p = progressObj.optJSONObject(job.id)
-                    if (p != null) {
-                        val newStatus = p.optString("status", job.status)
-                        val effectiveStatus = when {
-                            job.status == "Complete" || job.status == "Cancelled" -> job.status
-                            job.id in cancelledJobIds -> "Cancelled"
-                            newStatus == "Cancelled" || job.status == "Cancelled" -> "Cancelled"
-                            newStatus == "Paused" || job.status == "Paused" -> "Paused"
-                            newStatus == "Complete" && p.optString("path").isNotBlank() -> "Complete"
-                            else -> "Downloading"
-                        }
-                        val path = p.optString("path", job.path).ifEmpty { job.path }
-                        job.copy(
-                            progress = p.optDouble("percent", job.progress.toDouble()).toFloat(),
-                            downloaded = p.optString("downloaded_str", job.downloaded),
-                            total = p.optString("total_str", job.total),
-                            speed = if (effectiveStatus == "Paused") "--" else p.optString("speed", job.speed),
-                            eta = if (effectiveStatus == "Paused") "--" else p.optString("eta", job.eta),
-                            status = effectiveStatus,
-                            path = path,
-                        )
-                    } else job
-                }
+                DownloadManager.updateProgress(progressObj)
             }
         }
     }
@@ -1055,7 +1019,7 @@ private fun ArcApp(
                 )
             }
             message(friendlyError)
-            if (result.type == "download") jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
+            if (result.type == "download") DownloadManager.markFailed(context, result.jobId, friendlyError)
             return
         }
 
@@ -1397,19 +1361,19 @@ private fun ArcApp(
 
                 if (!isOk || isJobCancelled || path.isBlank()) {
                     if (isJobCancelled) {
-                        jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Cancelled") else it }
+                        DownloadManager.markCancelled(context, result.jobId)
                         message("Download cancelled.")
                     } else if (job != null) {
                         val errMsg = response.optString("error", error.ifBlank { "Download failed." })
                         val friendlyErr = formatUserFriendlyError(errMsg)
-                        jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
+                        DownloadManager.markFailed(context, result.jobId, friendlyErr)
                         message(friendlyErr)
                     }
                     return
                 }
 
                 val jobTitle = job?.title?.ifBlank { "Download" } ?: "Download"
-                jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Complete", path = path, progress = 100f) else it }
+                DownloadManager.markComplete(context, result.jobId, path)
                 message("Download complete: $jobTitle")
                 postNotification(jobTitle, path)
             }
@@ -1716,10 +1680,6 @@ private fun ArcApp(
             url = targetEngineUrl,
             headers = target.streamHeaders,
         )
-        jobs = listOf(job) + jobs
-        message("Download queued: $finalTitle")
-        tabName = AppTab.ACTIVITY.name
-
         val payload = JSONObject().apply {
             put("action", "download")
             put("url", targetEngineUrl)
@@ -1762,50 +1722,33 @@ private fun ArcApp(
                 put("cookie", effGoogleCookie)
             }
         }
-        scope.launch {
-            val response = withContext(Dispatchers.IO) {
-                runCatching { EmbeddedEngine.execute(context, payload) }
-                    .getOrElse { error ->
-                        JSONObject().apply {
-                            put("ok", false)
-                            put("error", error.message ?: "The engine could not start.")
-                        }
-                    }
-            }
-            handleEngineResult(EngineResult(job.id, "download", response))
-        }
+        DownloadService.startDownload(context, job, payload)
+        message("Download queued: $finalTitle")
         tabName = AppTab.ACTIVITY.name
     }
 
     fun pauseJob(jobId: String) {
-        EmbeddedEngine.pause(jobId)
-        jobs = jobs.map { if (it.id == jobId) it.copy(status = "Paused") else it }
+        DownloadService.pause(context, jobId)
         message("Download paused.")
     }
 
     fun resumeJob(jobId: String) {
-        EmbeddedEngine.resume(jobId)
-        jobs = jobs.map { if (it.id == jobId) it.copy(status = "Downloading") else it }
+        DownloadService.resume(context, jobId)
         message("Download resumed.")
     }
 
     fun cancelJob(jobId: String) {
         activeCancelledIds.add(jobId)
         cancelledJobIds = cancelledJobIds + jobId
-        EmbeddedEngine.cancel(jobId)
-        jobs = jobs.map { if (it.id == jobId) it.copy(status = "Cancelled") else it }
+        DownloadService.cancel(context, jobId)
         message("Download cancelled.")
     }
 
     fun deleteJob(jobId: String, removeFile: Boolean = false) {
         activeCancelledIds.add(jobId)
         cancelledJobIds = cancelledJobIds + jobId
-        EmbeddedEngine.cancel(jobId)
-        val job = jobs.firstOrNull { it.id == jobId }
-        if (job != null && removeFile && job.path.isNotBlank()) {
-            runCatching { File(job.path).delete() }
-        }
-        jobs = jobs.filterNot { it.id == jobId }
+        DownloadService.cancel(context, jobId)
+        DownloadManager.removeJob(context, jobId, removeFile)
         message("Media file removed.")
     }
 
@@ -2261,7 +2204,7 @@ private fun ArcApp(
                         onCancelJob = { cancelJob(it) },
                         onPauseJob = { pauseJob(it) },
                         onResumeJob = { resumeJob(it) },
-                        onDismissJob = { id -> jobs = jobs.filterNot { it.id == id } },
+                        onDismissJob = { id -> DownloadManager.removeJob(context, id, false) },
                     )
                     AppTab.LIBRARY -> LibraryScreen(
                         jobs = jobs.filter { it.status == "Complete" },

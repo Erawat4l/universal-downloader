@@ -156,56 +156,78 @@ object EmbeddedEngine {
             }
 
             muxer.start()
-            val maxBufferSize = 16 * 1024 * 1024
+            val maxBufferSize = 1024 * 1024
             val buffer = ByteBuffer.allocateDirect(maxBufferSize)
             val bufferInfo = MediaCodec.BufferInfo()
 
             class TrackSource(val extractor: MediaExtractor, val muxerTrackIndex: Int) {
                 var isDone = false
                 var lastTimestampUs: Long = -1L
-                fun sampleTime(): Long {
-                    if (isDone) return Long.MAX_VALUE
+                var currentPts: Long = extractor.sampleTime
+
+                init {
+                    if (currentPts < 0) {
+                        isDone = true
+                        currentPts = Long.MAX_VALUE
+                    }
+                }
+
+                fun advance() {
+                    extractor.advance()
                     val t = extractor.sampleTime
-                    return if (t < 0) Long.MAX_VALUE else t
+                    if (t < 0) {
+                        isDone = true
+                        currentPts = Long.MAX_VALUE
+                    } else {
+                        currentPts = t
+                    }
                 }
             }
 
-            val allTracks = mutableListOf<TrackSource>()
-            allTracks.add(TrackSource(videoExtractor, videoTrackIndex))
+            val tracks = ArrayList<TrackSource>(1 + audioExtractors.size)
+            tracks.add(TrackSource(videoExtractor, videoTrackIndex))
             for (i in audioExtractors.indices) {
-                allTracks.add(TrackSource(audioExtractors[i], audioTrackIndices[i]))
+                tracks.add(TrackSource(audioExtractors[i], audioTrackIndices[i]))
             }
+            val trackCount = tracks.size
 
             while (true) {
-                val nextSource = allTracks.filter { !it.isDone }.minByOrNull { it.sampleTime() }
-                if (nextSource == null || nextSource.sampleTime() == Long.MAX_VALUE) break
+                var minSource: TrackSource? = null
+                var minPts = Long.MAX_VALUE
 
-                val sampleSize = nextSource.extractor.readSampleData(buffer, 0)
+                for (i in 0 until trackCount) {
+                    val src = tracks[i]
+                    if (!src.isDone && src.currentPts < minPts) {
+                        minPts = src.currentPts
+                        minSource = src
+                    }
+                }
+
+                if (minSource == null || minPts == Long.MAX_VALUE) break
+
+                val sampleSize = minSource.extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) {
-                    nextSource.isDone = true
+                    minSource.isDone = true
+                    minSource.currentPts = Long.MAX_VALUE
                     continue
                 }
 
-                var pts = nextSource.extractor.sampleTime
-                if (pts < 0) {
-                    nextSource.isDone = true
-                    continue
+                var pts = minSource.currentPts
+                if (pts <= minSource.lastTimestampUs) {
+                    pts = minSource.lastTimestampUs + 1000L
                 }
-                if (pts <= nextSource.lastTimestampUs) {
-                    pts = nextSource.lastTimestampUs + 1000L
-                }
-                nextSource.lastTimestampUs = pts
+                minSource.lastTimestampUs = pts
 
                 bufferInfo.offset = 0
                 bufferInfo.size = sampleSize
                 bufferInfo.presentationTimeUs = pts
-                bufferInfo.flags = nextSource.extractor.sampleFlags
+                bufferInfo.flags = minSource.extractor.sampleFlags
                 try {
-                    muxer.writeSampleData(nextSource.muxerTrackIndex, buffer, bufferInfo)
+                    muxer.writeSampleData(minSource.muxerTrackIndex, buffer, bufferInfo)
                 } catch (we: Exception) {
-                    android.util.Log.w("EmbeddedEngine", "writeSampleData warning for track ${nextSource.muxerTrackIndex}: ${we.message}")
+                    android.util.Log.w("EmbeddedEngine", "writeSampleData warning: ${we.message}")
                 }
-                nextSource.extractor.advance()
+                minSource.advance()
             }
 
             muxer.stop()
