@@ -23,6 +23,12 @@ import socketserver
 import threading
 import concurrent.futures
 import asyncio
+import warnings
+
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", message=".*unclosed.*")
+warnings.filterwarnings("ignore", message=".*Task was destroyed.*")
+warnings.filterwarnings("ignore", message=".*loop is closed.*")
 
 class AnyThreadEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
     def get_event_loop(self):
@@ -5182,10 +5188,12 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         print(f"[OK] Telegram link resolved: {title} (can_stream={can_stream})")
         return {
             "url": stream_url,
+            "target_url": url,
+            "direct_url": stream_url if can_stream else "",
             "title": title,
             "source": "Telegram",
             "quality": "Best",
-            "qualities": ["Best"],
+            "qualities": ["Best Available"],
             "can_stream": can_stream,
             "media_type": media_type,
         }
@@ -5467,6 +5475,8 @@ def app_telegram_check(payload):
             raise Exception("Invalid or expired string session")
         if "AUTH_KEY" in err_msg:
             raise Exception("Session revoked or expired")
+        if "diff" in err_msg.lower() or "check" in err_msg.lower() or "padding" in err_msg.lower():
+            raise Exception("Invalid string session format")
         raise Exception(f"Connection failed: {err_msg[:60]}")
 
 def app_telegram_send_code(payload):
@@ -5545,6 +5555,13 @@ def app_telegram_sign_in(payload):
             return user, False
         except SessionPasswordNeeded:
             return None, True
+        except Exception as se:
+            s_err = str(se)
+            if "PHONE_CODE_INVALID" in s_err:
+                raise Exception("Invalid verification code")
+            if "PHONE_CODE_EXPIRED" in s_err:
+                raise Exception("Verification code expired. Please resend code")
+            raise Exception(s_err)
 
     user, need_password = loop.run_until_complete(_auth())
     if need_password:
@@ -5584,8 +5601,14 @@ def app_telegram_password(payload):
     loop = entry["loop"]
 
     async def _pwd():
-        user = await client.check_password(password)
-        return user
+        try:
+            user = await client.check_password(password)
+            return user
+        except Exception as pe:
+            p_err = str(pe)
+            if "PASSWORD_HASH_INVALID" in p_err or "PASSWORD_INVALID" in p_err:
+                raise Exception("Incorrect 2FA password")
+            raise Exception(p_err)
 
     user = loop.run_until_complete(_pwd())
     session_str = _safe_export_session(client, loop)

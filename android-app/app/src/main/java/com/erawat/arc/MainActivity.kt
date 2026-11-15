@@ -61,6 +61,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -178,6 +179,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -479,6 +481,95 @@ private fun arcTextFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedTrailingIconColor = ArcWhite,
     unfocusedTrailingIconColor = ArcMuted,
 )
+
+private fun formatUserFriendlyError(rawError: String?): String {
+    if (rawError.isNullOrBlank()) return "An unexpected issue occurred. Please try again."
+    val err = rawError.trim()
+    val lower = err.lowercase()
+
+    return when {
+        lower.contains("cancel") -> "Download cancelled"
+        lower.contains("diff") || lower.contains("padding") || (lower.contains("check") && lower.contains("0")) ->
+            "Invalid Telegram string session"
+        lower.contains("password_hash_invalid") || lower.contains("password_invalid") || (lower.contains("password") && lower.contains("invalid")) || lower.contains("wrong pass") ->
+            "Incorrect 2FA password"
+        lower.contains("phone_code_invalid") || (lower.contains("code") && lower.contains("invalid")) ->
+            "Invalid verification code"
+        lower.contains("phone_code_expired") || (lower.contains("code") && lower.contains("expired")) ->
+            "Verification code expired. Please request a new one"
+        lower.contains("phone_number_invalid") || (lower.contains("phone") && lower.contains("invalid")) ->
+            "Invalid phone number"
+        lower.contains("flood_wait") -> {
+            val seconds = Regex("""\d+""").find(err)?.value ?: "a few"
+            "Too many attempts. Please wait $seconds seconds"
+        }
+        lower.contains("auth_key_unregistered") || lower.contains("session_revoked") || lower.contains("session expired") ->
+            "Telegram session expired. Please log in again"
+        lower.contains("sign in to confirm you’re not a bot") || lower.contains("confirm you're not a bot") ->
+            "YouTube verification required. Retrying with fallback stream..."
+        lower.contains("timed out") || lower.contains("timeout") ->
+            "Connection timed out. Please check your network"
+        lower.contains("no such host") || lower.contains("unable to resolve host") || lower.contains("network is unreachable") ->
+            "No internet connection. Please check your network"
+        lower.contains("rate limit") || lower.contains("rate-limiting") || lower.contains("429") ->
+            "Server rate-limited. Please try again in a few moments"
+        lower.contains("no active streaming servers") || lower.contains("offline") ->
+            "No active streaming servers found for this media"
+        else -> {
+            val cleaned = err
+                .replace(Regex("""^\[\d+\s+[^\]]+\]\s*"""), "")
+                .replace(Regex("""^[A-Za-z_]+Error:\s*"""), "")
+                .replace(Regex("""^Exception:\s*"""), "")
+                .trim()
+            if (cleaned.length > 100) cleaned.take(97) + "..." else cleaned
+        }
+    }
+}
+
+private fun prioritizeAudioTracks(tracks: List<AudioChoice>): List<AudioChoice> {
+    if (tracks.isEmpty()) return emptyList()
+    return tracks.sortedWith(Comparator { a, b ->
+        val langA = a.language.lowercase()
+        val langB = b.language.lowercase()
+        val pA = when {
+            langA.contains("hindi") -> 1
+            langA.contains("english") -> 2
+            langA.contains("original") -> 3
+            langA.contains("tamil") -> 4
+            langA.contains("telugu") -> 5
+            langA.contains("bengali") -> 6
+            langA.contains("spanish") -> 7
+            langA.contains("french") -> 8
+            langA.contains("arabic") -> 9
+            langA.contains("portuguese") -> 10
+            langA.contains("russian") -> 11
+            langA.contains("german") -> 12
+            langA.contains("japanese") -> 13
+            langA.contains("korean") -> 14
+            langA.contains("chinese") -> 15
+            else -> 20
+        }
+        val pB = when {
+            langB.contains("hindi") -> 1
+            langB.contains("english") -> 2
+            langB.contains("original") -> 3
+            langB.contains("tamil") -> 4
+            langB.contains("telugu") -> 5
+            langB.contains("bengali") -> 6
+            langB.contains("spanish") -> 7
+            langB.contains("french") -> 8
+            langB.contains("arabic") -> 9
+            langB.contains("portuguese") -> 10
+            langB.contains("russian") -> 11
+            langB.contains("german") -> 12
+            langB.contains("japanese") -> 13
+            langB.contains("korean") -> 14
+            langB.contains("chinese") -> 15
+            else -> 20
+        }
+        if (pA != pB) pA.compareTo(pB) else langA.compareTo(langB)
+    })
+}
 
 
 @Composable
@@ -839,6 +930,7 @@ private fun ArcApp(
         }
 
         if (!isOk) {
+            val friendlyError = formatUserFriendlyError(error)
             currentTrace = CliTrace(
                 action = actionLabel,
                 target = if (result.type == "search") query else input,
@@ -846,13 +938,13 @@ private fun ArcApp(
                 steps = listOf(
                     "Media engine initialized",
                     "Executed task: ${result.type}",
-                    "[ERROR] Execution failed: $error",
+                    "[ERROR] Execution failed: $friendlyError",
                 ),
                 stdoutLogs = logs,
                 status = "Failed",
                 isError = true,
             )
-            message(error)
+            message(friendlyError)
             if (result.type == "resolve") {
                 resolveLoading = false
                 target = target.copy(
@@ -883,6 +975,7 @@ private fun ArcApp(
                                 audios += AudioChoice(audio.optString("language", "Default"), audio.optString("url"))
                             }
                         }
+                        val sortedAudios = prioritizeAudioTracks(audios)
                         resultList += SearchHit(
                             title = item.optString("title", "Untitled"),
                             source = item.optString("source", "Source"),
@@ -891,7 +984,7 @@ private fun ArcApp(
                             providers = item.optJSONArray("providers")?.let { providers ->
                                 (0 until providers.length()).joinToString(" · ") { providerIndex -> providers.optString(providerIndex) }
                             } ?: "",
-                            audio = audios,
+                            audio = sortedAudios,
                             url = item.optString("url", ""),
                             poster = item.optString("poster", ""),
                         )
@@ -906,8 +999,14 @@ private fun ArcApp(
                 val effPreloadHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
                 resultList.take(5).forEach { hit ->
                     scope.launch(Dispatchers.IO) {
-                        val preUrl = hit.audio.firstOrNull()?.url?.ifEmpty { hit.url } ?: hit.url
-                        val prefLang = hit.audio.firstOrNull()?.language.orEmpty()
+                        val sortedAudio = prioritizeAudioTracks(hit.audio)
+                        val prefLang = sortedAudio.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
+                            ?: sortedAudio.firstOrNull { it.language.contains("english", ignoreCase = true) }?.language
+                            ?: sortedAudio.firstOrNull()?.language.orEmpty()
+                        val preUrl = sortedAudio.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.url?.ifEmpty { hit.url }
+                            ?: sortedAudio.firstOrNull { it.language.contains("english", ignoreCase = true) }?.url?.ifEmpty { hit.url }
+                            ?: sortedAudio.firstOrNull()?.url?.ifEmpty { hit.url }
+                            ?: hit.url
                         if (preUrl.isNotBlank() && !preloadedTargets.containsKey(preUrl)) {
                             try {
                                 val prePayload = JSONObject().apply {
@@ -973,7 +1072,7 @@ private fun ArcApp(
                                             streamHeaders = hMap,
                                             isSeries = isSeries,
                                             seasons = seasonsList,
-                                            audioTracks = if (hit.audio.isNotEmpty()) hit.audio else if (aList.isNotEmpty()) aList else emptyList(),
+                                            audioTracks = prioritizeAudioTracks(if (hit.audio.isNotEmpty()) hit.audio else if (aList.isNotEmpty()) aList else emptyList()),
                                             selectedAudioLang = prefLang,
                                             mediaCategory = if (isSeries) "TV SERIES" else "MOVIE",
                                             year = hit.year,
@@ -1097,6 +1196,14 @@ private fun ArcApp(
                     }
                 }
 
+                val sortedTracks = prioritizeAudioTracks(audioTracksList)
+                val effectiveAudioTracks = if (sortedTracks.isNotEmpty()) sortedTracks else prioritizeAudioTracks(target.audioTracks)
+                val preferredLang = target.selectedAudioLang.ifBlank {
+                    effectiveAudioTracks.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
+                        ?: effectiveAudioTracks.firstOrNull { it.language.contains("english", ignoreCase = true) }?.language
+                        ?: effectiveAudioTracks.firstOrNull()?.language.orEmpty()
+                }
+
                 val isExplicitMovie = resolvedTitle.contains("Movie", ignoreCase = true) ||
                     target.title.contains("Movie", ignoreCase = true) ||
                     rawSource.contains("Movie", ignoreCase = true) ||
@@ -1151,7 +1258,8 @@ private fun ArcApp(
                     selectedEpisode = data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode,
                     canStream = finalCanStream,
                     mediaType = finalMediaType,
-                    audioTracks = if (audioTracksList.isNotEmpty()) audioTracksList else target.audioTracks,
+                    audioTracks = effectiveAudioTracks,
+                    selectedAudioLang = preferredLang,
                     year = resolvedYear,
                     mediaCategory = resolvedCategory,
                     providers = resolvedProviders,
@@ -1197,8 +1305,9 @@ private fun ArcApp(
                         message("Download cancelled.")
                     } else if (job != null) {
                         val errMsg = response.optString("error", error.ifBlank { "Download failed." })
+                        val friendlyErr = formatUserFriendlyError(errMsg)
                         jobs = jobs.map { if (it.id == result.jobId) it.copy(status = "Failed") else it }
-                        message("Download failed: $errMsg")
+                        message(friendlyErr)
                     }
                     return
                 }
@@ -1361,6 +1470,13 @@ private fun ArcApp(
             }
             val detectedYear = yearOverride ?: extractYear(titleToUse)
 
+            val sortedChoices = prioritizeAudioTracks(audioChoices)
+            val initialSelectedLang = selectedAudioLang.ifBlank {
+                sortedChoices.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
+                    ?: sortedChoices.firstOrNull { it.language.contains("english", ignoreCase = true) }?.language
+                    ?: sortedChoices.firstOrNull()?.language.orEmpty()
+            }
+
             resolvedUrl = ""
             target = if (isSameShow) {
                 target.copy(
@@ -1370,8 +1486,8 @@ private fun ArcApp(
                     availableQualities = emptyList(),
                     selectedSeason = season ?: target.selectedSeason,
                     selectedEpisode = episode ?: target.selectedEpisode,
-                    audioTracks = if (audioChoices.isNotEmpty()) audioChoices else target.audioTracks,
-                    selectedAudioLang = if (selectedAudioLang.isNotBlank()) selectedAudioLang else target.selectedAudioLang,
+                    audioTracks = if (sortedChoices.isNotEmpty()) sortedChoices else prioritizeAudioTracks(target.audioTracks),
+                    selectedAudioLang = if (initialSelectedLang.isNotBlank()) initialSelectedLang else target.selectedAudioLang,
                 )
             } else {
                 MediaTarget(
@@ -1395,8 +1511,8 @@ private fun ArcApp(
                     selectedEpisode = episode ?: 1,
                     canStream = !isTelegramClean,
                     mediaType = if (isTelegramClean) "file" else "video",
-                    audioTracks = audioChoices,
-                    selectedAudioLang = selectedAudioLang,
+                    audioTracks = sortedChoices,
+                    selectedAudioLang = initialSelectedLang,
                     year = detectedYear,
                     mediaCategory = detectedCategory,
                     providers = providersOverride ?: target.providers,
@@ -1718,14 +1834,25 @@ private fun ArcApp(
                                     onCopyLogs = { copyToClipboard(currentTrace?.stdoutLogs.orEmpty(), "Process logs") },
                                     onBack = ::openHome,
                                     onSelect = { hit, audio ->
-                                        val targetUrl = audio.url.ifEmpty { hit.url }
+                                        val sortedAudios = prioritizeAudioTracks(hit.audio)
+                                        val chosenLang = audio.language.ifBlank {
+                                            sortedAudios.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
+                                                ?: sortedAudios.firstOrNull { it.language.contains("english", ignoreCase = true) }?.language
+                                                ?: sortedAudios.firstOrNull()?.language.orEmpty()
+                                        }
+                                        val targetUrl = audio.url.ifEmpty {
+                                            sortedAudios.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.url
+                                                ?: sortedAudios.firstOrNull { it.language.contains("english", ignoreCase = true) }?.url
+                                                ?: sortedAudios.firstOrNull()?.url
+                                                ?: hit.url
+                                        }
                                         val pre = preloadedTargets[targetUrl] ?: preloadedTargets[hit.url]
                                         if (pre != null) {
                                             selectedQuality = pre.availableQualities.firstOrNull() ?: "Best Available"
                                             audioOnly = false
                                             target = pre.copy(
-                                                audioTracks = if (hit.audio.isNotEmpty()) hit.audio else pre.audioTracks,
-                                                selectedAudioLang = audio.language.ifBlank { pre.selectedAudioLang }
+                                                audioTracks = if (sortedAudios.isNotEmpty()) sortedAudios else prioritizeAudioTracks(pre.audioTracks),
+                                                selectedAudioLang = chosenLang.ifBlank { pre.selectedAudioLang }
                                             )
                                             overlay = "analysis"
                                             homeOverlay = "analysis"
@@ -1737,8 +1864,8 @@ private fun ArcApp(
                                                 value = targetUrl,
                                                 titleOverride = hit.title,
                                                 posterOverride = hit.poster,
-                                                audioChoices = hit.audio,
-                                                selectedAudioLang = audio.language,
+                                                audioChoices = sortedAudios,
+                                                selectedAudioLang = chosenLang,
                                                 mediaCategoryOverride = if (hit.type.contains("SERIES", ignoreCase = true) || hit.type.contains("TV", ignoreCase = true)) "TV SERIES" else "MOVIE",
                                                 yearOverride = hit.year,
                                                 providersOverride = hit.providers,
@@ -1799,7 +1926,12 @@ private fun ArcApp(
                                         )
                                     },
                                     onDownload = {
-                                        if (target.isSeries) {
+                                        val isTelegram = target.source.contains("Telegram", ignoreCase = true) ||
+                                            target.targetUrl.contains("t.me/", ignoreCase = true) ||
+                                            target.targetUrl.contains("telegram.me/", ignoreCase = true)
+                                        if (isTelegram) {
+                                            startDownload(audioLangOverride = target.selectedAudioLang)
+                                        } else if (target.isSeries) {
                                             showSeriesDownloadDialog = true
                                         } else if (target.audioTracks.size > 1 && target.selectedAudioLang.isBlank()) {
                                             pendingActionAfterAudioSelect = "download"
@@ -2662,7 +2794,11 @@ private fun SearchScreen(
 
         items(hits) { hit ->
             val chooseHit = {
-                val chosenAudio = hit.audio.firstOrNull() ?: AudioChoice("Video", hit.url)
+                val sorted = prioritizeAudioTracks(hit.audio)
+                val chosenAudio = sorted.firstOrNull { it.language.contains("hindi", ignoreCase = true) }
+                    ?: sorted.firstOrNull { it.language.contains("english", ignoreCase = true) }
+                    ?: sorted.firstOrNull()
+                    ?: AudioChoice("Video", hit.url)
                 onSelect(hit, chosenAudio)
             }
             Card(
@@ -2751,11 +2887,15 @@ private fun AnalysisScreen(
         Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(target.title)
     )
 
+    val isTelegramTarget = target.source.contains("Telegram", ignoreCase = true) ||
+        target.targetUrl.contains("t.me/", ignoreCase = true) ||
+        target.targetUrl.contains("telegram.me/", ignoreCase = true)
+
     val isYouTubeTarget = target.source.contains("YouTube", ignoreCase = true) ||
         target.targetUrl.contains("youtube.com", ignoreCase = true) ||
         target.targetUrl.contains("youtu.be", ignoreCase = true)
 
-    val isMovieTarget = !isSeriesTarget && !isYouTubeTarget && (
+    val isMovieTarget = !isSeriesTarget && !isYouTubeTarget && !isTelegramTarget && (
         target.title.contains("Movie", ignoreCase = true) ||
         target.mediaCategory.contains("MOVIE", ignoreCase = true) ||
         target.source.contains("Movie", ignoreCase = true) ||
@@ -2774,6 +2914,7 @@ private fun AnalysisScreen(
     val providerBadge = if (target.providers.isNotBlank()) " · ${target.providers}" else ""
 
     val categoryBadge = when {
+        isTelegramTarget -> "TELEGRAM FILE"
         isSeriesTarget -> "TV SERIES$yearBadge$providerBadge"
         isMovieTarget -> "MOVIE$yearBadge$providerBadge"
         isYouTubeTarget -> "YOUTUBE"
@@ -2910,15 +3051,20 @@ private fun AnalysisScreen(
             }
         }
 
-        // Multiple Audio Tracks selector if movie or series has multiple languages
-        if (!loading && target.audioTracks.size > 1) {
+        // Audio Tracks selector: visible immediately when audio tracks exist, even while loading
+        if (target.audioTracks.isNotEmpty()) {
             item {
-                val currentLang = target.selectedAudioLang.ifBlank { "Not selected (Tap to choose)" }
+                val sortedTracks = remember(target.audioTracks) { prioritizeAudioTracks(target.audioTracks) }
+                val currentLang = target.selectedAudioLang.ifBlank {
+                    sortedTracks.firstOrNull { it.language.contains("hindi", ignoreCase = true) }?.language
+                        ?: sortedTracks.firstOrNull { it.language.contains("english", ignoreCase = true) }?.language
+                        ?: sortedTracks.firstOrNull()?.language.orEmpty()
+                }
                 SectionHeader("Audio Language", currentLang)
                 Spacer(Modifier.height(6.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(target.audioTracks) { aChoice ->
-                        val isAudioSelected = target.selectedAudioLang.isNotBlank() && aChoice.language.equals(target.selectedAudioLang, ignoreCase = true)
+                    items(sortedTracks) { aChoice ->
+                        val isAudioSelected = aChoice.language.equals(currentLang, ignoreCase = true)
                         FilterChip(
                             selected = isAudioSelected,
                             onClick = {
@@ -3065,7 +3211,7 @@ private fun AnalysisScreen(
                 }
             }
 
-            if (displayQualities.isNotEmpty()) {
+            if (!isTelegramTarget && displayQualities.isNotEmpty()) {
                 item {
                     SectionHeader(if (audioOnly) "Audio Quality" else "Video Quality")
                     Spacer(Modifier.height(8.dp))
@@ -3130,10 +3276,57 @@ private fun AnalysisScreen(
                 target.qualityUrls.isNotEmpty() ||
                 target.isPlaylist ||
                 target.targetUrl.startsWith("magnet:", ignoreCase = true) ||
-                target.targetUrl.contains("t.me/", ignoreCase = true) ||
-                target.targetUrl.contains("telegram.me/", ignoreCase = true)
+                isTelegramTarget
 
-            if (!hasResolvedMedia) {
+            if (isTelegramTarget) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, Color(0xFF2B2B2B)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(46.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFF229ED9).copy(alpha = 0.15f)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Outlined.Send,
+                                    contentDescription = "Telegram",
+                                    tint = Color(0xFF229ED9),
+                                    modifier = Modifier.size(24.dp),
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Telegram Media File", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = ArcWhite)
+                                Text("Direct Telegram cloud download to device storage", fontSize = 11.sp, color = ArcMuted)
+                            }
+                        }
+                    }
+                }
+                item {
+                    Button(
+                        onClick = onDownload,
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                        shape = RoundedCornerShape(15.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                    ) {
+                        Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Download from Telegram", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                }
+            } else if (!hasResolvedMedia) {
                 item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = ArcSurface),
@@ -3808,6 +4001,14 @@ private fun SaveLocationDialog(
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     colors = arcTextFieldColors(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(
+                        onDone = {
+                            if (inputPath.isNotBlank()) {
+                                onPathSelected(inputPath)
+                            }
+                        }
+                    ),
                 )
             }
         },
@@ -4059,7 +4260,135 @@ private fun TelegramAuthDialog(
                 statusText = "Scan with your phone or tap below to link"
             } else {
                 isError = true
-                statusText = res?.optString("error") ?: "Failed to generate QR token"
+                statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to generate QR token")
+            }
+        }
+    }
+
+    val sendPhoneCode = {
+        if (!isLoading && phoneInput.length >= 8) {
+            isLoading = true
+            statusText = "Sending verification code..."
+            isError = false
+            scope.launch {
+                val payload = JSONObject().apply {
+                    put("action", "telegram_send_code")
+                    put("api_id", defaultApiId)
+                    put("api_hash", defaultApiHash)
+                    put("phone", phoneInput)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                }
+                isLoading = false
+                if (res != null && res.optBoolean("ok", false)) {
+                    val rObj = res.optJSONObject("result")
+                    phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
+                    phoneStep = 1
+                    statusText = "Code sent to your Telegram app!"
+                } else {
+                    isError = true
+                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to send code")
+                }
+            }
+        }
+    }
+
+    val signInWithCode = {
+        if (!isLoading && codeInput.isNotBlank()) {
+            isLoading = true
+            statusText = "Signing in..."
+            isError = false
+            scope.launch {
+                val payload = JSONObject().apply {
+                    put("action", "telegram_sign_in")
+                    put("phone", phoneInput)
+                    put("code", codeInput)
+                    put("phone_code_hash", phoneCodeHash)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                }
+                isLoading = false
+                if (res != null && res.optBoolean("ok", false)) {
+                    val rObj = res.optJSONObject("result")
+                    if (rObj?.optBoolean("need_password", false) == true) {
+                        phoneStep = 2
+                        statusText = "Two-step verification password required."
+                    } else {
+                        val sess = rObj?.optString("session").orEmpty()
+                        val u = rObj?.optString("user").orEmpty()
+                        val p = rObj?.optString("phone").orEmpty()
+                        onSave(defaultApiId, defaultApiHash, sess, u, p)
+                    }
+                } else {
+                    isError = true
+                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Sign in failed")
+                }
+            }
+        }
+    }
+
+    val submitPassword = {
+        if (!isLoading && passwordInput.isNotBlank()) {
+            isLoading = true
+            statusText = "Verifying password..."
+            isError = false
+            scope.launch {
+                val payload = JSONObject().apply {
+                    put("action", "telegram_password")
+                    put("phone", phoneInput)
+                    put("session_key", qrSessionKey)
+                    put("password", passwordInput)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                }
+                isLoading = false
+                if (res != null && res.optBoolean("ok", false)) {
+                    val rObj = res.optJSONObject("result")
+                    val sess = rObj?.optString("session").orEmpty()
+                    val u = rObj?.optString("user").orEmpty()
+                    val p = rObj?.optString("phone").orEmpty()
+                    onSave(defaultApiId, defaultApiHash, sess, u, p)
+                } else {
+                    isError = true
+                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Invalid password")
+                }
+            }
+        }
+    }
+
+    val connectSession = {
+        if (!isLoading && rawSessionInput.length > 20) {
+            isLoading = true
+            statusText = "Verifying string session..."
+            isError = false
+            scope.launch {
+                var cleanSess = rawSessionInput.replace(Regex("""\s+"""), "").trim()
+                val pad = cleanSess.length % 4
+                if (pad != 0) {
+                    cleanSess += "=".repeat(4 - pad)
+                }
+                val payload = JSONObject().apply {
+                    put("action", "telegram_check")
+                    put("api_id", defaultApiId)
+                    put("api_hash", defaultApiHash)
+                    put("session", cleanSess)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
+                }
+                isLoading = false
+                if (res != null && res.optBoolean("ok", false)) {
+                    val rObj = res.optJSONObject("result")
+                    val u = rObj?.optString("user", "Account Verified") ?: "Verified"
+                    val p = rObj?.optString("phone", "") ?: ""
+                    onSave(defaultApiId, defaultApiHash, cleanSess, u, p)
+                } else {
+                    isError = true
+                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Connection failed")
+                }
             }
         }
     }
@@ -4074,7 +4403,12 @@ private fun TelegramAuthDialog(
             Text("Telegram Login", fontWeight = FontWeight.Bold, fontSize = 18.sp)
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 // Tab Row
                 Row(
                     modifier = Modifier
@@ -4124,36 +4458,18 @@ private fun TelegramAuthDialog(
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = arcTextFieldColors(),
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Phone,
+                                        imeAction = ImeAction.Send,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onSend = { sendPhoneCode() }
+                                    ),
                                 )
                                 Button(
-                                    onClick = {
-                                        isLoading = true
-                                        statusText = "Sending verification code..."
-                                        isError = false
-                                        scope.launch {
-                                            val payload = JSONObject().apply {
-                                                put("action", "telegram_send_code")
-                                                put("api_id", defaultApiId)
-                                                put("api_hash", defaultApiHash)
-                                                put("phone", phoneInput)
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                                            }
-                                            isLoading = false
-                                            if (res != null && res.optBoolean("ok", false)) {
-                                                val rObj = res.optJSONObject("result")
-                                                phoneCodeHash = rObj?.optString("phone_code_hash").orEmpty()
-                                                phoneStep = 1
-                                                statusText = "Code sent to your Telegram app!"
-                                            } else {
-                                                isError = true
-                                                statusText = res?.optString("error") ?: "Failed to send code"
-                                            }
-                                        }
-                                    },
+                                    onClick = sendPhoneCode,
                                     enabled = !isLoading && phoneInput.length >= 8,
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth().height(48.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
                                     shape = RoundedCornerShape(10.dp),
                                 ) {
@@ -4169,42 +4485,18 @@ private fun TelegramAuthDialog(
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = arcTextFieldColors(),
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Number,
+                                        imeAction = ImeAction.Done,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onDone = { signInWithCode() }
+                                    ),
                                 )
                                 Button(
-                                    onClick = {
-                                        isLoading = true
-                                        statusText = "Signing in..."
-                                        isError = false
-                                        scope.launch {
-                                            val payload = JSONObject().apply {
-                                                put("action", "telegram_sign_in")
-                                                put("phone", phoneInput)
-                                                put("code", codeInput)
-                                                put("phone_code_hash", phoneCodeHash)
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                                            }
-                                            isLoading = false
-                                            if (res != null && res.optBoolean("ok", false)) {
-                                                val rObj = res.optJSONObject("result")
-                                                if (rObj?.optBoolean("need_password", false) == true) {
-                                                    phoneStep = 2
-                                                    statusText = "Two-step verification password required."
-                                                } else {
-                                                    val sess = rObj?.optString("session").orEmpty()
-                                                    val u = rObj?.optString("user").orEmpty()
-                                                    val p = rObj?.optString("phone").orEmpty()
-                                                    onSave(defaultApiId, defaultApiHash, sess, u, p)
-                                                }
-                                            } else {
-                                                isError = true
-                                                statusText = res?.optString("error") ?: "Sign in failed"
-                                            }
-                                        }
-                                    },
+                                    onClick = signInWithCode,
                                     enabled = !isLoading && codeInput.isNotBlank(),
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth().height(48.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
                                     shape = RoundedCornerShape(10.dp),
                                 ) {
@@ -4237,15 +4529,15 @@ private fun TelegramAuthDialog(
                                                     statusText = "New code sent to your Telegram app!"
                                                 } else {
                                                     isError = true
-                                                    statusText = res?.optString("error") ?: "Failed to resend code"
+                                                    statusText = formatUserFriendlyError(res?.optString("error") ?: "Failed to resend code")
                                                 }
                                             }
                                         },
                                         enabled = !isLoading,
-                                        modifier = Modifier.weight(1f),
+                                        modifier = Modifier.weight(1f).height(44.dp),
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text("Resend Code", fontSize = 11.sp)
+                                        Text("Resend Code", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                                     }
 
                                     OutlinedButton(
@@ -4256,10 +4548,10 @@ private fun TelegramAuthDialog(
                                             isError = false
                                         },
                                         enabled = !isLoading,
-                                        modifier = Modifier.weight(1f),
+                                        modifier = Modifier.weight(1f).height(44.dp),
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text("Change Phone", fontSize = 11.sp)
+                                        Text("Change Phone", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                                     }
                                 }
                             }
@@ -4272,37 +4564,18 @@ private fun TelegramAuthDialog(
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = arcTextFieldColors(),
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Password,
+                                        imeAction = ImeAction.Done,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onDone = { submitPassword() }
+                                    ),
                                 )
                                 Button(
-                                    onClick = {
-                                        isLoading = true
-                                        statusText = "Verifying password..."
-                                        isError = false
-                                        scope.launch {
-                                            val payload = JSONObject().apply {
-                                                put("action", "telegram_password")
-                                                put("phone", phoneInput)
-                                                put("session_key", qrSessionKey)
-                                                put("password", passwordInput)
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                                            }
-                                            isLoading = false
-                                            if (res != null && res.optBoolean("ok", false)) {
-                                                val rObj = res.optJSONObject("result")
-                                                val sess = rObj?.optString("session").orEmpty()
-                                                val u = rObj?.optString("user").orEmpty()
-                                                val p = rObj?.optString("phone").orEmpty()
-                                                onSave(defaultApiId, defaultApiHash, sess, u, p)
-                                            } else {
-                                                isError = true
-                                                statusText = res?.optString("error") ?: "Invalid password"
-                                            }
-                                        }
-                                    },
+                                    onClick = submitPassword,
                                     enabled = !isLoading && passwordInput.isNotBlank(),
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth().height(48.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
                                     shape = RoundedCornerShape(10.dp),
                                 ) {
@@ -4316,10 +4589,10 @@ private fun TelegramAuthDialog(
                                         isError = false
                                     },
                                     enabled = !isLoading,
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth().height(44.dp),
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
-                                    Text("Back", fontSize = 11.sp)
+                                    Text("Back", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
@@ -4379,7 +4652,7 @@ private fun TelegramAuthDialog(
                                             context.startActivity(i)
                                         } catch (_: Exception) {}
                                     },
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth().height(48.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
                                     shape = RoundedCornerShape(10.dp),
                                 ) {
@@ -4389,10 +4662,10 @@ private fun TelegramAuthDialog(
                             OutlinedButton(
                                 onClick = { initQr() },
                                 enabled = !isLoading && !qrLoading,
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier.fillMaxWidth().height(44.dp),
                                 shape = RoundedCornerShape(10.dp),
                             ) {
-                                Text("Refresh QR Code", fontSize = 11.sp)
+                                Text("Refresh QR Code", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
@@ -4409,41 +4682,17 @@ private fun TelegramAuthDialog(
                                 maxLines = 4,
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = arcTextFieldColors(),
+                                keyboardOptions = KeyboardOptions(
+                                    imeAction = ImeAction.Done,
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onDone = { connectSession() }
+                                ),
                             )
                             Button(
-                                onClick = {
-                                    isLoading = true
-                                    statusText = "Verifying string session..."
-                                    isError = false
-                                    scope.launch {
-                                        var cleanSess = rawSessionInput.replace(Regex("""\s+"""), "").trim()
-                                        val pad = cleanSess.length % 4
-                                        if (pad != 0) {
-                                            cleanSess += "=".repeat(4 - pad)
-                                        }
-                                        val payload = JSONObject().apply {
-                                            put("action", "telegram_check")
-                                            put("api_id", defaultApiId)
-                                            put("api_hash", defaultApiHash)
-                                            put("session", cleanSess)
-                                        }
-                                        val res = withContext(Dispatchers.IO) {
-                                            runCatching { EmbeddedEngine.execute(context, payload) }.getOrNull()
-                                        }
-                                        isLoading = false
-                                        if (res != null && res.optBoolean("ok", false)) {
-                                            val rObj = res.optJSONObject("result")
-                                            val u = rObj?.optString("user", "Account Verified") ?: "Verified"
-                                            val p = rObj?.optString("phone", "") ?: ""
-                                            onSave(defaultApiId, defaultApiHash, cleanSess, u, p)
-                                        } else {
-                                            isError = true
-                                            statusText = res?.optString("error") ?: "Connection failed"
-                                        }
-                                    }
-                                },
+                                onClick = connectSession,
                                 enabled = !isLoading && rawSessionInput.length > 20,
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier.fillMaxWidth().height(48.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
                                 shape = RoundedCornerShape(10.dp),
                             ) {
