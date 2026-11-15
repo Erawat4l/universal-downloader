@@ -1284,11 +1284,13 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'nopart': True,
         'noplaylist': True,
         'windowsfilenames': True,
-        'socket_timeout': 15,
-        'retries': 5,
-        'fragment_retries': 10,
+        'socket_timeout': 30,
+        'retries': 20,
+        'fragment_retries': 20,
         'file_access_retries': 5,
         'concurrent_fragment_downloads': 16,
+        'buffersize': 1024 * 64,
+        'http_chunk_size': 10485760,
         'logger': NetworkAwareLogger(),
     }
 
@@ -1540,7 +1542,7 @@ def mux_video_and_audio(video_path, audio_path, output_path):
         except Exception: pass
     return False
 
-def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None):
+def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None):
     if not HAS_YTDLP:
         print("[WARN] yt-dlp is not installed. Falling back to generic download...")
         return False
@@ -1652,6 +1654,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 else:
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
 
+    stage_dir = None
     if is_playlist:
         p_title = clean_filename(out_name or 'YouTube Playlist')
         playlist_dir = os.path.join(out_dir, p_title)
@@ -1659,14 +1662,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         out_dir = playlist_dir
         outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
     else:
+        stage_dir = os.path.join(out_dir, ".arc_stage")
+        os.makedirs(stage_dir, exist_ok=True)
         if out_name and not any(out_name.lower().startswith(p) for p in ('youtube video', 'video', 'download', 'stream')):
             clean_base = clean_filename(out_name, default_ext="")
-            outtmpl_pattern = os.path.join(out_dir, f"{clean_base}.%(ext)s")
+            outtmpl_pattern = os.path.join(stage_dir, f"{clean_base}.%(ext)s")
         else:
-            outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
+            outtmpl_pattern = os.path.join(stage_dir, '%(title)s.%(ext)s')
+
+    clean_audio_lang = str(audio_lang or "").strip().lower()
+    if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
+        audio_sel = f"bestaudio[language^={clean_audio_lang[:2]}][ext=m4a]/bestaudio[format_note*={clean_audio_lang}][ext=m4a]/bestaudio[language^={clean_audio_lang[:2]}]/bestaudio[format_note*={clean_audio_lang}]/bestaudio[ext=m4a]/bestaudio"
+    else:
+        audio_sel = "bestaudio[ext=m4a]/bestaudio"
 
     if is_audio_only:
-        format_spec = "bestaudio[ext=m4a]/bestaudio/best"
+        format_spec = f"{audio_sel}/best"
     else:
         q_text = str(quality_arg or "").lower()
         q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
@@ -1674,29 +1685,29 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             cap = int(q_match.group(1))
             if cap <= 1080:
                 format_spec = (
-                    f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={cap}][vcodec^=avc]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={cap}]+bestaudio/"
+                    f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
+                    f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
+                    f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
+                    f"bestvideo[height<={cap}]+{audio_sel}/"
                     f"best[height<={cap}][vcodec^=avc]/"
                     f"best[height<={cap}]/"
                     f"best"
                 )
             else:
                 format_spec = (
-                    f"bestvideo[height<={cap}][ext=webm]+bestaudio[ext=webm]/"
-                    f"bestvideo[height<={cap}][vcodec^=vp9]+bestaudio[ext=webm]/"
-                    f"bestvideo[height<={cap}]+bestaudio/"
+                    f"bestvideo[height<={cap}][ext=webm]+{audio_sel}/"
+                    f"bestvideo[height<={cap}][vcodec^=vp9]+{audio_sel}/"
+                    f"bestvideo[height<={cap}]+{audio_sel}/"
                     f"best"
                 )
         else:
             format_spec = (
-                "bestvideo[height<=1080][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/"
-                "best[vcodec!=none][acodec!=none]/"
-                "best"
+                f"bestvideo[height<=1080][vcodec^=avc][ext=mp4]+{audio_sel}/"
+                f"bestvideo[height<=1080][ext=mp4]+{audio_sel}/"
+                f"bestvideo[vcodec^=avc]+{audio_sel}/"
+                f"bestvideo+{audio_sel}/"
+                f"best[vcodec!=none][acodec!=none]/"
+                f"best"
             )
 
     print(f"> Direct YouTube download [{format_spec}]...")
@@ -1709,6 +1720,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'extractor_args': {'youtube': {'player_client': ['visionos', 'android'], 'skip': ['webpage', 'configs']}},
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
         'nopart': True,
+        'socket_timeout': 30,
+        'retries': 20,
+        'fragment_retries': 20,
+        'http_chunk_size': 10485760,
     }, cookie=cookie)
 
     max_attempts = 5
@@ -1746,8 +1761,15 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         else:
                             raise RuntimeError(f"Downloaded media file not found on device: {filename}")
 
-                # Ensure clean filename (strip random IDs in brackets, format tags, version suffixes)
-                if filename and os.path.exists(filename) and os.path.isfile(filename):
+                # Move from stage_dir to out_dir and ensure clean filename
+                if stage_dir and filename and os.path.exists(filename) and os.path.isfile(filename):
+                    cur_dir, cur_fn = os.path.split(filename)
+                    cleaned_fn = clean_filename(cur_fn)
+                    final_dest = os.path.join(out_dir, cleaned_fn)
+                    safe_move(filename, final_dest)
+                    filename = final_dest
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                elif filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
                     cleaned_fn = clean_filename(cur_fn)
                     if cleaned_fn != cur_fn:
@@ -1762,6 +1784,8 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             return filename
         except Exception as e:
+            if stage_dir and os.path.exists(stage_dir):
+                shutil.rmtree(stage_dir, ignore_errors=True)
             if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
                 if ytdl_stage and os.path.exists(ytdl_stage):
                     shutil.rmtree(ytdl_stage, ignore_errors=True)
@@ -4418,11 +4442,11 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
         last_err = None
 
         client_attempts = [
-            ['visionos', 'android'],
-            ['android', 'ios'],
-            ['tv', 'mweb'],
-            ['web', 'default'],
             None,
+            ['android', 'ios'],
+            ['web', 'default'],
+            ['visionos', 'android'],
+            ['tv', 'mweb'],
         ]
 
         safari_headers = {
@@ -4488,13 +4512,13 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
             f for f in formats
             if isinstance(f, dict) and f.get("url") and
                ('m3u8' in f.get('protocol', '') or 'm3u8' in str(f.get('url', '')) or 'manifest/hls_playlist' in str(f.get('url', ''))) and
-               f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')
+               f.get('vcodec') in (None, 'none') and
+               (f.get('resolution') == 'audio only' or f.get('height') in (None, 0))
         ]
         hls_audio_fmt = None
         for af in hls_audio_formats:
-            lang = str(af.get('language') or '').lower()
-            note = str(af.get('format_note') or '').lower()
-            if 'en' in lang or 'default' in note or 'original' in note:
+            lang = str(af.get('language') or af.get('format_note') or '').lower()
+            if 'en' in lang or 'default' in lang or 'original' in lang:
                 hls_audio_fmt = af
                 break
         if not hls_audio_fmt and hls_audio_formats:
@@ -4591,11 +4615,26 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
                     bw = int((v_fmt.get('tbr') or (target_h * 3.5)) * 1000)
                     a_url = hls_audio_fmt['url']
                     v_url = v_fmt['url']
+                    media_audio_lines = []
+                    seen_langs = set()
+                    for af in hls_audio_formats:
+                        lang = str(af.get('language') or af.get('format_note') or 'Audio').strip().capitalize()
+                        if lang in seen_langs:
+                            continue
+                        seen_langs.add(lang)
+                        is_def = "YES" if (af == hls_audio_fmt) else "NO"
+                        media_audio_lines.append(
+                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{lang}",DEFAULT={is_def},AUTOSELECT=YES,URI="{af["url"]}"'
+                        )
+                    if not media_audio_lines:
+                        media_audio_lines.append(
+                            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"'
+                        )
                     master_m3u8 = (
                         "#EXTM3U\n"
                         "#EXT-X-VERSION:3\n"
-                        "#EXT-X-INDEPENDENT-SEGMENTS\n"
-                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="{a_url}"\n'
+                        "#EXT-X-INDEPENDENT-SEGMENTS\n" +
+                        "\n".join(media_audio_lines) + "\n" +
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},AUDIO="audio"\n'
                         f'{v_url}\n'
                     )
@@ -4634,12 +4673,53 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
             for a_lbl in ["Best Audio (320kbps)", "High Audio (256kbps)", "Standard Audio (192kbps)", "Compact Audio (128kbps)", "Audio Only"]:
                 quality_urls_map[a_lbl] = best_audio_url
 
+        audio_choices = []
+        seen_langs = set()
+        for af in hls_audio_formats:
+            lang_code = str(af.get('language') or '').lower()
+            note = str(af.get('format_note') or '')
+            if lang_code:
+                if 'en' in lang_code: lang_display = 'English'
+                elif 'hi' in lang_code: lang_display = 'Hindi'
+                elif 'es' in lang_code: lang_display = 'Spanish'
+                elif 'fr' in lang_code: lang_display = 'French'
+                elif 'de' in lang_code: lang_display = 'German'
+                elif 'ja' in lang_code: lang_display = 'Japanese'
+                elif 'ko' in lang_code: lang_display = 'Korean'
+                elif 'pt' in lang_code: lang_display = 'Portuguese'
+                elif 'ru' in lang_code: lang_display = 'Russian'
+                elif 'zh' in lang_code: lang_display = 'Chinese'
+                elif 'ar' in lang_code: lang_display = 'Arabic'
+                else: lang_display = lang_code.upper()
+            elif 'default' in note.lower() or 'original' in note.lower():
+                lang_display = 'Original'
+            else:
+                lang_display = note.strip().capitalize() or 'Audio'
+
+            if lang_display in seen_langs:
+                continue
+            seen_langs.add(lang_display)
+            audio_choices.append({
+                "language": lang_display,
+                "url": url,
+            })
+
         stream_url = None
         if clean_quality in quality_urls_map:
             stream_url = quality_urls_map[clean_quality]
-        elif quality_urls_map.get("Best Available"):
+        else:
+            clean_q_lower = clean_quality.lower()
+            for q_key, q_val in quality_urls_map.items():
+                if clean_q_lower in q_key.lower() or \
+                   (clean_q_lower.startswith("1080") and "1080" in q_key) or \
+                   (clean_q_lower.startswith("720") and "720" in q_key) or \
+                   (clean_q_lower.startswith("480") and "480" in q_key) or \
+                   (clean_q_lower.startswith("360") and "360" in q_key):
+                    stream_url = q_val
+                    break
+        if not stream_url and quality_urls_map.get("Best Available"):
             stream_url = quality_urls_map["Best Available"]
-        elif progressive:
+        elif not stream_url and progressive:
             progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
             stream_url = progressive_sorted[0].get("url")
         else:
@@ -4671,6 +4751,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None):
             "quality": clean_quality,
             "qualities": real_qualities,
             "quality_urls": quality_urls_map,
+            "audios": audio_choices,
             "audio_only": False,
             "can_stream": True,
             "media_type": "video",
@@ -4878,6 +4959,7 @@ def app_download(payload):
             job_id=CURRENT_DOWNLOAD_JOB_ID,
             cache_dir=cache_dir,
             out_name=out_name or title,
+            audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang") or payload.get("audio"),
         )
 
     # Priority 4: Telegram media

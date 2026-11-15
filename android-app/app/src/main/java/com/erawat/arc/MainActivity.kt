@@ -273,6 +273,7 @@ private data class MediaTarget(
     val selectedAudioLang: String = "",
     val year: String = "",
     val mediaCategory: String = "",
+    val providers: String = "",
 )
 
 private fun extractYear(title: String, yearProp: String = ""): String {
@@ -970,6 +971,24 @@ private fun ArcApp(
                 val canStream = data?.optBoolean("can_stream", true) ?: true
                 val mediaType = data?.optString("media_type", if (canStream) "video" else "file") ?: (if (canStream) "video" else "file")
                 val resolvedYear = data?.optString("year").takeUnless { it.isNullOrBlank() } ?: extractYear(resolvedTitle, target.year)
+                val resolvedProviders = data?.optJSONArray("providers")?.let { providers ->
+                    (0 until providers.length()).joinToString(" · ") { providers.optString(it) }
+                }?.takeUnless { it.isBlank() } ?: target.providers
+
+                val audioTracksList = mutableListOf<AudioChoice>()
+                val aArray = data?.optJSONArray("audios")
+                if (aArray != null) {
+                    for (i in 0 until aArray.length()) {
+                        val aObj = aArray.optJSONObject(i) ?: continue
+                        audioTracksList.add(
+                            AudioChoice(
+                                language = aObj.optString("language", "Default"),
+                                url = aObj.optString("url", target.targetUrl)
+                            )
+                        )
+                    }
+                }
+
                 val isExplicitMovie = resolvedTitle.contains("Movie", ignoreCase = true) ||
                     target.title.contains("Movie", ignoreCase = true) ||
                     rawSource.contains("Movie", ignoreCase = true) ||
@@ -1018,8 +1037,10 @@ private fun ArcApp(
                     selectedEpisode = data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode,
                     canStream = canStream,
                     mediaType = mediaType,
+                    audioTracks = if (audioTracksList.isNotEmpty()) audioTracksList else target.audioTracks,
                     year = resolvedYear,
                     mediaCategory = resolvedCategory,
+                    providers = resolvedProviders,
                 )
                 val initS = target.selectedSeason
                 val initEp = target.selectedEpisode
@@ -1115,6 +1136,7 @@ private fun ArcApp(
         selectedAudioLang: String = "",
         mediaCategoryOverride: String? = null,
         yearOverride: String? = null,
+        providersOverride: String? = null,
     ) {
         val clean = value.trim()
         if (clean.isEmpty()) {
@@ -1196,6 +1218,7 @@ private fun ArcApp(
                     selectedAudioLang = selectedAudioLang,
                     year = detectedYear,
                     mediaCategory = detectedCategory,
+                    providers = providersOverride ?: target.providers,
                 )
             }
             overlay = "analysis"
@@ -1303,6 +1326,9 @@ private fun ArcApp(
             put("title", finalTitle)
             put("quality", if (isAudio) "audio" else if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
             put("audio_only", isAudio)
+            if (target.selectedAudioLang.isNotBlank()) {
+                put("audio_lang", target.selectedAudioLang)
+            }
             put("target_dir", downloadPath)
             put("cache_dir", context.cacheDir.absolutePath)
             put("job_id", job.id)
@@ -1504,6 +1530,7 @@ private fun ArcApp(
                                             selectedAudioLang = audio.language,
                                             mediaCategoryOverride = if (hit.type.contains("SERIES", ignoreCase = true) || hit.type.contains("TV", ignoreCase = true)) "TV SERIES" else "MOVIE",
                                             yearOverride = hit.year,
+                                            providersOverride = hit.providers,
                                         )
                                     },
                                 )
@@ -1556,6 +1583,7 @@ private fun ArcApp(
                                             selectedAudioLang = audio.language,
                                             mediaCategoryOverride = target.mediaCategory,
                                             yearOverride = target.year,
+                                            providersOverride = target.providers,
                                         )
                                     },
                                     onDownload = {
@@ -2356,9 +2384,13 @@ private fun SearchScreen(
                         Spacer(Modifier.width(11.dp))
                         Column(Modifier.weight(1f)) {
                             Text(hit.title, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            val srcTag = if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) " · ${hit.source}" else ""
-                            Text("${hit.type}${if (hit.year.isNotBlank()) " · ${hit.year}" else ""}$srcTag", color = ArcMuted, fontSize = 11.sp)
-                            if (hit.providers.isNotBlank()) Text(hit.providers, color = ArcSubtle, fontSize = 10.sp)
+                            val metaParts = buildList {
+                                add(hit.type)
+                                if (hit.year.isNotBlank()) add(hit.year)
+                                if (hit.providers.isNotBlank()) add(hit.providers)
+                                if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
+                            }
+                            Text(metaParts.joinToString(" · "), color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
@@ -2442,14 +2474,15 @@ private fun AnalysisScreen(
 
     val yearStr = extractYear(target.title, target.year)
     val yearBadge = if (yearStr.isNotBlank()) " · $yearStr" else ""
+    val providerBadge = if (target.providers.isNotBlank()) " · ${target.providers}" else ""
 
     val categoryBadge = when {
-        isSeriesTarget -> "TV SERIES$yearBadge"
-        isMovieTarget -> "MOVIE$yearBadge"
+        isSeriesTarget -> "TV SERIES$yearBadge$providerBadge"
+        isMovieTarget -> "MOVIE$yearBadge$providerBadge"
         isYouTubeTarget -> "YOUTUBE"
-        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) -> "${target.source.uppercase()}$yearBadge"
+        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) -> "${target.source.uppercase()}$yearBadge$providerBadge"
         target.mediaType == "file" || !target.canStream -> "FILE"
-        else -> "MOVIE$yearBadge"
+        else -> "MOVIE$yearBadge$providerBadge"
     }
 
     val headerTitle = cleanShowTitle(target.title).ifBlank { target.title.ifBlank { "Resolving link..." } }
@@ -3298,10 +3331,10 @@ private fun SettingsScreen(
                                         .background(Color(0xFF4CAF50))
                                 )
                             }
-                            Text(telegramUserPhone.ifBlank { "Connected · Ready for downloads" }, color = ArcMuted, fontSize = 11.sp)
+                            Text(telegramUserPhone.ifBlank { "Connected · Ready for downloads" }, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         } else {
                             Text("Telegram", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                            Text("Connect for direct Telegram media downloads", color = ArcMuted, fontSize = 11.sp)
+                            Text("Direct Telegram media downloads", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     if (telegramSession.isNotBlank()) {
