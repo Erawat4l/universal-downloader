@@ -414,7 +414,9 @@ def number_and_send_artifact(artifact: Path, build_num: int) -> Path:
                 transferred = True
                 break
         if not transferred:
-            say("Dell desktop currently offline/asleep. Transfer enqueued via tt -w.")
+            say("Dell desktop currently offline/asleep. Enqueueing transfer via tt send 3 -w...")
+            if tt and Path(tt).exists():
+                subprocess.Popen([tt, "send", "3", str(send_target), "-w"])
     except Exception as e:
         say(f"Dell desktop transfer notice: {e}")
 

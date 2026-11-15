@@ -1835,7 +1835,6 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'quiet': False,
         'no_warnings': True,
         'progress_hooks': [ytdlp_progress_hook],
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios'], 'skip': ['webpage', 'configs']}},
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
         'nopart': True,
         'socket_timeout': 30,
@@ -1991,12 +1990,19 @@ def _get_fallback_tg_creds():
     api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
     session = os.environ.get("TELEGRAM_SESSION", "").strip()
     if not (api_id and api_hash and session):
-        for p in [
+        paths_to_check = [
             os.path.join(os.path.dirname(__file__), "credentials.local.json"),
             os.path.join(os.path.dirname(__file__), "assets", "credentials.local.json"),
             os.path.expanduser("~/.telegram_credentials.json"),
-        ]:
-            if os.path.exists(p):
+            os.path.join(os.environ.get("HOME", ""), ".telegram_credentials.json"),
+            "/data/data/com.erawat.arc/files/telegram_credentials.json",
+            "/data/user/0/com.erawat.arc/files/telegram_credentials.json",
+        ]
+        files_dir = getattr(sys, "_arc_files_dir", None)
+        if files_dir:
+            paths_to_check.insert(0, os.path.join(files_dir, "telegram_credentials.json"))
+        for p in paths_to_check:
+            if p and os.path.exists(p):
                 try:
                     with open(p, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -2006,6 +2012,44 @@ def _get_fallback_tg_creds():
                 except Exception:
                     pass
     return api_id, api_hash, session
+
+def _save_fallback_tg_creds(api_id, api_hash, session):
+    targets = [
+        os.path.expanduser("~/.telegram_credentials.json"),
+        os.path.join(os.environ.get("HOME", ""), ".telegram_credentials.json"),
+        "/data/data/com.erawat.arc/files/telegram_credentials.json",
+        "/data/user/0/com.erawat.arc/files/telegram_credentials.json",
+    ]
+    files_dir = getattr(sys, "_arc_files_dir", None)
+    if files_dir:
+        targets.insert(0, os.path.join(files_dir, "telegram_credentials.json"))
+    payload = {"api_id": str(api_id), "api_hash": str(api_hash), "session": str(session)}
+    for t in targets:
+        try:
+            d = os.path.dirname(t)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+            with open(t, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception:
+            pass
+
+def _clear_fallback_tg_creds():
+    targets = [
+        os.path.expanduser("~/.telegram_credentials.json"),
+        os.path.join(os.environ.get("HOME", ""), ".telegram_credentials.json"),
+        "/data/data/com.erawat.arc/files/telegram_credentials.json",
+        "/data/user/0/com.erawat.arc/files/telegram_credentials.json",
+    ]
+    files_dir = getattr(sys, "_arc_files_dir", None)
+    if files_dir:
+        targets.insert(0, os.path.join(files_dir, "telegram_credentials.json"))
+    for t in targets:
+        try:
+            if os.path.exists(t):
+                os.remove(t)
+        except Exception:
+            pass
 
 def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, job_id=None):
     jid = job_id or get_current_job_id()
@@ -2075,12 +2119,22 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         mb_done = current / (1024 * 1024)
                         render_download_progress(100.0, f"{mb_done:.1f}MB", job_id=jid)
 
+                # Resolve chat / username peer upfront
+                resolved_chat_id = chat_id
+                if isinstance(chat_id, str) and not chat_id.lstrip('-').isdigit():
+                    try:
+                        resolved_chat = await app.get_chat(chat_id)
+                        if resolved_chat and resolved_chat.id:
+                            resolved_chat_id = resolved_chat.id
+                    except Exception as rc_err:
+                        print(f"[DEBUG] Username get_chat notice for @{chat_id}: {rc_err}")
+
                 # Prime peer cache if needed so private channels have their access_hash cached in memory
                 if chat_id:
                     try:
                         import pyrogram.raw as raw
                         try:
-                            await app.storage.get_peer_by_id(chat_id)
+                            await app.storage.get_peer_by_id(resolved_chat_id)
                         except KeyError:
                             r = await app.invoke(
                                 raw.functions.messages.GetDialogs(
@@ -2099,12 +2153,13 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                 msg = None
                 if msg_id:
                     try:
-                        msg = await app.get_messages(chat_id, msg_id)
+                        msg = await app.get_messages(resolved_chat_id, msg_id)
                     except Exception as gm_err:
                         print(f"[WARN] Direct get_messages notice: {gm_err}")
                         try:
                             c = await app.get_chat(chat_id)
                             if c:
+                                resolved_chat_id = c.id
                                 msg = await app.get_messages(c.id, msg_id)
                         except Exception:
                             pass
@@ -2148,12 +2203,10 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         file_path = await app.download_media(msg, file_name=target_file, progress=progress_cb)
                     except Exception as dl_err:
                         print(f"\n[WARN] Pyrogram download notice: {dl_err}")
-                        # Check if file was downloaded or partially downloaded
                         if isinstance(target_file, str) and not target_file.endswith("/"):
                             if os.path.exists(target_file) and os.path.getsize(target_file) > 0:
                                 file_path = target_file
                         else:
-                            # Look in out_dir for recently created non-empty files
                             for item in os.listdir(out_dir):
                                 item_p = os.path.join(out_dir, item)
                                 if os.path.isfile(item_p) and os.path.getsize(item_p) > 0:
@@ -2167,29 +2220,34 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         return file_path
                 elif msg and not getattr(msg, "empty", False):
                     # Message exists but has no direct media attachment (e.g. text/update post)
-                    if msg.text or msg.caption:
+                    post_text = (msg.text or msg.caption or "").strip()
+                    if post_text:
                         print("\n" + "="*65)
-                        print(f"  Telegram Post {chat_id}/{msg_id} (Text Only):")
+                        print(f"  Telegram Post {chat_id}/#{msg_id} (Text Only):")
                         print("="*65)
-                        print((msg.text or msg.caption).strip())
+                        print(post_text[:500])
                         print("="*65 + "\n")
 
-                    # Scan adjacent preceding messages for referenced media attachments (e.g. APKs, documents, videos)
+                    # Scan adjacent messages for referenced media attachments (preceding 1-5, following 1-2)
                     adjacent_media = []
-                    for offset in range(1, 5):
+                    check_offsets = [-1, -2, -3, -4, -5, 1, 2]
+                    for offset in check_offsets:
+                        cand_id = msg_id + offset
+                        if cand_id <= 0:
+                            continue
                         try:
-                            adj_msg = await app.get_messages(chat_id, msg_id - offset)
+                            adj_msg = await app.get_messages(resolved_chat_id, cand_id)
                             if adj_msg and not getattr(adj_msg, "empty", False) and adj_msg.media:
                                 fname = "media_file"
                                 fsize = 0
                                 if adj_msg.document:
-                                    fname = adj_msg.document.file_name or f"document_{msg_id - offset}"
+                                    fname = adj_msg.document.file_name or f"document_{cand_id}"
                                     fsize = adj_msg.document.file_size
                                 elif adj_msg.video:
-                                    fname = adj_msg.video.file_name or f"video_{msg_id - offset}.mp4"
+                                    fname = adj_msg.video.file_name or f"video_{cand_id}.mp4"
                                     fsize = adj_msg.video.file_size
                                 elif adj_msg.audio:
-                                    fname = adj_msg.audio.file_name or f"audio_{msg_id - offset}.mp3"
+                                    fname = adj_msg.audio.file_name or f"audio_{cand_id}.mp3"
                                     fsize = adj_msg.audio.file_size
                                 mb_sz = f" ({fsize / (1024*1024):.1f} MB)" if fsize else ""
                                 adjacent_media.append((adj_msg, fname, mb_sz))
@@ -2197,30 +2255,26 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                             pass
 
                     if adjacent_media:
-                        print("  Detected media attachments in preceding messages from same post:")
+                        print(f"> Found {len(adjacent_media)} media attachment(s) in adjacent messages:")
                         for idx, (m, fn, sz) in enumerate(adjacent_media, 1):
-                            print(f"   [{idx}] {fn}{sz} (Msg {m.id})")
-                        print("="*65)
-                        try:
-                            pick = input(f"> Select media to download [1-{len(adjacent_media)}] (Default: 1): ").strip()
-                            if not pick:
-                                pick = '1'
-                            if pick.isdigit() and 1 <= int(pick) <= len(adjacent_media):
-                                chosen_msg, chosen_name, _ = adjacent_media[int(pick) - 1]
-                                out_dir = target_dir or DEFAULT_DIR
-                                os.makedirs(out_dir, exist_ok=True)
-                                target_file = os.path.join(out_dir, out_name or chosen_name)
-                                print(f"\n> Fetching {chosen_name}...")
-                                fpath = await app.download_media(chosen_msg, file_name=target_file, progress=progress_cb)
-                                if fpath:
-                                    print(f"\n[OK] Telegram media downloaded to: {fpath}")
-                                    sync_to_sdcard_if_needed(fpath)
-                                    if jid:
-                                        render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
-                                    return fpath
-                        except (KeyboardInterrupt, EOFError):
-                            pass
-                    return None
+                            print(f"   [{idx}] {fn}{sz} (Msg #{m.id})")
+
+                        # Auto-download primary attachment in automated / app environment
+                        chosen_msg, chosen_name, _ = adjacent_media[0]
+                        out_dir = target_dir or DEFAULT_DIR
+                        os.makedirs(out_dir, exist_ok=True)
+                        target_file = os.path.join(out_dir, out_name or chosen_name)
+                        print(f"\n> Automatically downloading primary attachment: {chosen_name}...")
+                        fpath = await app.download_media(chosen_msg, file_name=target_file, progress=progress_cb)
+                        if fpath:
+                            print(f"\n[OK] Telegram media downloaded to: {fpath}")
+                            sync_to_sdcard_if_needed(fpath)
+                            if jid:
+                                render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
+                            return fpath
+                    else:
+                        summary_txt = post_text[:80] if post_text else "No text"
+                        raise Exception(f"Telegram post #{msg_id} is a text announcement with no media attachments: \"{summary_txt}\"")
                 else:
                     raise Exception(f"Message #{msg_id} was deleted or does not exist in Telegram channel {chat_id}.")
             finally:
@@ -2951,6 +3005,34 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         # Spin up local stream proxy to ensure VLC/external player streaming doesn't 403 on CDN
         proxy_stream_url = start_local_stream_proxy(direct_stream_url, custom_headers=stream_headers)
 
+        audio_choices_list = []
+        if 'show_base' in locals() and show_base:
+            try:
+                raw_peers = search_netmirror(show_base)
+                g_peers = group_and_deduplicate_results(raw_peers, query=show_base)
+                for g in g_peers:
+                    for lang, a_item in g.get("audios", {}).items():
+                        audio_choices_list.append({
+                            "language": lang,
+                            "url": a_item.get("url", ""),
+                            "title": a_item.get("title", ""),
+                            "id": a_item.get("id"),
+                        })
+            except Exception:
+                pass
+
+        def get_nm_aud_prio(c):
+            l = c.get("language", "").lower()
+            if "hindi" in l: return 1
+            if "english" in l: return 2
+            if "original" in l or "default" in l: return 3
+            w_list = ["tamil", "telugu", "bengali", "spanish", "french", "arabic", "portuguese", "russian", "german", "japanese", "korean", "chinese", "indonesian"]
+            for i, w in enumerate(w_list):
+                if w in l: return 10 + i
+            return 100
+
+        audio_choices_list.sort(key=get_nm_aud_prio)
+
         return {
             "url": direct_stream_url,
             "direct_url": direct_stream_url,
@@ -2963,6 +3045,8 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             "quality": quality_arg if (quality_arg and quality_arg.lower() != 'best' and quality_arg in sorted_qualities) else (sorted_qualities[0] if sorted_qualities else "Best Available"),
             "qualities": sorted_qualities,
             "quality_urls": quality_map,
+            "audios": audio_choices_list,
+            "audio_choices": audio_choices_list,
             "stream_headers": stream_headers,
             "is_series": is_tv_series,
             "seasons": formatted_seasons if is_tv_series else [],
@@ -4715,11 +4799,11 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         last_err = None
 
         client_attempts = [
-            ['android', 'ios'],
-            ['tv_embedded', 'android'],
+            None,
+            ['tv_embedded'],
+            ['android_creator'],
             ['visionos', 'android'],
-            ['ios'],
-            ['web', 'default'],
+            ['android', 'ios'],
         ]
 
         safari_headers = {
@@ -4735,7 +4819,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 "socket_timeout": 12,
             }, cookie=cookie)
             if client:
-                ydl_opts["extractor_args"] = {"youtube": {"player_client": client, "skip": ["webpage", "configs"]}}
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": client}}
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     extracted = ydl.extract_info(url, download=False)
@@ -4744,24 +4828,6 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                         if extracted_fmts:
                             info = extracted
                             formats = extracted.get("formats", [])
-                            # Also enrich with progressive audio+video format from android client if not already present
-                            if client != ['android']:
-                                try:
-                                    a_opts = {
-                                        "quiet": True,
-                                        "no_warnings": True,
-                                        "skip_download": True,
-                                        "noplaylist": True,
-                                        "socket_timeout": 8,
-                                        "extractor_args": {"youtube": {"player_client": ["android"], "skip": ["webpage", "configs"]}}
-                                    }
-                                    with yt_dlp.YoutubeDL(a_opts) as a_ydl:
-                                        a_ext = a_ydl.extract_info(url, download=False)
-                                        if a_ext and isinstance(a_ext, dict):
-                                            a_prog = [f for f in a_ext.get("formats", []) if isinstance(f, dict) and f.get("url") and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
-                                            formats.extend(a_prog)
-                                except Exception:
-                                    pass
                             break
             except Exception as e:
                 last_err = str(e)
@@ -5062,6 +5128,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "qualities": real_qualities,
             "quality_urls": quality_urls_map,
             "audios": audio_choices,
+            "audio_choices": audio_choices,
             "audio_only": False,
             "can_stream": True,
             "media_type": "video",
@@ -5388,7 +5455,10 @@ def app_telegram_check(payload):
             await client.stop()
 
     try:
-        return loop.run_until_complete(_verify())
+        res = loop.run_until_complete(_verify())
+        if res.get("valid"):
+            _save_fallback_tg_creds(api_id, api_hash, session)
+        return res
     except Exception as e:
         err_msg = str(e)
         if "API_ID_INVALID" in err_msg:
@@ -5482,7 +5552,11 @@ def app_telegram_sign_in(payload):
 
     session_str = _safe_export_session(client, loop)
     user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or "Telegram User")
+    saved_api_id = entry.get("api_id")
+    saved_api_hash = entry.get("api_hash")
     _PENDING_TG_CLIENTS.pop(phone, None)
+    if session_str:
+        _save_fallback_tg_creds(saved_api_id, saved_api_hash, session_str)
 
     return {
         "ok": True,
@@ -5490,8 +5564,8 @@ def app_telegram_sign_in(payload):
         "user": user_name,
         "username": user.username or "",
         "phone": user.phone_number or phone,
-        "api_id": entry.get("api_id"),
-        "api_hash": entry.get("api_hash"),
+        "api_id": saved_api_id,
+        "api_hash": saved_api_hash,
     }
 
 def app_telegram_password(payload):
@@ -5516,10 +5590,14 @@ def app_telegram_password(payload):
     user = loop.run_until_complete(_pwd())
     session_str = _safe_export_session(client, loop)
     user_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or "Telegram User")
+    saved_api_id = entry.get("api_id")
+    saved_api_hash = entry.get("api_hash")
     if session_key:
         _PENDING_TG_CLIENTS.pop(session_key, None)
     if phone:
         _PENDING_TG_CLIENTS.pop(phone, None)
+    if session_str:
+        _save_fallback_tg_creds(saved_api_id, saved_api_hash, session_str)
 
     return {
         "ok": True,
@@ -5527,8 +5605,8 @@ def app_telegram_password(payload):
         "user": user_name,
         "username": user.username or "",
         "phone": user.phone_number or phone,
-        "api_id": entry.get("api_id"),
-        "api_hash": entry.get("api_hash"),
+        "api_id": saved_api_id,
+        "api_hash": saved_api_hash,
     }
 
 def app_telegram_qr_init(payload):
@@ -5635,7 +5713,11 @@ def app_telegram_qr_check(payload):
                 pass
         session_str = _safe_export_session(client, loop)
         user_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or "Telegram User"
+        saved_api_id = entry["api_id"]
+        saved_api_hash = entry["api_hash"]
         _PENDING_TG_CLIENTS.pop(session_key, None)
+        if session_str:
+            _save_fallback_tg_creds(saved_api_id, saved_api_hash, session_str)
         return {
             "ok": True,
             "connected": True,
@@ -5643,12 +5725,13 @@ def app_telegram_qr_check(payload):
             "user": user_name,
             "username": getattr(user, 'username', '') or "",
             "phone": getattr(user, 'phone', '') or "",
-            "api_id": entry["api_id"],
-            "api_hash": entry["api_hash"],
+            "api_id": saved_api_id,
+            "api_hash": saved_api_hash,
         }
     return {"ok": True, "connected": False}
 
 def app_telegram_logout(payload):
+    _clear_fallback_tg_creds()
     global _PENDING_TG_CLIENTS
     for k, v in list(_PENDING_TG_CLIENTS.items()):
         try:

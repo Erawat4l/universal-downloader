@@ -206,6 +206,7 @@ import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -545,6 +546,8 @@ private fun ArcApp(
     var isTraceExpanded by rememberSaveable { mutableStateOf(false) }
     var elapsedSeconds by remember { mutableFloatStateOf(0f) }
     var liveStepText by remember { mutableStateOf("") }
+    var currentTaskJob by remember { mutableStateOf<Job?>(null) }
+    var currentTaskJobId by remember { mutableStateOf<String?>(null) }
 
     var showDeleteConfirmJobId by remember { mutableStateOf<String?>(null) }
     var showSeriesDownloadDialog by remember { mutableStateOf(false) }
@@ -897,9 +900,12 @@ private fun ArcApp(
                 hits = resultList
                 searchLoading = false
 
-                // Preload top search results in background for instant resolution
-                scope.launch(Dispatchers.IO) {
-                    resultList.take(3).forEach { hit ->
+                // Preload top search results in background in parallel for instant resolution
+                val effPreloadSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
+                val effPreloadId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
+                val effPreloadHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
+                resultList.take(5).forEach { hit ->
+                    scope.launch(Dispatchers.IO) {
                         val preUrl = hit.audio.firstOrNull()?.url?.ifEmpty { hit.url } ?: hit.url
                         val prefLang = hit.audio.firstOrNull()?.language.orEmpty()
                         if (preUrl.isNotBlank() && !preloadedTargets.containsKey(preUrl)) {
@@ -909,11 +915,11 @@ private fun ArcApp(
                                     put("url", preUrl)
                                     put("quality", "Best Available")
                                     if (prefLang.isNotBlank()) put("audio_lang", prefLang)
-                                    if (telegramSession.isNotBlank()) {
+                                    if (effPreloadSess.isNotBlank()) {
                                         put("telegram", JSONObject().apply {
-                                            put("api_id", telegramApiId)
-                                            put("api_hash", telegramApiHash)
-                                            put("session", telegramSession)
+                                            put("api_id", effPreloadId)
+                                            put("api_hash", effPreloadHash)
+                                            put("session", effPreloadSess)
                                         })
                                     }
                                 }
@@ -935,7 +941,7 @@ private fun ArcApp(
                                             qObj.keys().forEach { k -> qUrls[k] = qObj.optString(k) }
                                         }
                                         val aList = mutableListOf<AudioChoice>()
-                                        rData.optJSONArray("audio_choices")?.let { aArr ->
+                                        (rData.optJSONArray("audio_choices") ?: rData.optJSONArray("audios"))?.let { aArr ->
                                             for (ai in 0 until aArr.length()) {
                                                 val aItem = aArr.optJSONObject(ai) ?: continue
                                                 aList.add(AudioChoice(aItem.optString("language"), aItem.optString("url")))
@@ -967,7 +973,7 @@ private fun ArcApp(
                                             streamHeaders = hMap,
                                             isSeries = isSeries,
                                             seasons = seasonsList,
-                                            audioTracks = if (aList.isNotEmpty()) aList else hit.audio,
+                                            audioTracks = if (hit.audio.isNotEmpty()) hit.audio else if (aList.isNotEmpty()) aList else emptyList(),
                                             selectedAudioLang = prefLang,
                                             mediaCategory = if (isSeries) "TV SERIES" else "MOVIE",
                                             year = hit.year,
@@ -1078,7 +1084,7 @@ private fun ArcApp(
                 }?.takeUnless { it.isBlank() } ?: target.providers
 
                 val audioTracksList = mutableListOf<AudioChoice>()
-                val aArray = data?.optJSONArray("audios")
+                val aArray = data?.optJSONArray("audio_choices") ?: data?.optJSONArray("audios")
                 if (aArray != null) {
                     for (i in 0 until aArray.length()) {
                         val aObj = aArray.optJSONObject(i) ?: continue
@@ -1206,24 +1212,34 @@ private fun ArcApp(
     }
 
     fun submit(payload: JSONObject, type: String): String {
+        currentTaskJob?.cancel()
         val jobId = java.util.UUID.randomUUID().toString()
+        currentTaskJobId = jobId
         payload.put("job_id", jobId)
-        scope.launch {
+        currentTaskJob = scope.launch {
             val response = withContext(Dispatchers.IO) {
-                runCatching { EmbeddedEngine.execute(context, payload) }
-                    .getOrElse { error ->
-                        JSONObject().apply {
-                            put("ok", false)
-                            put("error", error.message ?: "The engine could not start.")
-                        }
+                runCatching {
+                    if (!isActive) return@withContext JSONObject().apply { put("ok", false); put("cancelled", true) }
+                    EmbeddedEngine.execute(context, payload)
+                }.getOrElse { error ->
+                    JSONObject().apply {
+                        put("ok", false)
+                        put("error", error.message ?: "The engine could not start.")
                     }
+                }
             }
-            handleEngineResult(EngineResult(jobId, type, response))
+            if (isActive && currentTaskJobId == jobId) {
+                handleEngineResult(EngineResult(jobId, type, response))
+            }
         }
         return jobId
     }
 
     fun openHome() {
+        currentTaskJob?.cancel()
+        currentTaskJob = null
+        currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+        currentTaskJobId = null
         tabName = AppTab.HOME.name
         overlay = ""
         homeOverlay = ""
@@ -1250,6 +1266,22 @@ private fun ArcApp(
                 tabName = AppTab.HOME.name
             }
             tab == AppTab.HOME -> {
+                if (resolveLoading || searchLoading) {
+                    currentTaskJob?.cancel()
+                    currentTaskJob = null
+                    currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+                    currentTaskJobId = null
+                    resolveLoading = false
+                    searchLoading = false
+                    if (hits.isNotEmpty() && overlay == "analysis") {
+                        overlay = "search"
+                        homeOverlay = "search"
+                    } else {
+                        openHome()
+                    }
+                    message("Process cancelled.")
+                    return@BackHandler
+                }
                 when {
                     overlay == "analysis" -> {
                         if (hits.isNotEmpty()) {
@@ -1380,11 +1412,14 @@ private fun ArcApp(
                     if (selectedAudioLang.isNotBlank()) put("audio_lang", selectedAudioLang)
                     if (season != null) put("season", season)
                     if (episode != null) put("episode", episode)
-                    if (telegramSession.isNotBlank()) {
+                    val effectiveSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
+                    val effectiveId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
+                    val effectiveHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
+                    if (effectiveSess.isNotBlank()) {
                         put("telegram", JSONObject().apply {
-                            put("api_id", telegramApiId)
-                            put("api_hash", telegramApiHash)
-                            put("session", telegramSession)
+                            put("api_id", effectiveId)
+                            put("api_hash", effectiveHash)
+                            put("session", effectiveSess)
                         })
                     }
                 },
@@ -1502,11 +1537,14 @@ private fun ArcApp(
                 put("season", sNum)
                 put("episode", epNum)
             }
-            if (telegramSession.isNotBlank()) {
+            val effectiveSess = telegramSession.ifBlank { preferences.getString("telegram_session", "").orEmpty() }
+            val effectiveId = telegramApiId.ifBlank { preferences.getString("telegram_api_id", "30909654") ?: "30909654" }
+            val effectiveHash = telegramApiHash.ifBlank { preferences.getString("telegram_api_hash", "d4b340a406c5c1ed1d7f26d44749602b") ?: "d4b340a406c5c1ed1d7f26d44749602b" }
+            if (effectiveSess.isNotBlank()) {
                 put("telegram", JSONObject().apply {
-                    put("api_id", telegramApiId)
-                    put("api_hash", telegramApiHash)
-                    put("session", telegramSession)
+                    put("api_id", effectiveId)
+                    put("api_hash", effectiveHash)
+                    put("session", effectiveSess)
                 })
             }
         }
@@ -1686,6 +1724,7 @@ private fun ArcApp(
                                             selectedQuality = pre.availableQualities.firstOrNull() ?: "Best Available"
                                             audioOnly = false
                                             target = pre.copy(
+                                                audioTracks = if (hit.audio.isNotEmpty()) hit.audio else pre.audioTracks,
                                                 selectedAudioLang = audio.language.ifBlank { pre.selectedAudioLang }
                                             )
                                             overlay = "analysis"
@@ -2027,6 +2066,10 @@ private fun ArcApp(
                                 .remove("telegram_user_name")
                                 .remove("telegram_user_phone")
                                 .apply()
+                            try {
+                                val f = File(context.filesDir, "telegram_credentials.json")
+                                if (f.exists()) f.delete()
+                            } catch (_: Exception) {}
                             message("Telegram disconnected.")
                             if (oldSession.isNotBlank()) {
                                 scope.launch(Dispatchers.IO) {
@@ -2263,6 +2306,17 @@ private fun ArcApp(
                             .putString("telegram_user_name", user)
                             .putString("telegram_user_phone", phone)
                             .apply()
+                        try {
+                            val f = File(context.filesDir, "telegram_credentials.json")
+                            val jobj = JSONObject().apply {
+                                put("api_id", id)
+                                put("api_hash", hash)
+                                put("session", sess)
+                                put("user", user)
+                                put("phone", phone)
+                            }
+                            f.writeText(jobj.toString())
+                        } catch (_: Exception) {}
                         showTelegramSetup = false
                         message("Telegram connected as ${user.ifBlank { phone }}")
                     },
