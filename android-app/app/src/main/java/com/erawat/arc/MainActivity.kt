@@ -484,11 +484,72 @@ private fun arcTextFieldColors() = OutlinedTextFieldDefaults.colors(
 
 private fun formatUserFriendlyError(rawError: String?): String {
     if (rawError.isNullOrBlank()) return "An unexpected issue occurred. Please try again."
-    val err = rawError.trim()
+    var err = rawError.trim()
+
+    // If multiline Python traceback, extract the final meaningful error line
+    if (err.contains("Traceback (most recent call last):", ignoreCase = true)) {
+        val lines = err.lines().map { it.trim() }.filter { it.isNotBlank() }
+        val lastLine = lines.lastOrNull { !it.startsWith("File ") && !it.startsWith("Traceback") } ?: lines.lastOrNull()
+        if (!lastLine.isNullOrBlank()) {
+            err = lastLine
+        }
+    }
+
     val lower = err.lowercase()
 
     return when {
-        lower.contains("cancel") -> "Download cancelled"
+        // Cancellation & Process Interruption
+        lower.contains("cancel") || lower.contains("interrupted") || lower.contains("aborted") ->
+            "Download cancelled"
+
+        // Device Storage & Disk Full
+        lower.contains("no space left") || lower.contains("enospc") || lower.contains("disk full") || lower.contains("storage full") ->
+            "Not enough storage space on your device"
+        lower.contains("permission denied") || lower.contains("eacces") || lower.contains("read-only file system") ->
+            "Storage access permission denied"
+
+        // Network, DNS & Socket failures
+        lower.contains("timed out") || lower.contains("timeout") || lower.contains("timedout") ->
+            "Connection timed out. Please check your network"
+        lower.contains("no such host") || lower.contains("unable to resolve host") || lower.contains("network is unreachable") ||
+        lower.contains("gaierror") || lower.contains("nodename nor servname") ->
+            "No internet connection. Please check your network"
+        lower.contains("econnrefused") || lower.contains("connection refused") ->
+            "Server connection refused. Please try again later"
+        lower.contains("econnreset") || lower.contains("connection reset") || lower.contains("broken pipe") || lower.contains("epipe") ->
+            "Connection interrupted. Please retry download"
+        lower.contains("certificate_verify_failed") || lower.contains("sslerror") || lower.contains("tlsv1") ->
+            "Secure connection failed (SSL certificate issue)"
+
+        // HTTP Status Codes
+        lower.contains("403") || lower.contains("forbidden") || lower.contains("access denied") ->
+            "Access forbidden by media server (HTTP 403)"
+        lower.contains("404") || lower.contains("not found") ->
+            "Media file or link was not found (HTTP 404)"
+        lower.contains("410") || lower.contains("gone") ->
+            "Media link has expired or been removed"
+        lower.contains("rate limit") || lower.contains("rate-limiting") || lower.contains("too many requests") || lower.contains("429") ->
+            "Server rate-limited. Please try again in a few moments"
+        lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("bad gateway") || lower.contains("gateway timeout") || lower.contains("service unavailable") ->
+            "Remote server is temporarily unavailable. Please retry shortly"
+
+        // YouTube & Video Extraction
+        lower.contains("sign in to confirm you’re not a bot") || lower.contains("confirm you're not a bot") || lower.contains("bot verification") ->
+            "YouTube verification required. Retrying with fallback stream..."
+        lower.contains("private video") || lower.contains("this video is private") ->
+            "This video is private and cannot be accessed"
+        lower.contains("members-only") || lower.contains("join this channel") ->
+            "This video is restricted to channel members"
+        lower.contains("age-restricted") || lower.contains("confirm your age") ->
+            "Video is age-restricted and requires account authentication"
+        lower.contains("not available in your country") || lower.contains("geo-restricted") || lower.contains("blocked in your country") ->
+            "Media is restricted or unavailable in your region"
+        lower.contains("premiere will begin in") || lower.contains("live event will begin in") ->
+            "This live premiere has not started yet"
+        lower.contains("copyright") || lower.contains("dmca") || lower.contains("infringement") ->
+            "Media was removed due to a copyright claim"
+
+        // Telegram Auth & RPC errors
         lower.contains("diff") || lower.contains("padding") || (lower.contains("check") && lower.contains("0")) ->
             "Invalid Telegram string session"
         lower.contains("password_hash_invalid") || lower.contains("password_invalid") || (lower.contains("password") && lower.contains("invalid")) || lower.contains("wrong pass") ->
@@ -498,30 +559,39 @@ private fun formatUserFriendlyError(rawError: String?): String {
         lower.contains("phone_code_expired") || (lower.contains("code") && lower.contains("expired")) ->
             "Verification code expired. Please request a new one"
         lower.contains("phone_number_invalid") || (lower.contains("phone") && lower.contains("invalid")) ->
-            "Invalid phone number"
+            "Invalid phone number format"
+        lower.contains("phone_number_unregistered") ->
+            "This phone number is not registered on Telegram"
         lower.contains("flood_wait") -> {
             val seconds = Regex("""\d+""").find(err)?.value ?: "a few"
             "Too many attempts. Please wait $seconds seconds"
         }
         lower.contains("auth_key_unregistered") || lower.contains("session_revoked") || lower.contains("session expired") ->
             "Telegram session expired. Please log in again"
-        lower.contains("sign in to confirm you’re not a bot") || lower.contains("confirm you're not a bot") ->
-            "YouTube verification required. Retrying with fallback stream..."
-        lower.contains("timed out") || lower.contains("timeout") ->
-            "Connection timed out. Please check your network"
-        lower.contains("no such host") || lower.contains("unable to resolve host") || lower.contains("network is unreachable") ->
-            "No internet connection. Please check your network"
-        lower.contains("rate limit") || lower.contains("rate-limiting") || lower.contains("429") ->
-            "Server rate-limited. Please try again in a few moments"
+        lower.contains("peer_id_invalid") || lower.contains("channel_invalid") || lower.contains("chat_invalid") || lower.contains("chat_admin_required") ->
+            "Telegram channel or message is private or restricted"
+        lower.contains("message_id_invalid") || lower.contains("message_empty") ->
+            "Telegram message or file not found"
+        lower.contains("file_reference_expired") ->
+            "Telegram file reference expired. Re-fetching..."
+        lower.contains("api_id_invalid") ->
+            "Invalid Telegram API ID or API Hash"
+
+        // Catalog & Streaming
         lower.contains("no active streaming servers") || lower.contains("offline") ->
             "No active streaming servers found for this media"
+        lower.contains("unsupported url") || lower.contains("extractor error") ->
+            "Unsupported or unrecognized media link"
+
+        // Clean Fallback
         else -> {
             val cleaned = err
                 .replace(Regex("""^\[\d+\s+[^\]]+\]\s*"""), "")
                 .replace(Regex("""^[A-Za-z_]+Error:\s*"""), "")
                 .replace(Regex("""^Exception:\s*"""), "")
+                .replace(Regex("""/data/data/[^\s]+"""), "system")
                 .trim()
-            if (cleaned.length > 100) cleaned.take(97) + "..." else cleaned
+            if (cleaned.length > 90) cleaned.take(87) + "..." else cleaned
         }
     }
 }
