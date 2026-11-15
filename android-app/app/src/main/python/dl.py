@@ -2138,14 +2138,39 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         mb_done = current / (1024 * 1024)
                         render_download_progress(100.0, f"{mb_done:.1f}MB", job_id=jid)
 
-                # Prime peer cache if dealing with a private channel or numeric chat_id
+                # Prime peer cache with user's dialogs so private channels have their access_hash cached in memory
                 if chat_id:
                     try:
-                        found_target = False
-                        async for dialog in app.get_dialogs(limit=250):
-                            if dialog.chat and (dialog.chat.id == chat_id or str(dialog.chat.id).endswith(str(abs(chat_id)))):
-                                found_target = True
+                        import pyrogram.raw as raw
+                        from pyrogram import utils as py_utils
+                        offset_date = 0
+                        offset_id = 0
+                        offset_peer = raw.types.InputPeerEmpty()
+                        for _ in range(5):
+                            r = await app.invoke(
+                                raw.functions.messages.GetDialogs(
+                                    offset_date=offset_date,
+                                    offset_id=offset_id,
+                                    offset_peer=offset_peer,
+                                    limit=100,
+                                    hash=0
+                                )
+                            )
+                            if not r.dialogs:
                                 break
+                            await app.fetch_peers(r.chats + r.users)
+                            try:
+                                await app.storage.get_peer_by_id(chat_id)
+                                break
+                            except KeyError:
+                                pass
+                            last_d = r.dialogs[-1]
+                            last_m = next((m for m in r.messages if getattr(m, 'id', None) == getattr(last_d, 'top_message', None)), None)
+                            if not last_m:
+                                break
+                            offset_date = getattr(last_m, 'date', 0)
+                            offset_id = getattr(last_m, 'id', 0)
+                            offset_peer = await app.resolve_peer(py_utils.get_peer_id(last_d.peer))
                     except Exception as d_err:
                         print(f"[DEBUG] Telegram peer priming notice: {d_err}")
 
@@ -2162,7 +2187,7 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         except Exception:
                             pass
 
-                if msg and msg.media:
+                if msg and not getattr(msg, "empty", False) and msg.media:
                     out_dir = target_dir or DEFAULT_DIR
                     os.makedirs(out_dir, exist_ok=True)
 
@@ -2212,7 +2237,7 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         if jid:
                             render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
                         return file_path
-                elif msg:
+                elif msg and not getattr(msg, "empty", False):
                     # Message exists but has no direct media attachment (e.g. text/update post)
                     if msg.text or msg.caption:
                         print("\n" + "="*65)
@@ -2226,7 +2251,7 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                     for offset in range(1, 5):
                         try:
                             adj_msg = await app.get_messages(chat_id, msg_id - offset)
-                            if adj_msg and adj_msg.media:
+                            if adj_msg and not getattr(adj_msg, "empty", False) and adj_msg.media:
                                 fname = "media_file"
                                 fsize = 0
                                 if adj_msg.document:
@@ -2269,12 +2294,19 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                             pass
                     return None
                 else:
-                    print("[WARN] No downloadable media found in Telegram message via Pyrogram.")
+                    raise Exception(f"Message #{msg_id} was not found, is empty, or is inaccessible in Telegram channel {chat_id}. Ensure your connected Telegram account has joined this channel.")
             finally:
                 await app.stop()
             return None
 
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         res_path = loop.run_until_complete(pyrogram_dl())
         if res_path:
             return res_path

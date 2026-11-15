@@ -93,9 +93,7 @@ object EmbeddedEngine {
             if (outFile.exists()) outFile.delete()
 
             videoExtractor = MediaExtractor()
-            java.io.FileInputStream(vFile).use { vFis ->
-                videoExtractor.setDataSource(vFis.fd)
-            }
+            videoExtractor.setDataSource(vFile.absolutePath)
 
             val isWebm = outputPath.endsWith(".webm", ignoreCase = true) ||
                          videoPath.endsWith(".webm", ignoreCase = true)
@@ -125,9 +123,7 @@ object EmbeddedEngine {
             for (aFile in validAudioFiles) {
                 val aExt = MediaExtractor()
                 try {
-                    java.io.FileInputStream(aFile).use { aFis ->
-                        aExt.setDataSource(aFis.fd)
-                    }
+                    aExt.setDataSource(aFile.absolutePath)
                     var trackAdded = false
                     for (i in 0 until aExt.trackCount) {
                         val format = aExt.getTrackFormat(i)
@@ -166,7 +162,12 @@ object EmbeddedEngine {
 
             class TrackSource(val extractor: MediaExtractor, val muxerTrackIndex: Int) {
                 var isDone = false
-                fun sampleTime(): Long = if (isDone) Long.MAX_VALUE else extractor.sampleTime
+                var lastTimestampUs: Long = -1L
+                fun sampleTime(): Long {
+                    if (isDone) return Long.MAX_VALUE
+                    val t = extractor.sampleTime
+                    return if (t < 0) Long.MAX_VALUE else t
+                }
             }
 
             val allTracks = mutableListOf<TrackSource>()
@@ -185,11 +186,25 @@ object EmbeddedEngine {
                     continue
                 }
 
+                var pts = nextSource.extractor.sampleTime
+                if (pts < 0) {
+                    nextSource.isDone = true
+                    continue
+                }
+                if (pts <= nextSource.lastTimestampUs) {
+                    pts = nextSource.lastTimestampUs + 1000L
+                }
+                nextSource.lastTimestampUs = pts
+
                 bufferInfo.offset = 0
                 bufferInfo.size = sampleSize
-                bufferInfo.presentationTimeUs = nextSource.extractor.sampleTime
+                bufferInfo.presentationTimeUs = pts
                 bufferInfo.flags = nextSource.extractor.sampleFlags
-                muxer.writeSampleData(nextSource.muxerTrackIndex, buffer, bufferInfo)
+                try {
+                    muxer.writeSampleData(nextSource.muxerTrackIndex, buffer, bufferInfo)
+                } catch (we: Exception) {
+                    android.util.Log.w("EmbeddedEngine", "writeSampleData warning for track ${nextSource.muxerTrackIndex}: ${we.message}")
+                }
                 nextSource.extractor.advance()
             }
 

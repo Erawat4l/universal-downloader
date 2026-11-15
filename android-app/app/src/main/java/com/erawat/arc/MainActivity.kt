@@ -1329,7 +1329,8 @@ private fun ArcApp(
         episodeOverride: Int? = null,
         directUrlOverride: String? = null,
         downloadScope: String = "episode",
-        audioOnlyOverride: Boolean? = null
+        audioOnlyOverride: Boolean? = null,
+        audioLangOverride: String? = null
     ) {
         val sNum = seasonOverride ?: target.selectedSeason
         val epNum = episodeOverride ?: target.selectedEpisode
@@ -1388,8 +1389,9 @@ private fun ArcApp(
             put("title", finalTitle)
             put("quality", if (isAudio) "audio" else if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
             put("audio_only", isAudio)
-            if (target.selectedAudioLang.isNotBlank()) {
-                put("audio_lang", target.selectedAudioLang)
+            val activeAudioLang = audioLangOverride ?: target.selectedAudioLang
+            if (activeAudioLang.isNotBlank()) {
+                put("audio_lang", activeAudioLang)
             }
             put("target_dir", downloadPath)
             put("cache_dir", context.cacheDir.absolutePath)
@@ -1660,7 +1662,7 @@ private fun ArcApp(
                                             if (target.isSeries) {
                                                 showSeriesDownloadDialog = true
                                             } else {
-                                                startDownload()
+                                                startDownload(audioLangOverride = dlLang)
                                             }
                                         }
                                     },
