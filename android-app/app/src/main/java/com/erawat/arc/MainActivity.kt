@@ -576,7 +576,9 @@ private fun formatUserFriendlyError(rawError: String?): String {
 
 private fun prioritizeAudioTracks(tracks: List<AudioChoice>): List<AudioChoice> {
     if (tracks.isEmpty()) return emptyList()
-    return tracks.sortedWith(Comparator { a, b ->
+    val cleanTracks = tracks.filter { it.language.isNotBlank() }
+    if (cleanTracks.isEmpty()) return emptyList()
+    return cleanTracks.sortedWith(Comparator { a, b ->
         val langA = a.language.lowercase()
         val langB = b.language.lowercase()
         val pA = when {
@@ -1362,8 +1364,10 @@ private fun ArcApp(
                 episodeCache[initKey] = target
 
                 resolveLoading = false
-                overlay = "analysis"
-                homeOverlay = "analysis"
+                if (overlay == "analysis" || homeOverlay == "analysis") {
+                    overlay = "analysis"
+                    homeOverlay = "analysis"
+                }
 
                 analysisTrace = CliTrace(
                     action = actionLabel,
@@ -1430,6 +1434,10 @@ private fun ArcApp(
                 }
             }
             if (isActive && currentTaskJobId == jobId) {
+                if (type == "resolve" && overlay != "analysis" && homeOverlay != "analysis") {
+                    resolveLoading = false
+                    return@launch
+                }
                 handleEngineResult(EngineResult(jobId, type, response))
             }
         }
@@ -1490,6 +1498,11 @@ private fun ArcApp(
                 }
                 when {
                     overlay == "analysis" -> {
+                        currentTaskJob?.cancel()
+                        currentTaskJob = null
+                        currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+                        currentTaskJobId = null
+                        resolveLoading = false
                         isSearchTraceExpanded = false
                         isAnalysisTraceExpanded = false
                         if (hits.isNotEmpty()) {
@@ -1919,6 +1932,10 @@ private fun ArcApp(
                                     onCopyLogs = { copyToClipboard(searchTrace?.stdoutLogs.orEmpty(), "Search logs") },
                                     onBack = ::openHome,
                                     onSelect = { hit, audio ->
+                                        currentTaskJob?.cancel()
+                                        currentTaskJob = null
+                                        currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+                                        currentTaskJobId = null
                                         isAnalysisTraceExpanded = false
                                         val sortedAudios = prioritizeAudioTracks(hit.audio)
                                         val chosenLang = audio.language.ifBlank {
@@ -1973,7 +1990,13 @@ private fun ArcApp(
                                     quality = selectedQuality,
                                     audioOnly = audioOnly,
                                     onBack = {
+                                        currentTaskJob?.cancel()
+                                        currentTaskJob = null
+                                        currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+                                        currentTaskJobId = null
+                                        resolveLoading = false
                                         isSearchTraceExpanded = false
+                                        isAnalysisTraceExpanded = false
                                         if (hits.isNotEmpty()) {
                                             overlay = "search"
                                             homeOverlay = "search"
@@ -1998,6 +2021,10 @@ private fun ArcApp(
                                         )
                                     },
                                     onSelectAudio = { audio ->
+                                        currentTaskJob?.cancel()
+                                        currentTaskJob = null
+                                        currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
+                                        currentTaskJobId = null
                                         val newUrl = audio.url.ifEmpty { target.targetUrl }
                                         analyze(
                                             value = newUrl,
