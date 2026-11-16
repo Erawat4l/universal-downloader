@@ -691,11 +691,11 @@ def clean_filename(title, default_ext="", quality=None):
     base = re.sub(r'[\s._-]+(v\d+|\bv\d+\b|f\d+|part\d+)$', '', base, flags=re.I).strip()
     base = re.sub(r'\s*[\(\[]v\d+[\)\]]$', '', base, flags=re.I).strip()
 
-    # Enforce NAME(QUALITY) for video outputs
+    # Enforce NAME{QUALITY} for video outputs
     q_tag = extract_quality_tag(quality)
     if q_tag and not (ext and ext.lower() in ('.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg')):
-        base = re.sub(r'\s*[\(\[](?:4320p|2160p|1440p|1080p|720p|480p|360p|240p|144p|4K|2K|HD|SD)[\)\]]', '', base, flags=re.I).strip()
-        base = f"{base}({q_tag})"
+        base = re.sub(r'\s*[\(\[\{](?:4320p|2160p|1440p|1080p|720p|480p|360p|240p|144p|4K|2K|HD|SD)[\)\]\}]', '', base, flags=re.I).strip()
+        base = f"{base}{{{q_tag}}}"
 
     if ext:
         title = base + ext
@@ -1109,14 +1109,30 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                 content_disp = r.headers.get('content-disposition', '')
                 
                 if downloaded == 0:
-                    is_generic_name = not filename or any(filename.lower().startswith(p) for p in ('download', 'stream', 'video', 'media', 'default'))
-                    if is_generic_name and 'filename=' in content_disp:
-                        match = re.search(r'filename=["\']?([^"\';]+)["\']?', content_disp)
-                        if match:
-                            filename = clean_filename(match.group(1))
-                            dest_path = get_dest_path(filename, target_dir)
+                    disp_filename = None
+                    if content_disp:
+                        m_star = re.search(r"filename\*\s*=\s*([a-zA-Z0-9_\-]+)''([^;\r\n]+)", content_disp, re.I)
+                        if m_star:
+                            try:
+                                disp_filename = urllib.parse.unquote(m_star.group(2), encoding=m_star.group(1))
+                            except Exception:
+                                disp_filename = urllib.parse.unquote(m_star.group(2))
+                        if not disp_filename:
+                            m_simple = re.search(r'filename\s*=\s*(?:"([^"]+)"|([^;\s\r\n]+))', content_disp, re.I)
+                            if m_simple:
+                                disp_filename = m_simple.group(1) or m_simple.group(2)
+
+                    if disp_filename:
+                        filename = clean_filename(disp_filename)
+                        dest_path = get_dest_path(filename, target_dir)
                     elif 'application/pdf' in content_type and not filename.endswith('.pdf'):
-                        filename += '.pdf'
+                        filename = os.path.splitext(filename)[0] + '.pdf'
+                        dest_path = get_dest_path(filename, target_dir)
+                    elif any(z in content_type for z in ('application/zip', 'application/x-zip-compressed')) and not filename.endswith('.zip'):
+                        filename = os.path.splitext(filename)[0] + '.zip'
+                        dest_path = get_dest_path(filename, target_dir)
+                    elif 'application/vnd.android.package-archive' in content_type and not filename.endswith('.apk'):
+                        filename = os.path.splitext(filename)[0] + '.apk'
                         dest_path = get_dest_path(filename, target_dir)
                     elif 'text/html' in content_type and not filename.endswith('.html'):
                         raise Exception("The server returned an HTML webpage instead of a direct file stream.")
@@ -1462,19 +1478,19 @@ def download_hls_with_python(url, dest_path, headers=None):
 def prompt_video_quality(url, quality_arg=None, cookie=None):
     """Interactively or via argument select video quality / format CLI."""
     if not HAS_YTDLP:
-        return 'bestvideo+bestaudio/best', False
+        return 'best[ext=mp4]/best/b', False
 
-    # Standard format map (prefer progressive single-file streams to avoid slow ffmpeg muxing)
+    # Standard format map (strictly progressive single-file streams to prevent slow ffmpeg muxing)
     format_map = {
-        '1': ('best[ext=mp4]/best/bestvideo+bestaudio/best', 'Best Available (Auto - Highest Quality)'),
-        '2160p': ('best[height<=2160][ext=mp4]/best[height<=2160]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best', '2160p (4K)'),
-        '1440p': ('best[height<=1440][ext=mp4]/best[height<=1440]/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best', '1440p (2K)'),
-        '1080p': ('best[height<=1080][ext=mp4]/best[height<=1080]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best', '1080p (Full HD)'),
-        '720p': ('best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best[height<=720]/best', '720p (HD)'),
-        '480p': ('best[height<=480][ext=mp4]/best[height<=480]/bestvideo[height<=480]+bestaudio/best[height<=480]/best', '480p (SD)'),
-        '360p': ('best[height<=360][ext=mp4]/best[height<=360]/bestvideo[height<=360]+bestaudio/best[height<=360]/best', '360p (Low)'),
-        '240p': ('best[height<=240][ext=mp4]/best[height<=240]/bestvideo[height<=240]+bestaudio/best', '240p'),
-        '144p': ('best[height<=144][ext=mp4]/best[height<=144]/bestvideo[height<=144]+bestaudio/best', '144p'),
+        '1': ('best[ext=mp4]/best/b', 'Best Available (Auto - Highest Quality)'),
+        '2160p': ('best[height<=2160][ext=mp4]/best[height<=2160]/best/b', '2160p (4K)'),
+        '1440p': ('best[height<=1440][ext=mp4]/best[height<=1440]/best/b', '1440p (2K)'),
+        '1080p': ('best[height<=1080][ext=mp4]/best[height<=1080]/best/b', '1080p (Full HD)'),
+        '720p': ('best[height<=720][ext=mp4]/best[height<=720]/best/b', '720p (HD)'),
+        '480p': ('best[height<=480][ext=mp4]/best[height<=480]/best/b', '480p (SD)'),
+        '360p': ('best[height<=360][ext=mp4]/best[height<=360]/best/b', '360p (Low)'),
+        '240p': ('best[height<=240][ext=mp4]/best[height<=240]/best/b', '240p'),
+        '144p': ('best[height<=144][ext=mp4]/best[height<=144]/best/b', '144p'),
         'audio': ('bestaudio/best', 'Audio Only (MP3/M4A)'),
         'mp3': ('bestaudio/best', 'Audio Only (MP3)'),
     }
@@ -1520,7 +1536,7 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
             available_heights = sorted(list(h_set), reverse=True)
     except Exception as e:
         print(f"[WARN] Warning: Could not fetch format metadata ({e}). Using auto best quality.")
-        return 'bestvideo+bestaudio/best', False
+        return 'best[ext=mp4]/best/b', False
 
     # If non-interactive shell (stdin not a tty), return default
     if not sys.stdin.isatty():
@@ -1825,7 +1841,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             clean_base = clean_filename(out_name, default_ext="", quality=q_tag)
             outtmpl_pattern = os.path.join(stage_dir, f"{clean_base}.%(ext)s")
         else:
-            outtmpl_pattern = os.path.join(stage_dir, f"%(title)s({q_tag}).%(ext)s")
+            outtmpl_pattern = os.path.join(stage_dir, f"%(title)s{{{q_tag}}}.%(ext)s")
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
     if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
@@ -1834,28 +1850,15 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         audio_sel = "bestaudio[ext=m4a]/bestaudio"
 
     if is_audio_only:
-        format_spec = f"{audio_sel}/best"
+        format_spec = f"{audio_sel}/bestaudio/best"
     else:
-        if cap <= 1080:
-            format_spec = (
-                f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
-                f"best[height<={cap}][ext=mp4]/"
-                f"best[height<={cap}]/"
-                f"best/"
-                f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
-                f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
-                f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
-                f"bestvideo[height<={cap}]+{audio_sel}"
-            )
-        else:
-            format_spec = (
-                f"best[height<={cap}][ext=mp4]/"
-                f"best[height<={cap}]/"
-                f"best/"
-                f"bestvideo[height<={cap}][ext=webm]+{audio_sel}/"
-                f"bestvideo[height<={cap}][vcodec^=vp9]+{audio_sel}/"
-                f"bestvideo[height<={cap}]+{audio_sel}"
-            )
+        format_spec = (
+            f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
+            f"best[height<={cap}][ext=mp4]/"
+            f"best[height<={cap}]/"
+            f"best[ext=mp4]/"
+            f"best/b"
+        )
 
     print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'audio+video'}]...")
     yt_opts_dict = {
@@ -1958,13 +1961,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                             print(f"  - Cleaned partial fragment: {f}")
                         except Exception:
                             pass
-                ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                ydl_opts['format'] = 'best[vcodec!=none][acodec!=none]/best/b'
                 continue
 
             if "Requested format is not available" in err_str:
-                if ydl_opts.get('format') != 'best[vcodec!=none][acodec!=none]/bestvideo+bestaudio/best':
-                    print("[WARN] Requested format not available. Falling back immediately to best audio+video stream...")
-                    ydl_opts['format'] = 'best[vcodec!=none][acodec!=none]/bestvideo+bestaudio/best'
+                if ydl_opts.get('format') != 'best[vcodec!=none][acodec!=none]/best/b':
+                    print("[WARN] Requested format not available. Falling back immediately to progressive stream...")
+                    ydl_opts['format'] = 'best[vcodec!=none][acodec!=none]/best/b'
                     continue
 
             if '403' in err_str or 'Forbidden' in err_str or 'bot' in err_str.lower():
@@ -4325,21 +4328,24 @@ def classify_igl_ep(ep):
     did = str(ep.get('dataId') or '').lower()
     desc = str(ep.get('description') or '').lower()
     text = f"{t} {did} {desc}"
-    if any(k in text for k in ['bts', 'clip', 'discarded', 'deleted', 'special', 'talk show', 'segment']):
+    if did == 's2-08':
+        return 'NORMAL'
+    if did in ('s2-09', 's2-06-rakhi') or 'uncensored' in text or 'member' in text:
+        return 'MEMBERS'
+    if any(k in text for k in ['bts', 'clip', 'discarded', 'deleted', 'special', 'talk show', 'segment', 'documentary', 'still alive']):
         return 'BONUS'
     if 'bonus' in t or 'bonus' in did:
         return 'BONUS'
-    if 'member' in text or 'uncensored' in text or did in ('s2-09', 's2-06-rakhi'):
-        return 'MEMBERS'
     return 'NORMAL'
 
 
 def get_ep_sort_key(ep):
-    t = str(ep.get('title') or '')
     did = str(ep.get('dataId') or '')
+    t = str(ep.get('title') or '')
+    m_did = re.search(r'(?:s\d+-|ep-)(\d+)', did, re.I)
+    if m_did:
+        return int(m_did.group(1))
     m = re.search(r'\b(?:ep|episode)\s*(\d+)\b', t, re.I)
-    if not m:
-        m = re.search(r'(?:s\d+-|ep-)(\d+)', did, re.I)
     if m:
         return int(m.group(1))
     return 0
@@ -4509,15 +4515,15 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
         cat_seasons.setdefault(s_val, []).append(ep)
 
     for sn in sorted(cat_seasons.keys()):
-        cat_seasons[sn].sort(key=get_ep_sort_key, reverse=True)
+        cat_seasons[sn].sort(key=get_ep_sort_key, reverse=False)
 
     seasons_info = [
         {"season": sn, "episodes": len(cat_seasons[sn])}
-        for sn in sorted(cat_seasons.keys(), reverse=True)
+        for sn in sorted(cat_seasons.keys())
     ]
 
     if is_series_request:
-        avail_seasons = sorted(cat_seasons.keys(), reverse=True)
+        avail_seasons = sorted(cat_seasons.keys())
         try:
             req_s = int(season) if season is not None else avail_seasons[0]
         except (ValueError, TypeError):
@@ -4553,15 +4559,15 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
             s_val = 2 if '2' in s_raw else 1
             cat_seasons.setdefault(s_val, []).append(ep)
         for sn in sorted(cat_seasons.keys()):
-            cat_seasons[sn].sort(key=get_ep_sort_key, reverse=True)
+            cat_seasons[sn].sort(key=get_ep_sort_key, reverse=False)
         seasons_info = [
             {"season": sn, "episodes": len(cat_seasons[sn])}
-            for sn in sorted(cat_seasons.keys(), reverse=True)
+            for sn in sorted(cat_seasons.keys())
         ]
 
         found_season = 2 if '2' in str(match_ep.get('season') or '').lower() else 1
         if found_season not in cat_seasons:
-            found_season = sorted(cat_seasons.keys(), reverse=True)[0]
+            found_season = sorted(cat_seasons.keys())[0]
         target_season = found_season
         ep_list = cat_seasons[target_season]
         try:
@@ -5333,6 +5339,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "quality_urls": quality_urls_map,
             "audios": audio_choices,
             "audio_choices": audio_choices,
+            "selected_audio_lang": (audio_lang or (audio_choices[0]["language"] if audio_choices else "")),
             "audio_only": False,
             "can_stream": True,
             "media_type": "video",
@@ -5425,11 +5432,38 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
 
     if url.startswith(("http://", "https://")):
         name = os.path.basename(urllib.parse.urlparse(url).path) or "Direct file"
-        print(f"[OK] Direct file verified: {name}")
+        content_type = ""
+        try:
+            head_res = requests.head(url, headers=HEADERS, timeout=2.5, allow_redirects=True)
+            cd = head_res.headers.get("content-disposition", "")
+            content_type = head_res.headers.get("content-type", "").lower()
+            if cd:
+                m_star = re.search(r"filename\*\s*=\s*([a-zA-Z0-9_\-]+)''([^;\r\n]+)", cd, re.I)
+                if m_star:
+                    try:
+                        name = urllib.parse.unquote(m_star.group(2), encoding=m_star.group(1))
+                    except Exception:
+                        name = urllib.parse.unquote(m_star.group(2))
+                else:
+                    m_simple = re.search(r'filename\s*=\s*(?:"([^"]+)"|([^;\s\r\n]+))', cd, re.I)
+                    if m_simple:
+                        name = m_simple.group(1) or m_simple.group(2)
+        except Exception:
+            pass
+
         ext = os.path.splitext(name)[1].lower()
+        if not ext and content_type:
+            if 'zip' in content_type: ext = '.zip'
+            elif 'pdf' in content_type: ext = '.pdf'
+            elif 'apk' in content_type: ext = '.apk'
+            elif 'mp4' in content_type: ext = '.mp4'
+            if ext: name += ext
+
+        print(f"[OK] Direct file verified: {name}")
         is_streamable = ext in ('.mp4', '.mkv', '.webm', '.m3u8', '.mpd', '.mov', '.avi', '.ts', '.mp3', '.m4a', '.flac')
         return {
             "url": url,
+            "target_url": url,
             "title": name,
             "source": "Direct file",
             "quality": "Best",
@@ -5507,7 +5541,7 @@ def app_download(payload):
     # Priority 1.5: Direct pre-resolved stream URL (Instant Single Movie / Episode Download)
     elif stream_url and stream_url.startswith(("http://", "https://")) and scope not in ("season", "series") and not any(h in lower or h in stream_lower for h in ["youtube.com", "youtu.be", "googlevideo.com", "t.me/", "telegram.me/", "telegram.dog/"]):
         path_ext = os.path.splitext(urllib.parse.urlparse(stream_url).path)[1].lower()
-        default_ext = path_ext if path_ext else ".mp4"
+        default_ext = path_ext if path_ext else ""
         clean_name = clean_filename(out_name or title, default_ext=default_ext, quality=quality)
         dest_path = get_dest_path(clean_name, target_dir)
         s_headers = get_stream_headers_for_url(stream_url, custom_headers)
@@ -5567,7 +5601,7 @@ def app_download(payload):
     else:
         target_direct = stream_url if (stream_url and stream_url.startswith(("http://", "https://"))) else url
         path_ext = os.path.splitext(urllib.parse.urlparse(target_direct).path)[1].lower()
-        default_ext = path_ext if path_ext else ".mp4"
+        default_ext = path_ext if path_ext else ""
         clean_name = clean_filename(out_name or title, default_ext=default_ext, quality=quality)
         dest_path = get_dest_path(clean_name, target_dir)
         s_headers = get_stream_headers_for_url(target_direct, custom_headers)

@@ -433,13 +433,19 @@ class MainActivity : ComponentActivity() {
         return match?.value ?: raw.trim()
     }
 
+    companion object {
+        var onResumeCallback: (() -> Unit)? = null
+    }
+
     override fun onResume() {
         super.onResume()
         StreamService.stop(this)
+        onResumeCallback?.invoke()
     }
 
     override fun onDestroy() {
         StreamService.stop(this)
+        onResumeCallback = null
         super.onDestroy()
     }
 }
@@ -704,6 +710,15 @@ private fun ArcApp(
     var showGoogleLoginDialog by rememberSaveable { mutableStateOf(false) }
     var showAboutDialog by rememberSaveable { mutableStateOf(false) }
     var isBatteryExempt by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
+
+    DisposableEffect(Unit) {
+        MainActivity.onResumeCallback = {
+            isBatteryExempt = isIgnoringBatteryOptimizations(context)
+        }
+        onDispose {
+            MainActivity.onResumeCallback = null
+        }
+    }
     val episodeCache = remember { mutableMapOf<String, MediaTarget>() }
 
     var searchTrace by remember { mutableStateOf<CliTrace?>(null) }
@@ -1396,6 +1411,15 @@ private fun ArcApp(
                 )
                 val targetKey = target.targetUrl.trim().ifBlank { input.trim() }
                 if (targetKey.isNotBlank()) {
+                    val effLang = target.selectedAudioLang.lowercase().trim()
+                    if (effLang.isNotBlank()) {
+                        AppSessionCache.targets["${targetKey}#${effLang}"] = target
+                        AppSessionCache.targetTraces["${targetKey}#${effLang}"] = CachedTrace(
+                            trace = analysisTrace,
+                            liveStep = analysisLiveStepText,
+                            elapsedSeconds = analysisElapsedSeconds,
+                        )
+                    }
                     AppSessionCache.targets[targetKey] = target
                     AppSessionCache.targetTraces[targetKey] = CachedTrace(
                         trace = analysisTrace,
@@ -1568,8 +1592,9 @@ private fun ArcApp(
             clean.startsWith("igl:", ignoreCase = true) ||
             clean.startsWith("magnet:", ignoreCase = true)
         if (isDirectUrl) {
-            val cachedTarget = AppSessionCache.targets[clean]
-            val cachedTargetTrace = AppSessionCache.targetTraces[clean]
+            val effLang = selectedAudioLang.lowercase().trim()
+            val cachedTarget = if (effLang.isNotBlank()) AppSessionCache.targets["${clean}#${effLang}"] else AppSessionCache.targets[clean]
+            val cachedTargetTrace = if (effLang.isNotBlank()) AppSessionCache.targetTraces["${clean}#${effLang}"] else AppSessionCache.targetTraces[clean]
             if (cachedTarget != null && season == null && episode == null) {
                 target = cachedTarget
                 cachedTargetTrace?.let {
@@ -2060,6 +2085,7 @@ private fun ArcApp(
                                         currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
                                         currentTaskJobId = null
                                         val newUrl = audio.url.ifEmpty { target.targetUrl }
+                                        target = target.copy(selectedAudioLang = audio.language)
                                         analyze(
                                             value = newUrl,
                                             titleOverride = target.title,
@@ -3952,7 +3978,17 @@ private fun SettingsScreen(
                             fontSize = 11.sp,
                         )
                     }
-                    Icon(Icons.AutoMirrored.Outlined.ArrowForward, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(16.dp))
+                    Switch(
+                        checked = isBatteryExempt,
+                        onCheckedChange = { onRequestBatteryExemption() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = ArcBlack,
+                            checkedTrackColor = ArcWhite,
+                            uncheckedThumbColor = ArcMuted,
+                            uncheckedTrackColor = Color(0xFF222222),
+                            uncheckedBorderColor = Color(0xFF333333),
+                        )
+                    )
                 }
             }
         }
