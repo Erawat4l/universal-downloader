@@ -4377,14 +4377,29 @@ def search_igl_episodes(query):
 
     q_clean = str(query).strip().lower()
     is_igl_query = any(k in q_clean for k in ["igl", "latent", "india's got latent", "indias got latent", "samay raina", "samay"])
+    wants_bonus = any(w in q_clean for w in ["bonus", "bts", "special", "discarded", "deleted", "extra", "clip"])
 
-    stopwords = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "it", "india", "india's", "indias", "indias'", "got", "latent", "igl", "samay", "raina", "season", "episode", "ep", "episodes", "bonus", "segment", "part", "ft", "feat", "featuring", "show", "video", "videos", "s1", "s2", "s01", "s02"}
+    stopwords = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "it", "india", "india's", "indias", "indias'", "got", "latent", "igl", "samay", "raina", "season", "episode", "ep", "episodes", "part", "show", "video", "videos", "s1", "s2"}
     tokens = [w for w in re.findall(r'[a-zA-Z0-9]+', q_clean) if len(w) > 2]
     specific_keywords = [w for w in tokens if w not in stopwords]
+
+    def get_ep_order(ep):
+        did = str(ep.get('dataId') or '')
+        s = 2 if ('s2' in did.lower() or '2' in str(ep.get('season') or '')) else 1
+        m_did = re.search(r'(?:s\d+-|ep-)(\d+)', did, re.I)
+        num = int(m_did.group(1)) if m_did else 0
+        return (s, num)
 
     matches = []
     for ep in episodes:
         t = ep.get('title', '').lower()
+        c = classify_igl_ep(ep)
+
+        # Update 67 style: Do not show everything.
+        # Only show full episodes and members only unless user specifically searches for bonus/specials
+        if not wants_bonus and c == 'BONUS':
+            continue
+
         score = 0
         if is_igl_query:
             if specific_keywords:
@@ -4393,6 +4408,8 @@ def search_igl_episodes(query):
                     score = 100 + len(matched_kws) * 10
                 elif matched_kws:
                     score = 50 + len(matched_kws) * 10
+            else:
+                score = 20
         else:
             if specific_keywords and len(specific_keywords) >= 2:
                 matched_kws = [kw for kw in specific_keywords if re.search(r'\b' + re.escape(kw) + r'\b', t)]
@@ -4403,62 +4420,26 @@ def search_igl_episodes(query):
                     score = 70
 
         if score > 0:
-            c = classify_igl_ep(ep)
             badge = "MEMBERS ONLY" if c == "MEMBERS" else ("BONUS / BTS" if c == "BONUS" else "FULL EPISODE")
             poster = get_igl_poster(ep, category=c)
-            matches.append((score, {
+            did = ep.get('dataId') or ep.get('id')
+            matches.append((score, get_ep_order(ep), {
                 "title": ep.get('title'),
-                "type": "TV SERIES",
+                "type": "IGL EPISODE",
                 "year": 2024,
-                "audios": [{"language": "Original", "title": ep.get('title'), "url": f"igl:{ep.get('dataId') or ep.get('id')}", "poster": poster}],
+                "audios": [{"language": "Original", "title": ep.get('title'), "url": f"igl:{did}", "poster": poster}],
                 "providers": [badge],
                 "source": "India's Got Latent",
                 "poster": poster,
-                "url": f"igl:{ep.get('dataId') or ep.get('id')}",
+                "url": f"igl:{did}",
             }))
 
-    matches.sort(key=lambda x: x[0], reverse=True)
-    results = [m[1] for m in matches]
+    if specific_keywords:
+        matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    else:
+        matches.sort(key=lambda x: x[1], reverse=True)
 
-    if is_igl_query:
-        series_cards = [
-            {
-                "title": "INDIA'S GOT LATENT",
-                "type": "TV SERIES",
-                "year": 2024,
-                "audios": [{"language": "Original", "title": "INDIA'S GOT LATENT", "url": "igl:series:normal", "poster": get_igl_poster(category='NORMAL')}],
-                "providers": ["FULL EPISODES"],
-                "source": "India's Got Latent",
-                "poster": get_igl_poster(category='NORMAL'),
-                "url": "igl:series:normal",
-            },
-            {
-                "title": "INDIA'S GOT LATENT: MEMBERS ONLY",
-                "type": "TV SERIES",
-                "year": 2024,
-                "audios": [{"language": "Original", "title": "INDIA'S GOT LATENT: MEMBERS ONLY", "url": "igl:series:members", "poster": get_igl_poster(category='MEMBERS')}],
-                "providers": ["MEMBERS ONLY"],
-                "source": "India's Got Latent",
-                "poster": get_igl_poster(category='MEMBERS'),
-                "url": "igl:series:members",
-            },
-            {
-                "title": "INDIA'S GOT LATENT: BONUS & SPECIALS",
-                "type": "TV SERIES",
-                "year": 2024,
-                "audios": [{"language": "Original", "title": "INDIA'S GOT LATENT: BONUS & SPECIALS", "url": "igl:series:bonus", "poster": get_igl_poster(category='BONUS')}],
-                "providers": ["BONUS / BTS"],
-                "source": "India's Got Latent",
-                "poster": get_igl_poster(category='BONUS'),
-                "url": "igl:series:bonus",
-            },
-        ]
-        if not specific_keywords:
-            return series_cards
-        else:
-            return results + series_cards
-
-    return results
+    return [m[2] for m in matches]
 
 
 def app_igl_catalog():
@@ -4491,130 +4472,79 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
     if not igl:
         raise Exception("IGL module unavailable")
     base_url, episodes, _ = igl.get_episodes_data()
-    clean_id = str(target_id).replace("igl:", "").strip().lower()
-
-    is_series_request = clean_id.startswith("series:") or clean_id in ("normal", "members", "bonus", "main", "")
-    target_category = 'NORMAL'
-    if "member" in clean_id:
-        target_category = 'MEMBERS'
-    elif "bonus" in clean_id:
-        target_category = 'BONUS'
+    clean_id = str(target_id).replace("igl:", "").strip()
 
     match_ep = None
-    target_season = 2
-    ep_num = 1
-
-    cat_episodes = [ep for ep in episodes if classify_igl_ep(ep) == target_category]
-    if not cat_episodes:
-        cat_episodes = episodes
-
-    cat_seasons = {}
-    for ep in cat_episodes:
-        s_raw = str(ep.get('season') or 's1').lower()
-        s_val = 2 if '2' in s_raw else 1
-        cat_seasons.setdefault(s_val, []).append(ep)
-
-    for sn in sorted(cat_seasons.keys()):
-        cat_seasons[sn].sort(key=get_ep_sort_key, reverse=False)
-
-    seasons_info = [
-        {"season": sn, "episodes": len(cat_seasons[sn])}
-        for sn in sorted(cat_seasons.keys())
-    ]
-
-    if is_series_request:
-        avail_seasons = sorted(cat_seasons.keys())
-        try:
-            req_s = int(season) if season is not None else avail_seasons[0]
-        except (ValueError, TypeError):
-            req_s = avail_seasons[0]
-        target_season = req_s if req_s in cat_seasons else avail_seasons[0]
-        ep_list = cat_seasons[target_season]
-        try:
-            req_e = int(episode) if episode is not None else 1
-        except (ValueError, TypeError):
-            req_e = 1
-        ep_idx = (req_e - 1) if (1 <= req_e <= len(ep_list)) else 0
-        match_ep = ep_list[ep_idx]
-        ep_num = ep_idx + 1
-    else:
-        raw_clean = str(target_id).replace("igl:", "").strip()
+    for ep in episodes:
+        if ep.get('dataId') == clean_id or str(ep.get('id')) == clean_id:
+            match_ep = ep
+            break
+    if not match_ep:
         for ep in episodes:
-            if ep.get('dataId') == raw_clean or str(ep.get('id')) == raw_clean:
+            if clean_id.lower() in ep.get('title', '').lower():
                 match_ep = ep
                 break
-        if not match_ep:
-            for ep in episodes:
-                if raw_clean.lower() in ep.get('title', '').lower():
-                    match_ep = ep
-                    break
-        if not match_ep:
-            raise Exception(f"IGL Episode '{raw_clean}' not found.")
-
-        target_category = classify_igl_ep(match_ep)
-        cat_episodes = [ep for ep in episodes if classify_igl_ep(ep) == target_category]
-        cat_seasons = {}
-        for ep in cat_episodes:
-            s_raw = str(ep.get('season') or 's1').lower()
-            s_val = 2 if '2' in s_raw else 1
-            cat_seasons.setdefault(s_val, []).append(ep)
-        for sn in sorted(cat_seasons.keys()):
-            cat_seasons[sn].sort(key=get_ep_sort_key, reverse=False)
-        seasons_info = [
-            {"season": sn, "episodes": len(cat_seasons[sn])}
-            for sn in sorted(cat_seasons.keys())
-        ]
-
-        found_season = 2 if '2' in str(match_ep.get('season') or '').lower() else 1
-        if found_season not in cat_seasons:
-            found_season = sorted(cat_seasons.keys())[0]
-        target_season = found_season
-        ep_list = cat_seasons[target_season]
-        try:
-            ep_num = ep_list.index(match_ep) + 1
-        except ValueError:
-            ep_num = 1
+    if not match_ep:
+        raise Exception(f"IGL Episode '{clean_id}' not found.")
 
     info = igl.resolve_stream_info(match_ep, base_url, target_quality=quality)
     if not info or not info.get('stream_url'):
         raise Exception("Could not resolve streaming link for this episode.")
 
     stream_url = info['stream_url']
-    headers = {
-        'Referer': 'https://igl-8wky.freeforall.dev/',
-        'Origin': 'https://igl-8wky.freeforall.dev',
+    ep_type = info.get('type')
+    poster = get_igl_poster(match_ep, category=classify_igl_ep(match_ep))
+    resolved_title = info.get('title') or match_ep.get('title')
+
+    # If YouTube episode, resolve playable direct video stream for instant VLC streaming
+    if ep_type == 'youtube' or "youtube.com" in stream_url or "youtu.be" in stream_url:
+        try:
+            yt_res = app_resolve(stream_url, quality=quality, skip_igl=True)
+            if yt_res and yt_res.get('url'):
+                direct_stream = yt_res['url']
+                return {
+                    "url": direct_stream,
+                    "stream_url": direct_stream,
+                    "direct_url": direct_stream,
+                    "target_url": f"igl:{match_ep.get('dataId') or match_ep.get('id')}",
+                    "title": resolved_title,
+                    "source": "India's Got Latent",
+                    "poster": poster,
+                    "quality": yt_res.get('quality', 'Best Available'),
+                    "qualities": yt_res.get('qualities', ["Best Available", "1080p (Full HD)", "720p (HD)"]),
+                    "stream_headers": yt_res.get('stream_headers', {}),
+                    "headers": yt_res.get('headers', {}),
+                    "is_series": False,
+                    "can_stream": True,
+                    "media_type": "video",
+                    "ep_type": "youtube",
+                    "yt_url": stream_url,
+                }
+        except Exception as e:
+            print(f"[WARN] IGL YouTube direct stream resolution: {e}")
+
+    # OKCDN direct stream: NEVER include Origin header (okcdn.ru rejects Origin with HTTP 400)
+    clean_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     }
-
-    poster = get_igl_poster(match_ep, category=target_category)
-
-    series_title = "INDIA'S GOT LATENT"
-    if target_category == 'MEMBERS':
-        series_title = "INDIA'S GOT LATENT: MEMBERS ONLY"
-    elif target_category == 'BONUS':
-        series_title = "INDIA'S GOT LATENT: BONUS & SPECIALS"
-
-    resolved_title = info.get('title') or match_ep.get('title') or series_title
 
     return {
         "url": stream_url,
         "direct_url": stream_url,
         "stream_url": stream_url,
-        "target_url": f"igl:{target_id}",
+        "target_url": f"igl:{match_ep.get('dataId') or match_ep.get('id')}",
         "title": resolved_title,
         "source": "India's Got Latent",
         "poster": poster,
         "quality": info.get('quality', 'best'),
         "qualities": ["Best Available", "4K (2160p)", "1080p (Full HD)", "720p (HD)", "480p (SD)"],
-        "stream_headers": headers,
-        "headers": headers,
-        "is_series": True,
-        "season": target_season,
-        "episode": ep_num,
-        "seasons": seasons_info,
+        "stream_headers": clean_headers,
+        "headers": clean_headers,
+        "is_series": False,
         "filename": info.get('filename'),
         "can_stream": True,
         "media_type": "video",
+        "ep_type": ep_type,
     }
 
 
@@ -4883,7 +4813,7 @@ def select_progressive_youtube_format(formats, quality="best"):
     return None
 
 
-def app_resolve(url, quality="best", season=None, episode=None, cookie=None, audio_lang=None, telegram_config=None):
+def app_resolve(url, quality="best", season=None, episode=None, cookie=None, audio_lang=None, telegram_config=None, skip_igl=False):
     if not url:
         raise Exception("A URL is required")
     lower = url.lower()
@@ -4891,11 +4821,11 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
     print(f"> Resolving target: {url}")
     print(f"> Preferred quality: {clean_quality}")
 
-    if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
+    if not skip_igl and (lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"])):
         print("> Resolving India's Got Latent episode stream via IGL engine...")
-        return app_igl_resolve(url, quality=clean_quality, season=season, episode=episode)
+        return app_igl_resolve(url, quality=clean_quality)
 
-    if ("youtube.com" in lower or "youtu.be" in lower) and any(w in lower for w in ["latent", "samay", "igl"]):
+    if not skip_igl and ("youtube.com" in lower or "youtu.be" in lower) and any(w in lower for w in ["latent", "samay", "igl"]):
         igl = get_igl_module()
         if igl:
             try:
@@ -4904,7 +4834,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     yt_id = ep.get('youtubeId')
                     if yt_id and yt_id.lower() in lower:
                         print(f"> Detected India's Got Latent episode: {ep.get('title')}")
-                        return app_igl_resolve(ep.get('dataId') or ep.get('id'), quality=clean_quality, season=season, episode=episode)
+                        return app_igl_resolve(ep.get('dataId') or ep.get('id'), quality=clean_quality)
             except Exception:
                 pass
 
@@ -5527,16 +5457,27 @@ def app_download(payload):
 
     # Priority 1: India's Got Latent
     if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
-        igl_res = app_igl_resolve(url, quality=quality, season=season, episode=episode)
-        headers = igl_res.get("stream_headers") or igl_res.get("headers") or {}
-        if not headers.get('Referer'):
-            headers['Referer'] = 'https://igl-8wky.freeforall.dev/'
-            headers['Origin'] = 'https://igl-8wky.freeforall.dev'
+        igl_res = app_igl_resolve(url, quality=quality)
         clean_name = clean_filename(out_name or igl_res.get("title") or title, default_ext=".mp4", quality=quality)
         if not clean_name.lower().endswith(".mp4"):
             clean_name += ".mp4"
-        dest_path = get_dest_path(clean_name, target_dir)
-        path = download_file_stream(igl_res["url"], clean_name, custom_headers=headers, target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
+
+        # If this episode is a YouTube stream, download directly with yt-dlp
+        yt_target = igl_res.get("yt_url") or (igl_res["url"] if any(y in igl_res["url"] for y in ("youtube.com", "youtu.be")) else None)
+        if yt_target:
+            path = handle_youtube_or_video(
+                yt_target,
+                target_dir=target_dir,
+                quality_arg=quality,
+                cookie=cookie,
+                standalone=True,
+                job_id=jid,
+                cache_dir=cache_dir,
+                out_name=clean_name,
+            )
+        else:
+            headers = igl_res.get("stream_headers") or {}
+            path = download_file_stream(igl_res["url"], clean_name, custom_headers=headers, target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
 
     # Priority 1.5: Direct pre-resolved stream URL (Instant Single Movie / Episode Download)
     elif stream_url and stream_url.startswith(("http://", "https://")) and scope not in ("season", "series") and not any(h in lower or h in stream_lower for h in ["youtube.com", "youtu.be", "googlevideo.com", "t.me/", "telegram.me/", "telegram.dog/"]):
