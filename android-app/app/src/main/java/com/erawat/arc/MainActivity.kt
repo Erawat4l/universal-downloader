@@ -17,6 +17,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.PowerManager
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -351,6 +352,41 @@ private data class CliTrace(
     val isError: Boolean = false,
 )
 
+private data class CachedTrace(
+    val trace: CliTrace?,
+    val liveStep: String,
+    val elapsedSeconds: Float,
+)
+
+private object AppSessionCache {
+    val searchHits = mutableMapOf<String, List<SearchHit>>()
+    val searchTraces = mutableMapOf<String, CachedTrace>()
+    val targets = mutableMapOf<String, MediaTarget>()
+    val targetTraces = mutableMapOf<String, CachedTrace>()
+}
+
+private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+    return powerManager.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+private fun requestIgnoreBatteryOptimizations(context: Context) {
+    try {
+        val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:${context.packageName}")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        try {
+            val fallback = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(fallback)
+        } catch (_: Exception) {}
+    }
+}
+
 class MainActivity : ComponentActivity() {
     private val incomingUrl = mutableStateOf<String?>(null)
 
@@ -666,6 +702,8 @@ private fun ArcApp(
     var googleCookies by rememberSaveable { mutableStateOf(preferences.getString("google_cookies", "") ?: "") }
     var showGoogleInfoDialog by rememberSaveable { mutableStateOf(false) }
     var showGoogleLoginDialog by rememberSaveable { mutableStateOf(false) }
+    var showAboutDialog by rememberSaveable { mutableStateOf(false) }
+    var isBatteryExempt by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
     val episodeCache = remember { mutableMapOf<String, MediaTarget>() }
 
     var searchTrace by remember { mutableStateOf<CliTrace?>(null) }
@@ -1159,6 +1197,15 @@ private fun ArcApp(
                     status = "Completed",
                     isError = false,
                 )
+                val searchKey = query.trim()
+                if (searchKey.isNotBlank()) {
+                    AppSessionCache.searchHits[searchKey] = resultList
+                    AppSessionCache.searchTraces[searchKey] = CachedTrace(
+                        trace = searchTrace,
+                        liveStep = searchLiveStepText,
+                        elapsedSeconds = searchElapsedSeconds,
+                    )
+                }
             }
             "resolve" -> {
                 val isSeries = data?.optBoolean("is_series", false) ?: false
@@ -1347,6 +1394,15 @@ private fun ArcApp(
                     status = "Completed",
                     isError = false,
                 )
+                val targetKey = target.targetUrl.trim().ifBlank { input.trim() }
+                if (targetKey.isNotBlank()) {
+                    AppSessionCache.targets[targetKey] = target
+                    AppSessionCache.targetTraces[targetKey] = CachedTrace(
+                        trace = analysisTrace,
+                        liveStep = analysisLiveStepText,
+                        elapsedSeconds = analysisElapsedSeconds,
+                    )
+                }
             }
             "download" -> {
                 val isCancelled = data?.optBoolean("cancelled", false) == true ||
@@ -1512,6 +1568,20 @@ private fun ArcApp(
             clean.startsWith("igl:", ignoreCase = true) ||
             clean.startsWith("magnet:", ignoreCase = true)
         if (isDirectUrl) {
+            val cachedTarget = AppSessionCache.targets[clean]
+            val cachedTargetTrace = AppSessionCache.targetTraces[clean]
+            if (cachedTarget != null && season == null && episode == null) {
+                target = cachedTarget
+                cachedTargetTrace?.let {
+                    analysisTrace = it.trace
+                    analysisLiveStepText = it.liveStep
+                    analysisElapsedSeconds = it.elapsedSeconds
+                }
+                overlay = "analysis"
+                homeOverlay = "analysis"
+                resolveLoading = false
+                return
+            }
             resolveLoading = true
             val isYouTubeClean = clean.contains("youtu", ignoreCase = true)
             val isSameShow = !isYouTubeClean && (clean.equals(target.targetUrl, ignoreCase = true) ||
@@ -1528,11 +1598,17 @@ private fun ArcApp(
                 isYouTubeClean -> "YouTube Video"
                 else -> clean.split("/").lastOrNull { it.isNotBlank() } ?: "Media stream"
             }
+            val fileExtMatch = Regex("""\.(zip|aip|rar|7z|tar|gz|apk|pdf|epub|iso|dmg|exe|bin|doc|docx|xls|xlsx|ppt|pptx)$""", RegexOption.IGNORE_CASE).containsMatchIn(clean.split("?").first())
+            val isDirectFile = fileExtMatch
+            val initialCanStream = !isDirectFile
+            val initialMediaType = if (isDirectFile) "file" else "video"
+
             val isMovieTitle = (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
             val detectedSeries = !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
                                  (mediaCategoryOverride?.contains("TV", ignoreCase = true) == true) ||
                                  Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(titleToUse))
             val detectedCategory = when {
+                isDirectFile -> "FILE"
                 isMovieTitle -> "MOVIE"
                 detectedSeries -> "TV SERIES"
                 clean.contains("youtu", ignoreCase = true) -> "YOUTUBE"
@@ -1565,7 +1641,7 @@ private fun ArcApp(
                 MediaTarget(
                     title = titleToUse,
                     source = if (detectedSeries) "TV Series" else (if (clean.contains("youtu", ignoreCase = true)) "YouTube" else "Movie"),
-                    detail = if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else "Analyzing media...",
+                    detail = if (detectedSeries) "Season ${season ?: 1} · Episode ${episode ?: 1}" else (if (isDirectFile) "Direct File" else "Analyzing media..."),
                     size = "Detecting",
                     description = clean,
                     targetUrl = clean,
@@ -1581,8 +1657,8 @@ private fun ArcApp(
                     playlistEntries = emptyList(),
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
-                    canStream = true,
-                    mediaType = "video",
+                    canStream = initialCanStream,
+                    mediaType = initialMediaType,
                     audioTracks = sortedChoices,
                     selectedAudioLang = initialSelectedLang,
                     year = detectedYear,
@@ -1608,6 +1684,21 @@ private fun ArcApp(
                 "resolve"
             )
         } else {
+            val cachedHits = AppSessionCache.searchHits[clean]
+            val cachedSearchTrace = AppSessionCache.searchTraces[clean]
+            if (cachedHits != null) {
+                query = clean
+                hits = cachedHits
+                cachedSearchTrace?.let {
+                    searchTrace = it.trace
+                    searchLiveStepText = it.liveStep
+                    searchElapsedSeconds = it.elapsedSeconds
+                }
+                overlay = "search"
+                homeOverlay = "search"
+                searchLoading = false
+                return
+            }
             query = clean
             searchTrace = null
             searchLiveStepText = ""
@@ -2251,10 +2342,20 @@ private fun ArcApp(
                             } catch (_: Exception) {}
                             message("Google account disconnected.")
                         },
+                        isBatteryExempt = isBatteryExempt,
+                        onRequestBatteryExemption = {
+                            requestIgnoreBatteryOptimizations(context)
+                            isBatteryExempt = isIgnoringBatteryOptimizations(context)
+                        },
+                        onOpenAboutFeatures = { showAboutDialog = true },
                     )
                 }
             }
         }
+
+            if (showAboutDialog) {
+                AboutFeaturesDialog(onDismiss = { showAboutDialog = false })
+            }
 
             // Series Download Options Dialog
             if (showSeriesDownloadDialog) {
@@ -3724,6 +3825,9 @@ private fun SettingsScreen(
     googleAccountEmail: String,
     onGoogleInfo: () -> Unit,
     onGoogleDisconnect: () -> Unit,
+    isBatteryExempt: Boolean = false,
+    onRequestBatteryExemption: () -> Unit = {},
+    onOpenAboutFeatures: () -> Unit = {},
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -3823,6 +3927,34 @@ private fun SettingsScreen(
                     )
                 }
             }
+
+            Spacer(Modifier.height(6.dp))
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable(onClick = onRequestBatteryExemption),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                ) {
+                    MediaGlyph(Icons.Outlined.CheckCircle, Modifier.size(36.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Battery Optimization", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(
+                            if (isBatteryExempt) "Unrestricted · Background downloads active" else "Optimized · Tap to disable battery restrictions",
+                            color = ArcMuted,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Icon(Icons.AutoMirrored.Outlined.ArrowForward, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(16.dp))
+                }
+            }
         }
 
         item {
@@ -3879,7 +4011,85 @@ private fun SettingsScreen(
                 }
             }
         }
+
+        item {
+            SettingsGroup("About")
+            Card(
+                colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable(onClick = onOpenAboutFeatures),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                ) {
+                    MediaGlyph(Icons.Outlined.Info, Modifier.size(36.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("About ARC Features", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("View core capabilities and supported formats", color = ArcMuted, fontSize = 11.sp)
+                    }
+                    Icon(Icons.AutoMirrored.Outlined.ArrowForward, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(16.dp))
+                }
+            }
+        }
     }
+}
+
+@Composable
+private fun AboutFeaturesDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ArcSurface,
+        titleContentColor = ArcWhite,
+        textContentColor = ArcWhite,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text("About ARC Features", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Core features:", color = ArcMuted, fontSize = 12.sp)
+                listOf(
+                    "Universal Media Downloader & Streamer",
+                    "Direct Progressive Downloads (No Slow Muxing)",
+                    "Multi-Audio Track Selector (Hindi, English, Original)",
+                    "India's Got Latent Catalog & Episode Selector",
+                    "Movies & TV Series Season / Episode Management",
+                    "Background Download Service & System Notifications",
+                    "Dynamic Resolution Switcher (4K, 1080p, 720p, 480p, Audio)",
+                    "Direct File Handler (.apk, .zip, .pdf, documents)",
+                    "Instant Torrent & Magnet Media Resolver",
+                    "Session Execution Cache & Real-Time Engine Logs",
+                ).forEach { feature ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(5.dp)
+                                .clip(CircleShape)
+                                .background(ArcWhite)
+                        )
+                        Text(feature, fontSize = 12.sp)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text("Done", fontWeight = FontWeight.Bold)
+            }
+        }
+    )
 }
 
 @Composable
@@ -4377,6 +4587,8 @@ private fun JobRow(
             },
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val ext = job.path.substringAfterLast('.', "").lowercase()
+            val isMedia = ext in listOf("mp4", "mkv", "webm", "avi", "mov", "ts", "mp3", "m4a", "aac", "flac", "ogg", "wav")
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (job.poster.isNotBlank()) {
                     AsyncImage(
@@ -4389,7 +4601,7 @@ private fun JobRow(
                             .background(Color(0xFF222222)),
                     )
                 } else {
-                    MediaGlyph(if (job.status == "Complete") Icons.Outlined.PlayArrow else Icons.Outlined.FileDownload, Modifier.size(34.dp))
+                    MediaGlyph(if (job.status == "Complete" && isMedia) Icons.Outlined.PlayArrow else Icons.Outlined.FileDownload, Modifier.size(34.dp))
                 }
                 Column(Modifier.weight(1f)) {
                     Text(job.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -4414,9 +4626,9 @@ private fun JobRow(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     TextButton(onClick = { onOpen(job.path) }) {
-                        Icon(Icons.Outlined.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(if (isMedia) Icons.Outlined.PlayArrow else Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("Play", fontSize = 12.sp)
+                        Text(if (isMedia) "Play" else "Open File", fontSize = 12.sp)
                     }
                     TextButton(onClick = { onShare(job.path) }) {
                         Icon(Icons.Outlined.Share, contentDescription = null, modifier = Modifier.size(16.dp))

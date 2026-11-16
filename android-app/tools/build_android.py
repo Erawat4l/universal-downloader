@@ -371,6 +371,9 @@ def sync_python_engine() -> None:
 
 
 def get_next_build_number() -> int:
+    env_num = os.environ.get("ARC_BUILD_NUM")
+    if env_num and env_num.isdigit():
+        return int(env_num)
     output_dir = APP_ROOT / "app" / "build" / "outputs" / "apk" / "debug"
     sdcard_downloads = Path("/sdcard/Download")
     numbers = []
