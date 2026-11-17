@@ -293,7 +293,10 @@ def get_stream_headers_for_url(url, base_headers=None):
     try:
         parsed = urllib.parse.urlparse(url)
         hostname = (parsed.hostname or '').lower()
-        if 'okcdn' in hostname or 'freeforall.dev' in hostname or 'indiassgetlentp' in hostname:
+        if 'okcdn' in hostname:
+            headers.pop('Origin', None)
+            headers.pop('Referer', None)
+        elif 'freeforall.dev' in hostname or 'indiassgetlentp' in hostname:
             headers['Referer'] = 'https://igl-8wky.freeforall.dev/'
             headers['Origin'] = 'https://igl-8wky.freeforall.dev'
         elif 'hakunaymatata.com' in hostname or 'bcdn' in hostname:
@@ -1097,6 +1100,9 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
     while True:
         try:
             req_headers = dict(headers)
+            if 'okcdn' in url.lower():
+                req_headers.pop('Origin', None)
+                req_headers.pop('Referer', None)
             if downloaded > 0:
                 req_headers['Range'] = f'bytes={downloaded}-'
             
@@ -1424,7 +1430,6 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'buffersize': 1024 * 64,
         'http_chunk_size': 10485760,
         'logger': NetworkAwareLogger(),
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
     }
 
     node_bin = shutil.which('node')

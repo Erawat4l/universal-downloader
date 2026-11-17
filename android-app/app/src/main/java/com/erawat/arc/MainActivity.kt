@@ -2881,14 +2881,16 @@ private fun HomeScreen(
                     Text("Universal Downloader", color = ArcMuted, fontSize = 11.sp)
                 }
                 Spacer(Modifier.weight(1f))
-                StatusPill("Ready")
+                val activeDownloadsCount = jobs.count { it.status == "Downloading" }
+                val pillText = if (activeDownloadsCount > 0) "Downloading $activeDownloadsCount" else "Ready"
+                StatusPill(pillText)
             }
         }
         item {
             Spacer(Modifier.height(4.dp))
             Text("Universal Downloader", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp)
             Spacer(Modifier.height(4.dp))
-            Text("Download and stream media directly on your device", color = ArcMuted, fontSize = 13.sp)
+            Text("Paste a link. Get your media.", color = ArcMuted, fontSize = 13.sp)
         }
         item {
             OutlinedTextField(
@@ -2918,7 +2920,7 @@ private fun HomeScreen(
         }
         item { SectionHeader("Recent Downloads", "See Library", onLibrary) }
         if (jobs.isEmpty()) {
-            item { EmptyState("No Downloads Yet", "Media links and downloads will appear here.") }
+            item { EmptyState("Nothing here yet", "Paste a link to begin.") }
         } else {
             items(jobs.take(3)) { job -> JobRow(job, onOpen = onOpen, onShare = onShare) }
         }
@@ -3572,7 +3574,7 @@ private fun ActivityScreen(
             Text("Active and recent downloads", color = ArcMuted, fontSize = 13.sp)
         }
         if (jobs.isEmpty()) {
-            item { EmptyState("No Active Downloads", "Active downloads will appear here.") }
+            item { EmptyState("No Active Downloads", "Active downloads will appear here.", icon = Icons.Outlined.FileDownload) }
         } else {
             items(jobs) { job ->
                 Card(
@@ -3782,7 +3784,7 @@ private fun LibraryScreen(
             Text("Downloaded media files on device.", color = ArcMuted, fontSize = 13.sp)
         }
         if (jobs.isEmpty()) {
-            item { EmptyState("No Files Yet", "Completed downloads will appear here.") }
+            item { EmptyState("No Files Yet", "Completed downloads will appear here.", icon = Icons.Outlined.Folder) }
         } else {
             items(jobs) { job ->
                 Card(
@@ -3977,7 +3979,7 @@ private fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Notifications", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                         Text(
-                            if (notifications) "Enabled · Alerts when downloads finish" else "Disabled · Muted",
+                            "Know when it's done",
                             color = ArcMuted,
                             fontSize = 11.sp,
                         )
@@ -4015,7 +4017,7 @@ private fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Battery Optimization", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                         Text(
-                            if (isBatteryExempt) "Unrestricted · Background downloads active" else "Optimized · Tap to disable battery restrictions",
+                            "Unrestricted · Downloads never pause",
                             color = ArcMuted,
                             fontSize = 11.sp,
                         )
@@ -4108,7 +4110,7 @@ private fun SettingsScreen(
                     MediaGlyph(Icons.Outlined.Info, Modifier.size(36.dp))
                     Column(Modifier.weight(1f)) {
                         Text("About ARC Features", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Text("View core capabilities and supported formats", color = ArcMuted, fontSize = 11.sp)
+                        Text("What ARC can do", color = ArcMuted, fontSize = 11.sp)
                     }
                     Icon(Icons.AutoMirrored.Outlined.ArrowForward, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(16.dp))
                 }
@@ -4132,16 +4134,16 @@ private fun AboutFeaturesDialog(onDismiss: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Core features:", color = ArcMuted, fontSize = 12.sp)
                 listOf(
-                    "Universal Media Downloader & Streamer",
-                    "Direct Progressive Downloads (No Slow Muxing)",
-                    "Multi-Audio Track Selector (Hindi, English, Original)",
-                    "India's Got Latent Catalog & Episode Selector",
-                    "Movies & TV Series Season / Episode Management",
-                    "Background Download Service & System Notifications",
-                    "Dynamic Resolution Switcher (4K, 1080p, 720p, 480p, Audio)",
-                    "Direct File Handler (.apk, .zip, .pdf, documents)",
-                    "Instant Torrent & Magnet Media Resolver",
-                    "Session Execution Cache & Real-Time Engine Logs",
+                    "Universal Downloader: Download or stream almost anything.",
+                    "Direct Downloads: No muxing wait.",
+                    "Multi-Audio: Hindi, English, or Original.",
+                    "Resolution Control: 4K to 480p, or audio only.",
+                    "Series & Movies: Seasons and episodes, organized.",
+                    "India's Got Latent: Browse and pick any episode.",
+                    "Background Downloads: Live notifications while you do other things.",
+                    "File Handler: APK, ZIP, PDF, and documents.",
+                    "Torrent & Magnet: Paste a link and go.",
+                    "Engine Logs: Real-time session diagnostics.",
                 ).forEach { feature ->
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -4455,22 +4457,16 @@ private fun GoogleAccountInfoDialog(
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Outlined.AccountCircle, contentDescription = null, tint = ArcWhite)
-                Text("Google / YouTube", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                Text("Sign in only if needed.", fontWeight = FontWeight.Bold, fontSize = 17.sp)
             }
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "ARC automatically streams and downloads YouTube without login using optimized direct engines. Signing in is only necessary if YouTube blocks stream manifests with bot-check or 403 errors.",
+                    "ARC downloads YouTube without login. Sign in only if YouTube blocks a request with a bot-check or 403 error. Your session stays on this device. Nothing is uploaded.",
                     fontSize = 12.sp,
                     color = ArcWhite,
                     lineHeight = 16.sp
-                )
-                Text(
-                    "What this does: Your Google session cookies are stored strictly on-device to authorize YouTube playback directly. Zero personal data leaves your device.",
-                    fontSize = 11.sp,
-                    color = ArcMuted,
-                    lineHeight = 15.sp
                 )
                 Surface(
                     color = Color(0xFF1E1711),
@@ -4489,7 +4485,7 @@ private fun GoogleAccountInfoDialog(
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
-                            "Safety Recommendation: Use a secondary or alternate Google account (not your primary personal account) to protect against any automated rate-limit flags.",
+                            "Use a secondary Google account, not your primary one.",
                             fontSize = 11.sp,
                             color = Color(0xFFFFD59E),
                             lineHeight = 15.sp
@@ -4750,10 +4746,10 @@ private fun MediaGlyph(icon: ImageVector, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun EmptyState(title: String, detail: String) {
+private fun EmptyState(title: String, detail: String, icon: ImageVector = Icons.Outlined.Link) {
     Card(colors = CardDefaults.cardColors(containerColor = ArcSurface), shape = RoundedCornerShape(18.dp)) {
         Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            MediaGlyph(Icons.Outlined.Link, Modifier.size(48.dp))
+            MediaGlyph(icon, Modifier.size(48.dp))
             Spacer(Modifier.height(12.dp))
             Text(title, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(5.dp))
