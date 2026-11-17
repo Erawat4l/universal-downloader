@@ -33,7 +33,19 @@ FALLBACK_DOMAINS = [
     "https://igl-8wky.freeforall.dev",
     "https://india-got-latent-3ms.pages.dev"
 ]
-WORKER_URL = "https://okcdn.moivies.workers.dev"
+
+def get_worker_url():
+    for conf_domain in ["https://igl-8wky.freeforall.dev", "https://indiassgetlentp.freeforall.dev"]:
+        try:
+            r = requests.get(f"{conf_domain}/config.json", timeout=3).json()
+            worker = r.get("OKCDN_WORKER")
+            if worker and worker.startswith("http"):
+                return worker.rstrip("/")
+        except Exception:
+            pass
+    return "https://okcdn.uppcldirect.workers.dev"
+
+WORKER_URL = "https://okcdn.uppcldirect.workers.dev"
 
 def get_dest_dir():
     target = os.environ.get("ARC_DOWNLOAD_DIR") or "/sdcard/Download"
@@ -227,16 +239,28 @@ def resolve_stream_info(ep, base_url, target_quality="best"):
 
     # OKCDN Stream
     item_id = ep.get('id')
-    headers = {'Referer': base_url}
+    eff_base = base_url or 'https://igl-8wky.freeforall.dev'
+    headers = {'Referer': eff_base}
     print(f"{CLR_YELLOW}➜ Resolving high-speed video streams from Worker...{CLR_RESET}")
-    try:
-        resp = requests.get(f"{WORKER_URL}/?id={item_id}", headers=headers, timeout=12).json()
-    except Exception as e:
-        print(f"{CLR_RED}✖ Worker API request failed: {e}{CLR_RESET}")
-        return None
+    worker_candidates = [get_worker_url(), "https://okcdn.uppcldirect.workers.dev", "https://okcdn.moivies.workers.dev"]
+    seen_w = set()
+    unique_workers = [w for w in worker_candidates if not (w in seen_w or seen_w.add(w))]
 
-    if resp.get('status') != 'success' or not resp.get('streams'):
-        print(f"{CLR_RED}✖ Worker error: {resp.get('message') or resp.get('error') or 'Stream unavailable'}{CLR_RESET}")
+    resp = None
+    for w_url in unique_workers:
+        try:
+            r = requests.get(f"{w_url}/?id={item_id}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('status') == 'success' and data.get('streams'):
+                    resp = data
+                    break
+        except Exception as e:
+            print(f"{CLR_DIM}[WARN] Worker {w_url} failed: {e}{CLR_RESET}")
+            continue
+
+    if not resp or resp.get('status') != 'success' or not resp.get('streams'):
+        print(f"{CLR_RED}✖ Worker error: {resp.get('message') or resp.get('error') or 'Stream unavailable' if resp else 'All workers unreachable'}{CLR_RESET}")
         return None
 
     streams = resp.get('streams')

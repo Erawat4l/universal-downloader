@@ -1122,7 +1122,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                             if m_simple:
                                 disp_filename = m_simple.group(1) or m_simple.group(2)
 
-                    if disp_filename:
+                    if disp_filename and (not os.path.splitext(filename)[1] or any(filename.lower().startswith(p) for p in ('download', 'video', 'stream', 'media', 'direct file', 'file'))):
                         filename = clean_filename(disp_filename)
                         dest_path = get_dest_path(filename, target_dir)
                     elif 'application/pdf' in content_type and not filename.endswith('.pdf'):
@@ -1377,6 +1377,31 @@ class NetworkAwareLogger:
             if not check_network():
                 wait_for_network()
 
+def ensure_cookiefile_from_string(cookie_str, target_dir=None):
+    if not cookie_str or os.path.isfile(cookie_str):
+        return cookie_str
+    try:
+        tmp_dir = target_dir or os.path.expanduser("~/.cache")
+        os.makedirs(tmp_dir, exist_ok=True)
+        cookie_path = os.path.join(tmp_dir, "arc_yt_cookies.txt")
+        if "# Netscape" in cookie_str or "\t" in cookie_str:
+            with open(cookie_path, "w", encoding="utf-8") as f:
+                f.write(cookie_str)
+            return cookie_path
+        lines = ["# Netscape HTTP Cookie File", "# https://curl.se/docs/http-cookies.html", ""]
+        now = int(time.time()) + 86400 * 365
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                lines.append(f".youtube.com\tTRUE\t/\tTRUE\t{now}\t{k.strip()}\t{v.strip()}")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return cookie_path
+    except Exception as e:
+        print(f"[WARN] Failed to write cookiefile: {e}")
+        return None
+
 def get_ytdlp_opts(custom_opts=None, cookie=None):
     opts = {}
     if HAS_YTDLP:
@@ -1399,6 +1424,7 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         'buffersize': 1024 * 64,
         'http_chunk_size': 10485760,
         'logger': NetworkAwareLogger(),
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
     }
 
     node_bin = shutil.which('node')
@@ -1430,6 +1456,9 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
         if os.path.isfile(cookie):
             opts['cookiefile'] = cookie
         else:
+            cookie_file = ensure_cookiefile_from_string(cookie)
+            if cookie_file:
+                opts['cookiefile'] = cookie_file
             opts.setdefault('http_headers', {})['Cookie'] = cookie
     if custom_opts:
         opts.update(custom_opts)
@@ -1480,17 +1509,17 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     if not HAS_YTDLP:
         return 'best[ext=mp4]/best/b', False
 
-    # Standard format map (strictly progressive single-file streams to prevent slow ffmpeg muxing)
+    # Standard format map (prefers progressive single-file streams with video+audio fallback)
     format_map = {
-        '1': ('best[ext=mp4]/best/b', 'Best Available (Auto - Highest Quality)'),
-        '2160p': ('best[height<=2160][ext=mp4]/best[height<=2160]/best/b', '2160p (4K)'),
-        '1440p': ('best[height<=1440][ext=mp4]/best[height<=1440]/best/b', '1440p (2K)'),
-        '1080p': ('best[height<=1080][ext=mp4]/best[height<=1080]/best/b', '1080p (Full HD)'),
-        '720p': ('best[height<=720][ext=mp4]/best[height<=720]/best/b', '720p (HD)'),
-        '480p': ('best[height<=480][ext=mp4]/best[height<=480]/best/b', '480p (SD)'),
-        '360p': ('best[height<=360][ext=mp4]/best[height<=360]/best/b', '360p (Low)'),
-        '240p': ('best[height<=240][ext=mp4]/best[height<=240]/best/b', '240p'),
-        '144p': ('best[height<=144][ext=mp4]/best[height<=144]/best/b', '144p'),
+        '1': ('best[ext=mp4]/best/bestvideo+bestaudio/best', 'Best Available (Auto - Highest Quality)'),
+        '2160p': ('best[height<=2160][ext=mp4]/best[height<=2160]/bestvideo[height<=2160]+bestaudio/best', '2160p (4K)'),
+        '1440p': ('best[height<=1440][ext=mp4]/best[height<=1440]/bestvideo[height<=1440]+bestaudio/best', '1440p (2K)'),
+        '1080p': ('best[height<=1080][ext=mp4]/best[height<=1080]/bestvideo[height<=1080]+bestaudio/best', '1080p (Full HD)'),
+        '720p': ('best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best', '720p (HD)'),
+        '480p': ('best[height<=480][ext=mp4]/best[height<=480]/bestvideo[height<=480]+bestaudio/best', '480p (SD)'),
+        '360p': ('best[height<=360][ext=mp4]/best[height<=360]/bestvideo[height<=360]+bestaudio/best', '360p (Low)'),
+        '240p': ('best[height<=240][ext=mp4]/best[height<=240]/bestvideo[height<=240]+bestaudio/best', '240p'),
+        '144p': ('best[height<=144][ext=mp4]/best[height<=144]/bestvideo[height<=144]+bestaudio/best', '144p'),
         'audio': ('bestaudio/best', 'Audio Only (MP3/M4A)'),
         'mp3': ('bestaudio/best', 'Audio Only (MP3)'),
     }
@@ -1856,8 +1885,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
             f"best[height<={cap}][ext=mp4]/"
             f"best[height<={cap}]/"
-            f"best[ext=mp4]/"
-            f"best/b"
+            f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
+            f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
+            f"bestvideo[height<={cap}]+{audio_sel}/"
+            f"bestvideo[height<={cap}]+bestaudio/"
+            f"bestvideo+{audio_sel}/"
+            f"bestvideo+bestaudio/"
+            f"best"
         )
 
     print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'audio+video'}]...")
@@ -4420,16 +4454,15 @@ def search_igl_episodes(query):
                     score = 70
 
         if score > 0:
-            badge = "MEMBERS ONLY" if c == "MEMBERS" else ("BONUS / BTS" if c == "BONUS" else "FULL EPISODE")
             poster = get_igl_poster(ep, category=c)
             did = ep.get('dataId') or ep.get('id')
             matches.append((score, get_ep_order(ep), {
                 "title": ep.get('title'),
-                "type": "IGL EPISODE",
-                "year": 2024,
+                "type": "IGL",
+                "year": "",
                 "audios": [{"language": "Original", "title": ep.get('title'), "url": f"igl:{did}", "poster": poster}],
-                "providers": [badge],
-                "source": "India's Got Latent",
+                "providers": [],
+                "source": "ARC",
                 "poster": poster,
                 "url": f"igl:{did}",
             }))
@@ -4508,7 +4541,8 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
                     "direct_url": direct_stream,
                     "target_url": f"igl:{match_ep.get('dataId') or match_ep.get('id')}",
                     "title": resolved_title,
-                    "source": "India's Got Latent",
+                    "source": "ARC",
+                    "type": "IGL",
                     "poster": poster,
                     "quality": yt_res.get('quality', 'Best Available'),
                     "qualities": yt_res.get('qualities', ["Best Available", "1080p (Full HD)", "720p (HD)"]),
@@ -4534,7 +4568,8 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
         "stream_url": stream_url,
         "target_url": f"igl:{match_ep.get('dataId') or match_ep.get('id')}",
         "title": resolved_title,
-        "source": "India's Got Latent",
+        "source": "ARC",
+        "type": "IGL",
         "poster": poster,
         "quality": info.get('quality', 'best'),
         "qualities": ["Best Available", "4K (2160p)", "1080p (Full HD)", "720p (HD)", "480p (SD)"],
@@ -5457,7 +5492,21 @@ def app_download(payload):
 
     # Priority 1: India's Got Latent
     if lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"]):
-        igl_res = app_igl_resolve(url, quality=quality)
+        try:
+            igl_res = app_igl_resolve(url, quality=quality)
+        except Exception as e:
+            print(f"[WARN] IGL re-resolve failed: {e}")
+            if stream_url and stream_url.startswith(("http://", "https://")):
+                clean_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                }
+                igl_res = {
+                    "url": stream_url,
+                    "title": title,
+                    "stream_headers": clean_headers,
+                }
+            else:
+                raise
         clean_name = clean_filename(out_name or igl_res.get("title") or title, default_ext=".mp4", quality=quality)
         if not clean_name.lower().endswith(".mp4"):
             clean_name += ".mp4"

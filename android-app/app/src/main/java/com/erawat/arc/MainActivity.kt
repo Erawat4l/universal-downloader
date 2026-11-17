@@ -1784,11 +1784,30 @@ private fun ArcApp(
             else -> input.ifBlank { resolvedUrl }
         }
 
+        val isIglTarget = target.targetUrl.startsWith("igl:", ignoreCase = true) ||
+            target.source.contains("Latent", ignoreCase = true) ||
+            target.source.contains("IGL", ignoreCase = true) ||
+            target.mediaCategory.contains("IGL", ignoreCase = true)
+        val isFileTarget = !target.canStream || target.mediaType.equals("file", true) || target.source.equals("Direct file", true)
+
+        val jobSource = when {
+            isFileTarget -> ""
+            isIglTarget -> "ARC"
+            else -> target.source.ifBlank { "Stream" }
+        }
+
+        val jobDetail = when {
+            isFileTarget -> "File"
+            isIglTarget -> "IGL · ARC"
+            isAudio -> "Audio"
+            else -> "${selectedQuality} · Video"
+        }
+
         val job = DownloadJob(
             id = java.util.UUID.randomUUID().toString(),
             title = finalTitle,
-            source = target.source.ifBlank { "Stream" },
-            detail = "${if (isAudio) "Audio" else selectedQuality}${if (isAudio) " · Audio" else " · Video"}",
+            source = jobSource,
+            detail = jobDetail,
             status = "Downloading",
             speed = "Connecting...",
             downloaded = "Starting...",
@@ -2991,11 +3010,15 @@ private fun SearchScreen(
                     Column(Modifier.weight(1f)) {
                         Text(hit.title, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Spacer(Modifier.height(3.dp))
-                        val metaParts = buildList {
-                            add(hit.type)
-                            if (hit.year.isNotBlank()) add(hit.year)
-                            if (hit.providers.isNotBlank()) add(hit.providers)
-                            if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
+                        val metaParts = if (hit.url.startsWith("igl:", ignoreCase = true) || hit.source.contains("Latent", ignoreCase = true) || hit.type.equals("IGL", ignoreCase = true)) {
+                            listOf("IGL", "ARC")
+                        } else {
+                            buildList {
+                                add(hit.type)
+                                if (hit.year.isNotBlank()) add(hit.year)
+                                if (hit.providers.isNotBlank()) add(hit.providers)
+                                if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
+                            }
                         }
                         Text(metaParts.joinToString(" · "), color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
@@ -3068,12 +3091,19 @@ private fun AnalysisScreen(
     val yearBadge = if (yearStr.isNotBlank()) " · $yearStr" else ""
     val providerBadge = if (target.providers.isNotBlank()) " · ${target.providers}" else ""
 
+    val isIglTarget = target.targetUrl.startsWith("igl:", ignoreCase = true) ||
+        target.source.contains("Latent", ignoreCase = true) ||
+        target.source.contains("IGL", ignoreCase = true) ||
+        target.mediaCategory.contains("IGL", ignoreCase = true)
+    val isFileTarget = target.mediaType == "file" || !target.canStream || target.source.equals("Direct file", true)
+
     val categoryBadge = when {
+        isIglTarget -> "IGL · ARC"
+        isFileTarget -> "FILE"
         isSeriesTarget -> "TV SERIES$yearBadge$providerBadge"
         isMovieTarget -> "MOVIE$yearBadge$providerBadge"
         isYouTubeTarget -> "YOUTUBE"
-        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) -> "${target.source.uppercase()}$yearBadge$providerBadge"
-        target.mediaType == "file" || !target.canStream -> "FILE"
+        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) && !target.source.equals("Direct file", true) -> "${target.source.uppercase()}$yearBadge$providerBadge"
         else -> "MOVIE$yearBadge$providerBadge"
     }
 
@@ -3488,7 +3518,7 @@ private fun AnalysisScreen(
                         Text(
                             if (target.isSeries) "Download $quality"
                             else if (target.isPlaylist) "Download Playlist ($quality)"
-                            else if (!target.canStream || target.mediaType == "file") "Download File"
+                            else if (!target.canStream || target.mediaType == "file" || target.source.equals("Direct file", true)) "Download File"
                             else "Download $quality",
                             fontWeight = FontWeight.Bold,
                         )
@@ -3578,7 +3608,13 @@ private fun ActivityScreen(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
-                                val actSrc = if (job.source.isNotBlank() && !job.source.equals("NetMirror", true) && !job.source.equals("Stream", true)) " · ${job.source}" else ""
+                                val actSrc = if (job.source.isNotBlank() &&
+                                    !job.source.equals("NetMirror", true) &&
+                                    !job.source.equals("Stream", true) &&
+                                    !job.source.equals("Direct file", true) &&
+                                    !job.source.equals("ARC", true) &&
+                                    !job.detail.equals("File", true) &&
+                                    !job.detail.equals("IGL · ARC", true)) " · ${job.source}" else ""
                                 Text(
                                     text = "${job.detail}$actSrc",
                                     color = ArcMuted,
@@ -3782,7 +3818,13 @@ private fun LibraryScreen(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
-                                val actSrc = if (job.source.isNotBlank() && !job.source.equals("NetMirror", true) && !job.source.equals("Stream", true)) " · ${job.source}" else ""
+                                val actSrc = if (job.source.isNotBlank() &&
+                                    !job.source.equals("NetMirror", true) &&
+                                    !job.source.equals("Stream", true) &&
+                                    !job.source.equals("Direct file", true) &&
+                                    !job.source.equals("ARC", true) &&
+                                    !job.detail.equals("File", true) &&
+                                    !job.detail.equals("IGL · ARC", true)) " · ${job.source}" else ""
                                 Text(
                                     text = "${job.detail}$actSrc",
                                     color = ArcMuted,
@@ -4641,7 +4683,13 @@ private fun JobRow(
                 }
                 Column(Modifier.weight(1f)) {
                     Text(job.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    val rowSrc = if (job.source.isNotBlank() && !job.source.equals("NetMirror", true) && !job.source.equals("Stream", true)) " · ${job.source}" else ""
+                    val rowSrc = if (job.source.isNotBlank() &&
+                        !job.source.equals("NetMirror", true) &&
+                        !job.source.equals("Stream", true) &&
+                        !job.source.equals("Direct file", true) &&
+                        !job.source.equals("ARC", true) &&
+                        !job.detail.equals("File", true) &&
+                        !job.detail.equals("IGL · ARC", true)) " · ${job.source}" else ""
                     Text("${job.detail}$rowSrc", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 Text(
