@@ -685,6 +685,7 @@ private fun ArcApp(
     var tabName by rememberSaveable { mutableStateOf(AppTab.HOME.name) }
     var overlay by rememberSaveable { mutableStateOf("") }
     var homeOverlay by rememberSaveable { mutableStateOf("") }
+    var navigationSource by rememberSaveable { mutableStateOf("") }
     var input by rememberSaveable { mutableStateOf("") }
     var audioOnly by rememberSaveable { mutableStateOf(false) }
 
@@ -937,9 +938,16 @@ private fun ArcApp(
 
     fun openStreamExternal(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
         try {
-            if (streamUrl.isBlank() || streamUrl.contains("youtube.com") || streamUrl.contains("youtu.be")) {
+            if (streamUrl.isBlank()) {
                 message("Resolving stream URL...")
                 return
+            }
+
+            val cleanHeaders = headers.toMutableMap().apply {
+                if (streamUrl.contains("okcdn", ignoreCase = true)) {
+                    remove("Origin")
+                    remove("Referer")
+                }
             }
 
             val isDirectPlayable = streamUrl.contains("googlevideo.com") ||
@@ -953,7 +961,7 @@ private fun ArcApp(
                     put("action", "stream_proxy")
                     put("url", streamUrl)
                     val hObj = JSONObject()
-                    headers.forEach { (k, v) -> hObj.put(k, v) }
+                    cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
                     put("headers", hObj)
                 }
                 val pRes = runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
@@ -964,23 +972,25 @@ private fun ArcApp(
             }
 
             if (playUrl.contains("127.0.0.1")) {
-                StreamService.start(context, streamUrl, headers)
+                StreamService.start(context, streamUrl, cleanHeaders)
                 try {
                     Thread.sleep(150)
                 } catch (_: Exception) {}
             }
             val uri = Uri.parse(playUrl)
+            val isM3u8 = playUrl.contains(".m3u8", ignoreCase = true) || playUrl.contains("hls_playlist", ignoreCase = true)
+            val mimeType = if (isM3u8) "application/x-mpegURL" else "video/*"
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "video/*")
+                setDataAndType(uri, mimeType)
                 putExtra("title", title.ifBlank { "Media Stream" })
                 putExtra("from_start", true)
                 putExtra("position", 0L)
-                headers.forEach { (k, v) -> putExtra(k, v) }
-                if (headers.isNotEmpty()) {
-                    val headersArray = headers.map { "${it.key}: ${it.value}" }.toTypedArray()
+                cleanHeaders.forEach { (k, v) -> putExtra(k, v) }
+                if (cleanHeaders.isNotEmpty()) {
+                    val headersArray = cleanHeaders.map { "${it.key}: ${it.value}" }.toTypedArray()
                     putExtra("headers", headersArray)
                     val bundle = Bundle()
-                    headers.forEach { (k, v) -> bundle.putString(k, v) }
+                    cleanHeaders.forEach { (k, v) -> bundle.putString(k, v) }
                     putExtra("android.media.intent.extra.HTTP_HEADERS", bundle)
                 }
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -1496,10 +1506,19 @@ private fun ArcApp(
         tabName = AppTab.HOME.name
         overlay = ""
         homeOverlay = ""
+        navigationSource = ""
         isSearchTraceExpanded = false
         isAnalysisTraceExpanded = false
         searchLoading = false
         resolveLoading = false
+        streamLoading = false
+        episodeLoading = false
+        hits = emptyList()
+        query = ""
+        searchTrace = null
+        analysisTrace = null
+        analysisLiveStepText = ""
+        searchLiveStepText = ""
         selectedQuality = "Best Available"
         audioOnly = false
         target = MediaTarget("", "", "", "", "")
@@ -1529,15 +1548,16 @@ private fun ArcApp(
                     currentTaskJobId = null
                     resolveLoading = false
                     searchLoading = false
+                    streamLoading = false
+                    episodeLoading = false
                     isSearchTraceExpanded = false
                     isAnalysisTraceExpanded = false
-                    if (hits.isNotEmpty() && overlay == "analysis") {
+                    if (navigationSource == "search" && hits.isNotEmpty() && overlay == "analysis") {
                         overlay = "search"
                         homeOverlay = "search"
                     } else {
                         openHome()
                     }
-                    message("Process cancelled.")
                     return@BackHandler
                 }
                 when {
@@ -1547,9 +1567,11 @@ private fun ArcApp(
                         currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
                         currentTaskJobId = null
                         resolveLoading = false
+                        streamLoading = false
+                        episodeLoading = false
                         isSearchTraceExpanded = false
                         isAnalysisTraceExpanded = false
-                        if (hits.isNotEmpty()) {
+                        if (navigationSource == "search" && hits.isNotEmpty()) {
                             overlay = "search"
                             homeOverlay = "search"
                         } else {
@@ -2014,6 +2036,7 @@ private fun ArcApp(
                                         currentTaskJob = null
                                         currentTaskJobId?.let { EmbeddedEngine.cancel(it) }
                                         currentTaskJobId = null
+                                        navigationSource = "search"
                                         isAnalysisTraceExpanded = false
                                         val sortedAudios = prioritizeAudioTracks(hit.audio)
                                         val chosenLang = audio.language.ifBlank {
@@ -2881,7 +2904,7 @@ private fun HomeScreen(
                     Text("Universal Downloader", color = ArcMuted, fontSize = 11.sp)
                 }
                 Spacer(Modifier.weight(1f))
-                val activeDownloadsCount = jobs.count { it.status == "Downloading" }
+                val activeDownloadsCount = jobs.count { it.status == "Downloading" || it.status == "Muxing" }
                 val pillText = if (activeDownloadsCount > 0) "Downloading $activeDownloadsCount" else "Ready"
                 StatusPill(pillText)
             }
@@ -3624,7 +3647,7 @@ private fun ActivityScreen(
                                 )
                             }
                             val isFetching = job.status == "Downloading" && job.progress <= 0.5f && (job.speed == "--" || job.speed.isBlank() || job.speed == "Connecting..." || job.downloaded == "0 MB" || job.downloaded.startsWith("Starting"))
-                            val badgeText = if (isFetching) "Fetching" else job.status
+                            val badgeText = if (job.status == "Muxing") "Muxing ${job.progress.toInt()}%" else if (isFetching) "Fetching" else job.status
                             val badgeColor = if (job.status == "Failed") Color(0xFFFF5252) else ArcWhite
                             val badgeBorder = if (job.status == "Failed") Color(0xFF882222) else Color(0xFF333333)
                             Box(
@@ -3697,7 +3720,7 @@ private fun ActivityScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             val cleanEta = job.eta.removePrefix("ETA").removePrefix("eta").trim()
                             val etaDisplay = if (cleanEta.isNotBlank() && cleanEta != "--") " · ETA $cleanEta" else ""
-                            val speedText = if (isFetching) "Resolving..." else "${job.speed}$etaDisplay"
+                            val speedText = if (job.status == "Muxing") "Muxing tracks" else if (isFetching) "Resolving..." else "${job.speed}$etaDisplay"
                             Text(
                                 text = speedText,
                                 fontSize = 11.sp,
@@ -4689,10 +4712,10 @@ private fun JobRow(
                     Text("${job.detail}$rowSrc", color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 Text(
-                    job.status,
+                    if (job.status == "Muxing") "Muxing ${job.progress.toInt()}%" else job.status,
                     color = when (job.status) {
                         "Complete" -> ArcWhite
-                        "Downloading" -> ArcWhite
+                        "Downloading", "Muxing" -> ArcWhite
                         else -> Color(0xFFFF5252)
                     },
                     fontSize = 11.sp,

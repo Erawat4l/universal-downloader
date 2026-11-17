@@ -16,6 +16,9 @@ import java.nio.ByteBuffer
  * No external terminal, shell, or companion app is required.
  */
 object EmbeddedEngine {
+    @Volatile
+    var currentMuxProgress: Double = -1.0
+
     fun execute(context: Context, request: JSONObject): JSONObject {
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(context.applicationContext))
@@ -30,7 +33,21 @@ object EmbeddedEngine {
         return try {
             val module = Python.getInstance().getModule("dl")
             val raw = module.callAttr("get_download_progress_json", jobId ?: "")
-            JSONObject(raw.toString())
+            val obj = JSONObject(raw.toString())
+            val muxPct = currentMuxProgress
+            if (muxPct >= 0.0) {
+                val pctInt = muxPct.toInt()
+                val targetKey = if (!jobId.isNullOrBlank()) jobId else obj.keys().asSequence().firstOrNull() ?: "job"
+                val existing = obj.optJSONObject(targetKey) ?: JSONObject()
+                existing.put("percent", muxPct)
+                existing.put("status", "Muxing")
+                existing.put("speed", "Muxing")
+                existing.put("eta", "$pctInt%")
+                existing.put("downloaded_str", "Muxing $pctInt%")
+                existing.put("total_str", "Combining tracks")
+                obj.put(targetKey, existing)
+            }
+            obj
         } catch (_: Exception) {
             JSONObject()
         }
@@ -155,6 +172,17 @@ object EmbeddedEngine {
                 return false
             }
 
+            var totalDurationUs = 0L
+            try {
+                for (i in 0 until videoExtractor.trackCount) {
+                    val format = videoExtractor.getTrackFormat(i)
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        totalDurationUs = maxOf(totalDurationUs, format.getLong(MediaFormat.KEY_DURATION))
+                    }
+                }
+            } catch (_: Exception) {}
+            currentMuxProgress = 0.0
+
             muxer.start()
             val maxBufferSize = 1024 * 1024
             val buffer = ByteBuffer.allocateDirect(maxBufferSize)
@@ -227,9 +255,14 @@ object EmbeddedEngine {
                 } catch (we: Exception) {
                     android.util.Log.w("EmbeddedEngine", "writeSampleData warning: ${we.message}")
                 }
+                if (totalDurationUs > 0) {
+                    val pct = ((pts.toDouble() / totalDurationUs.toDouble()) * 100.0).coerceIn(0.0, 99.0)
+                    currentMuxProgress = pct
+                }
                 minSource.advance()
             }
 
+            currentMuxProgress = 100.0
             muxer.stop()
             val success = outFile.exists() && outFile.length() > 0
             if (!success) {
@@ -240,6 +273,7 @@ object EmbeddedEngine {
             android.util.Log.e("EmbeddedEngine", "Native muxMultiple failed with exception", e)
             false
         } finally {
+            currentMuxProgress = -1.0
             try { muxer?.release() } catch (_: Exception) {}
             try { videoExtractor?.release() } catch (_: Exception) {}
             for (a in audioExtractors) {

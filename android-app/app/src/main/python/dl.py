@@ -450,6 +450,9 @@ class StreamProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             req_target = urllib.parse.urljoin(self.__class__.target_stream_url, self.path)
 
         req_headers = dict(self.__class__.stream_headers)
+        if 'okcdn' in req_target.lower():
+            req_headers.pop('Origin', None)
+            req_headers.pop('Referer', None)
         range_header = self.headers.get('Range')
         if range_header:
             req_headers['Range'] = range_header
@@ -694,11 +697,11 @@ def clean_filename(title, default_ext="", quality=None):
     base = re.sub(r'[\s._-]+(v\d+|\bv\d+\b|f\d+|part\d+)$', '', base, flags=re.I).strip()
     base = re.sub(r'\s*[\(\[]v\d+[\)\]]$', '', base, flags=re.I).strip()
 
-    # Enforce NAME{QUALITY} for video outputs
+    # Enforce NAME[QUALITY] for video outputs
     q_tag = extract_quality_tag(quality)
     if q_tag and not (ext and ext.lower() in ('.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg')):
         base = re.sub(r'\s*[\(\[\{](?:4320p|2160p|1440p|1080p|720p|480p|360p|240p|144p|4K|2K|HD|SD)[\)\]\}]', '', base, flags=re.I).strip()
-        base = f"{base}{{{q_tag}}}"
+        base = f"{base}[{q_tag}]"
 
     if ext:
         title = base + ext
@@ -1639,6 +1642,10 @@ def mux_video_and_audio(video_path, audio_path, output_path):
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
         return False
 
+    jid = get_current_job_id()
+    if jid:
+        render_download_progress(95.0, "Muxing media...", "Muxing", "--", job_id=jid)
+
     temp_out = output_path
     needs_rename = False
     if output_path in (video_path, audio_path):
@@ -1875,7 +1882,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             clean_base = clean_filename(out_name, default_ext="", quality=q_tag)
             outtmpl_pattern = os.path.join(stage_dir, f"{clean_base}.%(ext)s")
         else:
-            outtmpl_pattern = os.path.join(stage_dir, f"%(title)s{{{q_tag}}}.%(ext)s")
+            outtmpl_pattern = os.path.join(stage_dir, f"%(title)s[{q_tag}].%(ext)s")
 
     clean_audio_lang = str(audio_lang or "").strip().lower()
     if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
@@ -5273,22 +5280,23 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                    (clean_q_lower.startswith("360") and "360" in q_key):
                     stream_url = q_val
                     break
-        if not stream_url and quality_urls_map.get("Best Available"):
-            stream_url = quality_urls_map["Best Available"]
-        elif not stream_url and progressive:
-            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
-            stream_url = progressive_sorted[0].get("url")
-        else:
-            v_fmts = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-            if v_fmts:
-                v_sorted = sorted(v_fmts, key=lambda f: f.get("height") or 0, reverse=True)
-                stream_url = v_sorted[0].get("url")
+        if not stream_url:
+            if quality_urls_map.get("Best Available"):
+                stream_url = quality_urls_map["Best Available"]
+            elif progressive:
+                progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+                stream_url = progressive_sorted[0].get("url")
             else:
-                any_fmts = [f for f in formats if f.get("url")]
-                if any_fmts:
-                    stream_url = any_fmts[0].get("url")
+                v_fmts = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+                if v_fmts:
+                    v_sorted = sorted(v_fmts, key=lambda f: f.get("height") or 0, reverse=True)
+                    stream_url = v_sorted[0].get("url")
                 else:
-                    raise Exception("No direct playable stream could be extracted from YouTube format manifest")
+                    any_fmts = [f for f in formats if f.get("url")]
+                    if any_fmts:
+                        stream_url = any_fmts[0].get("url")
+                    else:
+                        raise Exception("No direct playable stream could be extracted from YouTube format manifest")
 
         if not stream_url or stream_url == url or "youtube.com" in stream_url or "youtu.be" in stream_url:
             raise Exception("Failed to resolve direct playable stream URL for this YouTube video")

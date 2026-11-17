@@ -56,6 +56,7 @@ object DownloadManager {
                     newStatus == "Cancelled" || job.status == "Cancelled" -> "Cancelled"
                     newStatus == "Paused" || job.status == "Paused" -> "Paused"
                     newStatus == "Complete" && p.optString("path").isNotBlank() -> "Complete"
+                    newStatus == "Muxing" -> "Muxing"
                     else -> "Downloading"
                 }
                 val path = p.optString("path", job.path).ifEmpty { job.path }

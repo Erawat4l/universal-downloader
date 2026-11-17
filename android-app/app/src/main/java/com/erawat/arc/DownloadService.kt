@@ -214,10 +214,14 @@ class DownloadService : Service() {
                     DownloadManager.updateProgress(progressObj)
 
                     val jobs = DownloadManager.getJobs()
-                    val activeJob = jobs.firstOrNull { it.id in activeJobIds && it.status == "Downloading" }
+                    val activeJob = jobs.firstOrNull { it.id in activeJobIds && (it.status == "Downloading" || it.status == "Muxing") }
                     if (activeJob != null) {
                         val pct = activeJob.progress.toInt().coerceIn(0, 100)
-                        val text = "${activeJob.downloaded} / ${activeJob.total} · ${activeJob.speed}"
+                        val text = if (activeJob.status == "Muxing") {
+                            "Muxing media: ${pct}%"
+                        } else {
+                            "${activeJob.downloaded} / ${activeJob.total} · ${activeJob.speed}"
+                        }
                         updateOngoingNotification(activeJob.title, pct, text)
                     }
                 }
