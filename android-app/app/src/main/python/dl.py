@@ -305,6 +305,12 @@ def get_stream_headers_for_url(url, base_headers=None):
             if hostname != 'bcdnt.hakunaymatata.com':
                 headers['Referer'] = 'https://mzfi.me/'
                 headers['Origin'] = 'https://mzfi.me'
+        elif '1024tera' in hostname or 'terabox' in hostname:
+            headers['Referer'] = 'https://www.1024tera.com/'
+            headers['Origin'] = 'https://www.1024tera.com'
+            ndus = os.environ.get('TERA_COOKIE')
+            if ndus:
+                headers['Cookie'] = f'ndus={ndus}'
         elif 'Referer' not in headers:
             headers['Referer'] = 'https://netmirror.plus/'
     except Exception:
@@ -1235,6 +1241,22 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                                 last_time = now
                                 last_downloaded = downloaded
                 break
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                parsed_host = (urllib.parse.urlparse(url).hostname or "").lower()
+                if '1024tera' in parsed_host or 'terabox' in parsed_host:
+                    print(f"\n[FAIL] TeraBox HTTP 403 Forbidden: TeraBox restricts direct downloads over 50MB to logged-in accounts.")
+                    print(f"[+] Direct Download Link (1h validity):\n    {url}")
+                    print(f"[+] Direct link copied to clipboard!")
+                    print(f"[+] To download directly in Termux CLI: export TERA_COOKIE=\"your_ndus_cookie\"")
+                    print(f"[+] Or paste the direct link in your browser / download manager (1DM / ADM).\n")
+                    try:
+                        subprocess.run(["termux-clipboard-set"], input=url.encode("utf-8"), capture_output=True, timeout=2)
+                    except Exception:
+                        pass
+                    return None
+            print(f"\n[FAIL] HTTP Error: {e}", flush=True)
+            return None
         except (requests.exceptions.RequestException, socket.error) as e:
             if not check_network():
                 wait_for_network()
@@ -4276,6 +4298,13 @@ def download(url, out_name=None, cookie=None, target_dir=None, quality_arg=None,
     try:
         # Check Bypasser for DDLs (MediaFire, Terabox, Uptobox, Zippyshare, etc.)
         PROCESS_MONITOR.log("Checking Direct Link Bypasser...")
+        if any(dom in url_lower for dom in ["terabox.", "1024tera.", "teraboxapp.", "nephobox.", "4funbox.", "mirrobox."]):
+            bypassed_path = handle_bypasser(url, out_name=out_name, target_dir=target_dir)
+            if bypassed_path:
+                PROCESS_MONITOR.set_status("Completed (Bypassed)")
+                return bypassed_path
+            return None
+
         bypassed_path = handle_bypasser(url, out_name=out_name, target_dir=target_dir)
         if bypassed_path:
             PROCESS_MONITOR.set_status("Completed (Bypassed)")
