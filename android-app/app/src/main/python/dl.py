@@ -296,9 +296,11 @@ def get_stream_headers_for_url(url, base_headers=None):
         if 'okcdn' in hostname:
             headers.pop('Origin', None)
             headers.pop('Referer', None)
+            headers['Accept-Encoding'] = 'identity'
         elif 'freeforall.dev' in hostname or 'indiassgetlentp' in hostname:
             headers['Referer'] = 'https://igl-8wky.freeforall.dev/'
             headers['Origin'] = 'https://igl-8wky.freeforall.dev'
+            headers['Accept-Encoding'] = 'identity'
         elif 'hakunaymatata.com' in hostname or 'bcdn' in hostname:
             if hostname != 'bcdnt.hakunaymatata.com':
                 headers['Referer'] = 'https://mzfi.me/'
@@ -777,6 +779,11 @@ def safe_move(src, dst):
         try: os.remove(dst)
         except Exception: pass
     try:
+        os.replace(src, dst)
+        return dst
+    except OSError:
+        pass
+    try:
         shutil.move(src, dst)
         return dst
     except Exception:
@@ -1085,12 +1092,23 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
     dest_path = get_dest_path(filename, target_dir)
     jid = job_id or get_current_job_id()
 
-    # Place in-progress fragments in cache directory if provided, keeping target directory clean
+    # Place in-progress fragments in cache directory ONLY if on the exact same filesystem,
+    # otherwise stage directly in destination directory to ensure instant 0ms atomic move at 100%
+    out_dir = os.path.dirname(dest_path) or target_dir or DEFAULT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    use_cache = False
     if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            if os.stat(cache_dir).st_dev == os.stat(out_dir).st_dev:
+                use_cache = True
+        except Exception:
+            use_cache = False
+
+    if use_cache:
         work_path = os.path.join(cache_dir, f".temp_{jid}_{filename}.part")
     else:
-        work_path = dest_path + ".part"
+        work_path = os.path.join(out_dir, f".temp_{jid}_{filename}.part")
 
     downloaded = 0
     total_bytes = 0
@@ -1103,6 +1121,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
     while True:
         try:
             req_headers = dict(headers)
+            req_headers['Accept-Encoding'] = 'identity'
             if 'okcdn' in url.lower():
                 req_headers.pop('Origin', None)
                 req_headers.pop('Referer', None)
@@ -1892,17 +1911,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
     if is_audio_only:
         format_spec = f"{audio_sel}/bestaudio/best"
-    else:
+    elif cap <= 360 and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none")):
         format_spec = (
             f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
             f"best[height<={cap}][ext=mp4]/"
             f"best[height<={cap}]/"
             f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
+            f"best"
+        )
+    else:
+        format_spec = (
+            f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
+            f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
             f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
             f"bestvideo[height<={cap}]+{audio_sel}/"
-            f"bestvideo[height<={cap}]+bestaudio/"
-            f"bestvideo+{audio_sel}/"
-            f"bestvideo+bestaudio/"
+            f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
+            f"best[height<={cap}][ext=mp4]/"
             f"best"
         )
 
@@ -3120,14 +3144,21 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
         audio_choices_list.sort(key=get_nm_aud_prio)
 
+        otts = []
+        try:
+            otts = get_ott_providers_for_title(display_title, media_type, year) or []
+        except Exception:
+            pass
+
         return {
             "url": direct_stream_url,
             "direct_url": direct_stream_url,
             "proxy_url": proxy_stream_url,
             "target_url": url,
             "title": display_title,
-            "source": "TV Series" if is_tv_series else "Movie",
-            "year": year,
+            "source": ", ".join(otts) if otts else ("TV Series" if is_tv_series else "Movie"),
+            "providers": otts,
+            "year": str(year) if year else "",
             "poster": poster,
             "quality": quality_arg if (quality_arg and quality_arg.lower() != 'best' and quality_arg in sorted_qualities) else (sorted_qualities[0] if sorted_qualities else "Best Available"),
             "qualities": sorted_qualities,
@@ -4988,14 +5019,17 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         client_attempts = [
             None,
             ['tv_embedded'],
-            ['android_creator'],
-            ['visionos', 'android'],
-            ['android', 'ios'],
+            ['web_creator'],
+            ['android'],
         ]
 
         safari_headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         }
+
+        best_extracted = None
+        best_formats = []
+        best_max_h = 0
 
         for client in client_attempts:
             ydl_opts = get_ytdlp_opts({
@@ -5013,12 +5047,22 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     if extracted and isinstance(extracted, dict):
                         extracted_fmts = [f for f in extracted.get("formats", []) if isinstance(f, dict) and f.get("url")]
                         if extracted_fmts:
-                            info = extracted
-                            formats = extracted.get("formats", [])
-                            break
+                            curr_h = max([f.get("height") or 0 for f in extracted_fmts if f.get("vcodec") != "none"] or [0])
+                            if curr_h > best_max_h:
+                                best_max_h = curr_h
+                                best_extracted = extracted
+                                best_formats = extracted.get("formats", [])
+                                if best_max_h >= 720:
+                                    break
+                            elif not best_extracted:
+                                best_extracted = extracted
+                                best_formats = extracted.get("formats", [])
             except Exception as e:
                 last_err = str(e)
                 continue
+
+        info = best_extracted
+        formats = best_formats
 
         if not info or not formats or not any(isinstance(f, dict) and f.get("url") for f in formats):
             err_msg = last_err or "No playable video streams found (YouTube bot verification or restriction)"
@@ -5177,10 +5221,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     master_m3u8 = (
                         "#EXTM3U\n"
                         "#EXT-X-VERSION:6\n"
-                        "#EXT-X-INDEPENDENT-SEGMENTS\n" +
-                        "\n".join(media_audio_lines) + "\n" +
+                        "#EXT-X-INDEPENDENT-SEGMENTS\n"
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},{codecs_str}AUDIO="audio"\n'
-                        f'{v_url}\n'
+                        f'{v_url}\n' +
+                        "\n".join(media_audio_lines) + "\n"
                     )
                     quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_master_{target_h}.m3u8", master_m3u8)
                     continue

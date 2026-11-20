@@ -17,6 +17,7 @@ data class DownloadJob(
     val poster: String = "",
     val url: String = "",
     val headers: Map<String, String> = emptyMap(),
+    val errorLog: String = "",
 ) {
     fun toJson(): JSONObject {
         val obj = JSONObject()
@@ -33,6 +34,7 @@ data class DownloadJob(
         obj.put("eta", eta)
         obj.put("poster", poster)
         obj.put("url", url)
+        obj.put("errorLog", errorLog)
         val h = JSONObject()
         headers.forEach { (k, v) -> h.put(k, v) }
         obj.put("headers", h)
@@ -58,7 +60,8 @@ data class DownloadJob(
                 eta = obj.optString("eta", "--"),
                 poster = obj.optString("poster"),
                 url = obj.optString("url"),
-                headers = hMap
+                headers = hMap,
+                errorLog = obj.optString("errorLog", "")
             )
         }
     }

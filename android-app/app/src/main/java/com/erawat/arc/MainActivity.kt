@@ -979,7 +979,7 @@ private fun ArcApp(
             }
             val uri = Uri.parse(playUrl)
             val isM3u8 = playUrl.contains(".m3u8", ignoreCase = true) || playUrl.contains("hls_playlist", ignoreCase = true)
-            val mimeType = if (isM3u8) "application/x-mpegURL" else "video/*"
+            val mimeType = "video/*"
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mimeType)
                 putExtra("title", title.ifBlank { "Media Stream" })
@@ -2364,6 +2364,7 @@ private fun ArcApp(
                         onPauseJob = { pauseJob(it) },
                         onResumeJob = { resumeJob(it) },
                         onDismissJob = { id -> DownloadManager.removeJob(context, id, false) },
+                        onCopyLogs = { text -> copyToClipboard(text, "Error logs") },
                     )
                     AppTab.LIBRARY -> LibraryScreen(
                         jobs = jobs.filter { it.status == "Complete" },
@@ -3039,10 +3040,14 @@ private fun SearchScreen(
                             listOf("IGL", "ARC")
                         } else {
                             buildList {
-                                add(hit.type)
-                                if (hit.year.isNotBlank()) add(hit.year)
-                                if (hit.providers.isNotBlank()) add(hit.providers)
-                                if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true)) add(hit.source)
+                                val provStr = hit.providers.ifBlank { if (hit.source.isNotBlank() && !hit.source.equals("NetMirror", true) && !hit.source.equals("Movie", true) && !hit.source.equals("TV Series", true)) hit.source else "" }
+                                if (provStr.isNotBlank()) {
+                                    add(provStr)
+                                } else {
+                                    add(hit.type)
+                                }
+                                val yr = hit.year.takeUnless { it == "0" || it.isBlank() }
+                                if (yr != null) add(yr)
                             }
                         }
                         Text(metaParts.joinToString(" · "), color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -3112,7 +3117,7 @@ private fun AnalysisScreen(
         target.canStream
     )
 
-    val yearStr = extractYear(target.title, target.year)
+    val yearStr = extractYear(target.title, target.year).takeUnless { it == "0" }.orEmpty()
     val yearBadge = if (yearStr.isNotBlank()) " · $yearStr" else ""
     val providerBadge = if (target.providers.isNotBlank()) " · ${target.providers}" else ""
 
@@ -3125,11 +3130,11 @@ private fun AnalysisScreen(
     val categoryBadge = when {
         isIglTarget -> "IGL · ARC"
         isFileTarget -> "FILE"
-        isSeriesTarget -> "TV SERIES$yearBadge$providerBadge"
-        isMovieTarget -> "MOVIE$yearBadge$providerBadge"
+        isSeriesTarget -> if (target.providers.isNotBlank()) "${target.providers.uppercase()}$yearBadge" else "TV SERIES$yearBadge"
+        isMovieTarget -> if (target.providers.isNotBlank()) "${target.providers.uppercase()}$yearBadge" else "MOVIE$yearBadge"
         isYouTubeTarget -> "YOUTUBE"
-        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) && !target.source.equals("Direct file", true) -> "${target.source.uppercase()}$yearBadge$providerBadge"
-        else -> "MOVIE$yearBadge$providerBadge"
+        target.source.isNotBlank() && !target.source.equals("Stream", ignoreCase = true) && !target.source.equals("NetMirror", ignoreCase = true) && !target.source.equals("Movie", ignoreCase = true) && !target.source.equals("Direct file", true) -> "${target.source.uppercase()}$yearBadge"
+        else -> if (target.providers.isNotBlank()) "${target.providers.uppercase()}$yearBadge" else "MOVIE$yearBadge"
     }
 
     val headerTitle = cleanShowTitle(target.title).ifBlank { target.title.ifBlank { "Resolving link..." } }
@@ -3585,7 +3590,10 @@ private fun ActivityScreen(
     onPauseJob: (String) -> Unit = {},
     onResumeJob: (String) -> Unit = {},
     onDismissJob: (String) -> Unit = {},
+    onCopyLogs: (String) -> Unit = {},
 ) {
+    var viewLogsJob by remember { mutableStateOf<DownloadJob?>(null) }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 22.dp),
@@ -3737,6 +3745,15 @@ private fun ActivityScreen(
                         ) {
                             if (job.status == "Failed") {
                                 OutlinedButton(
+                                    onClick = { viewLogsJob = job },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                ) {
+                                    Icon(Icons.Outlined.Info, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Logs", fontSize = 11.sp)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                OutlinedButton(
                                     onClick = { onDismissJob(job.id) },
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                                 ) {
@@ -3786,6 +3803,55 @@ private fun ActivityScreen(
                 }
             }
         }
+    }
+
+    if (viewLogsJob != null) {
+        val currJob = viewLogsJob!!
+        AlertDialog(
+            onDismissRequest = { viewLogsJob = null },
+            containerColor = ArcRaised,
+            title = {
+                Text("Error Diagnostics", fontWeight = FontWeight.Bold, color = ArcWhite, fontSize = 16.sp)
+            },
+            text = {
+                Column {
+                    Text(currJob.title, color = ArcMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(10.dp))
+                    val logContent = currJob.errorLog.ifBlank { currJob.detail.ifBlank { "No detailed diagnostic trace available." } }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 280.dp)
+                            .background(Color(0xFF161616), RoundedCornerShape(8.dp))
+                            .border(1.dp, Color(0xFF2E2E2E), RoundedCornerShape(8.dp))
+                            .padding(10.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        Text(
+                            text = logContent,
+                            color = ArcWhite,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val logText = currJob.errorLog.ifBlank { currJob.detail }
+                        onCopyLogs(logText)
+                    }
+                ) {
+                    Text("Copy Logs", color = ArcWhite, fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewLogsJob = null }) {
+                    Text("Close", color = ArcMuted)
+                }
+            }
+        )
     }
 }
 

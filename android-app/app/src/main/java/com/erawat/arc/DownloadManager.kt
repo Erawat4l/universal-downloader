@@ -84,8 +84,15 @@ object DownloadManager {
     }
 
     @Synchronized
-    fun markFailed(context: Context, jobId: String, error: String) {
-        updateJob(context, jobId) { it.copy(status = "Failed", speed = "--", eta = "--") }
+    fun markFailed(context: Context, jobId: String, error: String, errorLog: String = "") {
+        updateJob(context, jobId) {
+            it.copy(
+                status = "Failed",
+                speed = "--",
+                eta = "--",
+                errorLog = if (errorLog.isNotBlank()) errorLog else error
+            )
+        }
     }
 
     @Synchronized

@@ -184,14 +184,28 @@ class DownloadService : Service() {
         val isCancelled = data?.optBoolean("cancelled", false) == true ||
                 data?.optString("status") == "Cancelled" ||
                 response.optBoolean("cancelled", false)
-        val path = data?.optString("path").orEmpty()
+        var path = data?.optString("path").orEmpty()
+        if (path.isBlank()) {
+            path = response.optString("path").orEmpty()
+        }
 
-        if (!isOk || isCancelled || path.isBlank()) {
+        val existingJob = DownloadManager.getJobs().firstOrNull { it.id == jobId }
+        val checkPath = if (path.isNotBlank()) path else existingJob?.path.orEmpty()
+        val fileActuallyExists = checkPath.isNotBlank() && runCatching {
+            val f = File(checkPath)
+            f.exists() && f.length() > 0
+        }.getOrDefault(false)
+
+        if (fileActuallyExists) {
+            DownloadManager.markComplete(applicationContext, jobId, checkPath)
+            postCompletionNotification(title.ifBlank { "Download" }, checkPath)
+        } else if (!isOk || isCancelled || path.isBlank()) {
             if (isCancelled) {
                 DownloadManager.markCancelled(applicationContext, jobId)
             } else {
                 val errMsg = response.optString("error", "Download failed.")
-                DownloadManager.markFailed(applicationContext, jobId, errMsg)
+                val engineLogs = response.optString("logs", "").ifBlank { errMsg }
+                DownloadManager.markFailed(applicationContext, jobId, errMsg, engineLogs)
             }
         } else {
             DownloadManager.markComplete(applicationContext, jobId, path)
