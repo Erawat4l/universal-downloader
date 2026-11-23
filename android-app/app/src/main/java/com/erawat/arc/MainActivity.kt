@@ -711,6 +711,9 @@ private fun ArcApp(
     var showGoogleLoginDialog by rememberSaveable { mutableStateOf(false) }
     var showAboutDialog by rememberSaveable { mutableStateOf(false) }
     var isBatteryExempt by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
+    val hasSeenOnboarding = preferences.getBoolean("has_seen_onboarding_permissions", false)
+    var showOnboardingNotificationDialog by rememberSaveable { mutableStateOf(!hasSeenOnboarding) }
+    var showOnboardingBatteryDialog by rememberSaveable { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         MainActivity.onResumeCallback = {
@@ -855,7 +858,7 @@ private fun ArcApp(
     }
 
     LaunchedEffect(Unit) {
-        if (notifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (hasSeenOnboarding && notifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
@@ -1531,6 +1534,14 @@ private fun ArcApp(
             showAudioSelectDialog -> {
                 showAudioSelectDialog = false
                 pendingActionAfterAudioSelect = null
+            }
+            showOnboardingNotificationDialog -> {
+                showOnboardingNotificationDialog = false
+                showOnboardingBatteryDialog = true
+            }
+            showOnboardingBatteryDialog -> {
+                showOnboardingBatteryDialog = false
+                preferences.edit().putBoolean("has_seen_onboarding_permissions", true).apply()
             }
             showDeleteConfirmJobId != null -> showDeleteConfirmJobId = null
             showGoogleInfoDialog -> showGoogleInfoDialog = false
@@ -2623,6 +2634,40 @@ private fun ArcApp(
                 )
             }
 
+            // Onboarding Step 1: Notifications Permission Dialog
+            if (showOnboardingNotificationDialog) {
+                OnboardingNotificationDialog(
+                    onAllow = {
+                        showOnboardingNotificationDialog = false
+                        notifications = true
+                        preferences.edit().putBoolean("notifications_enabled", true).apply()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        showOnboardingBatteryDialog = true
+                    },
+                    onCancel = {
+                        showOnboardingNotificationDialog = false
+                        showOnboardingBatteryDialog = true
+                    }
+                )
+            }
+
+            // Onboarding Step 2: Battery Optimization Dialog
+            if (showOnboardingBatteryDialog) {
+                OnboardingBatteryDialog(
+                    onAllow = {
+                        showOnboardingBatteryDialog = false
+                        preferences.edit().putBoolean("has_seen_onboarding_permissions", true).apply()
+                        requestIgnoreBatteryOptimizations(context)
+                    },
+                    onCancel = {
+                        showOnboardingBatteryDialog = false
+                        preferences.edit().putBoolean("has_seen_onboarding_permissions", true).apply()
+                    }
+                )
+            }
+
             // Google Account Info Dialog
             if (showGoogleInfoDialog) {
                 GoogleAccountInfoDialog(
@@ -3487,11 +3532,12 @@ private fun AnalysisScreen(
                 }
             }
             val hasResolvedMedia = target.directStreamUrl.isNotBlank() ||
+                target.proxyUrl.isNotBlank() ||
                 target.qualityUrls.isNotEmpty() ||
                 target.isPlaylist ||
                 target.targetUrl.startsWith("magnet:", ignoreCase = true)
 
-            if (!hasResolvedMedia) {
+            if (!loading && !streamLoading && !episodeLoading && !hasResolvedMedia && target.title.isNotBlank()) {
                 item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = ArcSurface),
@@ -3517,12 +3563,6 @@ private fun AnalysisScreen(
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 16.sp,
                                 color = ArcWhite,
-                            )
-                            Text(
-                                "No active streaming servers or direct downloadable sources could be found for this media. CDN nodes may be rate-limiting or offline.",
-                                fontSize = 12.sp,
-                                color = ArcMuted,
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                             )
                             Spacer(Modifier.height(6.dp))
                             OutlinedButton(
@@ -4223,16 +4263,16 @@ private fun AboutFeaturesDialog(onDismiss: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Core features:", color = ArcMuted, fontSize = 12.sp)
                 listOf(
-                    "Universal Downloader: Download or stream almost anything.",
-                    "Direct Downloads: No muxing wait.",
-                    "Multi-Audio: Hindi, English, or Original.",
-                    "Resolution Control: 4K to 480p, or audio only.",
-                    "Series & Movies: Seasons and episodes, organized.",
-                    "India's Got Latent: Browse and pick any episode.",
-                    "Background Downloads: Live notifications while you do other things.",
-                    "File Handler: APK, ZIP, PDF, and documents.",
-                    "Torrent & Magnet: Paste a link and go.",
-                    "Engine Logs: Real-time session diagnostics.",
+                    "Universal Downloader",
+                    "Direct Downloads",
+                    "Multi-Audio",
+                    "Resolution Control",
+                    "Series & Movies",
+                    "India's Got Latent",
+                    "Background Downloads",
+                    "File Handler",
+                    "Torrent & Magnet",
+                    "Engine Logs",
                 ).forEach { feature ->
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -4256,6 +4296,82 @@ private fun AboutFeaturesDialog(onDismiss: () -> Unit) {
                 shape = RoundedCornerShape(10.dp),
             ) {
                 Text("Done", fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
+
+@Composable
+private fun OnboardingNotificationDialog(
+    onAllow: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        containerColor = ArcSurface,
+        titleContentColor = ArcWhite,
+        textContentColor = ArcWhite,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text("Enable Notifications", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
+        text = {
+            Text(
+                "Enable notifications to know when downloads finish and track live progress.",
+                color = ArcMuted,
+                fontSize = 14.sp
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onAllow,
+                colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text("Allow", fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel", color = ArcMuted)
+            }
+        }
+    )
+}
+
+@Composable
+private fun OnboardingBatteryDialog(
+    onAllow: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        containerColor = ArcSurface,
+        titleContentColor = ArcWhite,
+        textContentColor = ArcWhite,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text("Disable Battery Optimization", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
+        text = {
+            Text(
+                "Allow ARC to run unrestricted in the background so downloads never pause.",
+                color = ArcMuted,
+                fontSize = 14.sp
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onAllow,
+                colors = ButtonDefaults.buttonColors(containerColor = ArcRaised, contentColor = ArcWhite),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text("Allow", fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel", color = ArcMuted)
             }
         }
     )
