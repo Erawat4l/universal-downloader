@@ -2485,6 +2485,8 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
     raise Exception("Could not download Telegram link media.")
 
 _NETMIRROR_META_CACHE = {}
+_STREAM_RESOLVE_CACHE = {}
+_NETMIRROR_AUDIO_CACHE = {}
 
 def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None, download_scope="episode", job_id=None, cache_dir=None, audio_lang=None):
     jid = job_id or get_current_job_id()
@@ -2742,6 +2744,13 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
     tv_val = '1' if is_tv_series else ''
     display_title = f"{show_base} S{int(se_val)}E{int(ep_val)}" if is_tv_series else clean_title
 
+    cache_key = f"{media_id}_s{se_val}_e{ep_val}_{str(audio_lang or '').lower().strip()}"
+    if action_mode in ('direct_link_only', 'direct') and cache_key in _STREAM_RESOLVE_CACHE:
+        c_ts, c_res = _STREAM_RESOLVE_CACHE[cache_key]
+        if time.time() - c_ts < 7200:
+            print(f"> Instant stream cache hit for {display_title} (0ms)")
+            return c_res
+
     if not embed_json or is_tv_series:
         # Resolve stream via vidsync / NetMirror external & watchbox server APIs
         kind_label = f"series episode S{se_val}E{ep_val}" if is_tv_series else "movie"
@@ -2780,54 +2789,41 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         candidate_streams = []
         qualities_dict = {}
 
-        # Step 2: Primary Indian Stream Gateways (Vidsync & Hindi nodes)
         if tm_id:
-            sys.stdout.write("  [2/4]  Querying primary Indian stream nodes (Vidsync & Hindi servers)... ")
-            sys.stdout.flush()
-            try:
-                if is_tv_series:
-                    vidsync_api = f"https://vidsync.pro/api/stream?type=tv&id={tm_id}&season={se_val}&episode={ep_val}"
-                else:
-                    vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
-                v_headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Referer': 'https://vidsync.pro/',
-                    'Origin': 'https://vidsync.pro'
-                }
-                v_res = requests.get(vidsync_api, headers=v_headers, timeout=3.5)
-                if v_res.status_code == 200:
-                    v_data = v_res.json()
-                    sources = v_data.get('sources', [])
-                    if sources:
-                        matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
-                        if not matching:
-                            matching = sources
-                        for s in matching:
-                            q_raw = s.get('quality', 'Auto')
-                            m_q = re.search(r'(4k|1080p|720p|480p|360p)', q_raw, re.I)
-                            q_k = m_q.group(1).lower() if m_q else q_raw.lower()
-                            u = s.get('url') or s.get('directUrl') or s.get('permanent_m3u8_url') or s.get('rawUrl')
-                            if u:
-                                lbl = f"{q_k.upper()} (HD)" if q_k == '720p' else (f"{q_k.upper()} (SD)" if q_k == '480p' else f"{q_k.upper()} (Full HD)" if q_k == '1080p' else q_k.upper())
-                                qualities_dict[q_k] = {'label': lbl, 'url': u, 'dom': 'https://vidsync.pro', 'headers': s.get('headers')}
-                                if u not in [c[0] for c in candidate_streams]:
-                                    candidate_streams.append((u, 'https://vidsync.pro'))
-                        print(f"[OK] Found {len(matching)} Indian source(s)")
+            def _fetch_vidsync():
+                res_q = {}
+                res_c = []
+                try:
+                    if is_tv_series:
+                        vidsync_api = f"https://vidsync.pro/api/stream?type=tv&id={tm_id}&season={se_val}&episode={ep_val}"
                     else:
-                        print("[FAIL] (no Indian stream sources)")
-                else:
-                    print(f"[FAIL] (status {v_res.status_code})")
-            except Exception:
-                print("[FAIL] (offline/timed out)")
+                        vidsync_api = f"https://vidsync.pro/api/stream?type={media_type}&id={tm_id}"
+                    v_headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Referer': 'https://vidsync.pro/',
+                        'Origin': 'https://vidsync.pro'
+                    }
+                    v_res = requests.get(vidsync_api, headers=v_headers, timeout=2.5)
+                    if v_res.status_code == 200:
+                        v_data = v_res.json()
+                        sources = v_data.get('sources', [])
+                        if sources:
+                            matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
+                            if not matching:
+                                matching = sources
+                            for s in matching:
+                                q_raw = s.get('quality', 'Auto')
+                                m_q = re.search(r'(4k|1080p|720p|480p|360p)', q_raw, re.I)
+                                q_k = m_q.group(1).lower() if m_q else q_raw.lower()
+                                u = s.get('url') or s.get('directUrl') or s.get('permanent_m3u8_url') or s.get('rawUrl')
+                                if u:
+                                    lbl = f"{q_k.upper()} (HD)" if q_k == '720p' else (f"{q_k.upper()} (SD)" if q_k == '480p' else f"{q_k.upper()} (Full HD)" if q_k == '1080p' else q_k.upper())
+                                    res_q[q_k] = {'label': lbl, 'url': u, 'dom': 'https://vidsync.pro', 'headers': s.get('headers')}
+                                    res_c.append((u, 'https://vidsync.pro'))
+                except Exception:
+                    pass
+                return res_q, res_c
 
-        # Step 3: Multi-Server CDN manifests (Queried only after Indian nodes or as fallback)
-        if tm_id:
-            if candidate_streams:
-                sys.stdout.write("  [3/4]  Querying multi-server CDN manifests... ")
-            else:
-                print("  [WARN] Primary Indian stream nodes offline or rate-limiting. Searching multi-server global CDN fallback manifests...")
-                sys.stdout.write("  [3/4]  Querying multi-server global CDN fallback manifests... ")
-            sys.stdout.flush()
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
             sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
             wb_params = {
@@ -2836,56 +2832,69 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                 'tv': tv_val, 'token': '', 'warp': 'false', '_': str(int(time.time() * 1000))
             }
             wb_query = urllib.parse.urlencode(wb_params)
-            
-            for dom in ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']:
+
+            def _fetch_watchbox(dom):
+                res_q = {}
+                res_c = []
                 try:
                     wb_url = f"{dom}/play/watchbox.php?{wb_query}"
-                    wb_r = requests.get(wb_url, headers=headers, timeout=4)
+                    wb_r = requests.get(wb_url, headers=headers, timeout=2.5)
                     if wb_r.status_code == 200 and len(wb_r.text) > 200:
-                        # 1. Extract from dl-item (contains resolution + filesize, e.g. "1080P 2GB")
                         for m_dl in re.finditer(r'<div class=[\"\']dl-item[\"\']>([^<]+)<[^>]+onclick=[\"\']myFunction_dl\([\"\']([^\"\']+)[\"\']', wb_r.text):
                             lbl = m_dl.group(1).strip()
                             u = m_dl.group(2).strip()
                             m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
                             q_key = m_q.group(1).lower() if m_q else lbl.lower()
-                            if q_key not in qualities_dict or '.mp4' in u.lower():
-                                qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
-                            if u not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((u, dom))
+                            res_q[q_key] = {'label': lbl, 'url': u, 'dom': dom}
+                            res_c.append((u, dom))
 
-                        # 2. Extract selector items in quality_new
                         for m_sel in re.finditer(r'html\s*:\s*[\"\']([^\"\']*(?:1080|720|480|360|4k)[^\"\']*)[\"\'].*?url\s*:\s*[\"\'](https?://[^\"\'\`\s]+)[\"\']', wb_r.text, re.I | re.DOTALL):
                             lbl = m_sel.group(1).strip()
                             u = m_sel.group(2).strip()
                             m_q = re.search(r'(4k|1080p|720p|480p|360p)', lbl, re.I)
                             q_key = m_q.group(1).lower() if m_q else lbl.lower()
-                            if q_key not in qualities_dict or '.mp4' in u.lower():
-                                qualities_dict[q_key] = {'label': lbl, 'url': u, 'dom': dom}
-                            if u not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((u, dom))
+                            if q_key not in res_q or '.mp4' in u.lower():
+                                res_q[q_key] = {'label': lbl, 'url': u, 'dom': dom}
+                            res_c.append((u, dom))
 
-                        # 3. Extract art.url
                         for m_art in re.finditer(r'art\.url\s*=\s*play_url\([\"\']([^\"\']+)[\"\']', wb_r.text):
                             u = m_art.group(1).strip()
-                            if u and u.startswith(('http://', 'https://')) and u not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((u, dom))
+                            if u and u.startswith(('http://', 'https://')):
+                                res_c.append((u, dom))
 
-                        # 4. Extract art.tvVideoUrl
                         for m_tv in re.finditer(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
                             raw_val = m_tv.group(1)
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
-                            if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((dec_url, dom))
+                            if dec_url and dec_url.startswith(('http://', 'https://')):
+                                res_c.append((dec_url, dom))
 
-                        # 4. Extract TvUrl
                         for m_tvurl in re.finditer(r'TvUrl\s*:\s*[\"\']([^\"\']+)[\"\']', wb_r.text):
                             raw_val = m_tvurl.group(1)
                             dec_url = decrypt_netmirror_tv_url(raw_val) if 'encrypt=true' in raw_val else raw_val
-                            if dec_url and dec_url.startswith(('http://', 'https://')) and dec_url not in [c[0] for c in candidate_streams]:
-                                candidate_streams.append((dec_url, dom))
-                        break
+                            if dec_url and dec_url.startswith(('http://', 'https://')):
+                                res_c.append((dec_url, dom))
                 except Exception:
                     pass
+                return res_q, res_c
+
+            sys.stdout.write("  [2/4]  Querying stream gateways & CDN manifests concurrently... ")
+            sys.stdout.flush()
+            wb_domains = ['https://bet.watch22.shop', 'https://limit.watch22.shop', 'https://webvp.watch21.shop']
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(_fetch_vidsync)]
+                for d in wb_domains:
+                    futures.append(ex.submit(_fetch_watchbox, d))
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        q_map, c_list = f.result()
+                        for k, v in q_map.items():
+                            if k not in qualities_dict or '.mp4' in str(v.get('url', '')).lower():
+                                qualities_dict[k] = v
+                        for c_url, c_dom in c_list:
+                            if c_url not in [c[0] for c in candidate_streams]:
+                                candidate_streams.append((c_url, c_dom))
+                    except Exception:
+                        pass
 
             if candidate_streams:
                 print(f"[OK] Found {len(candidate_streams)} stream candidate(s)")
@@ -3142,22 +3151,26 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
 
         audio_choices_list = []
         if 'show_base' in locals() and show_base:
-            try:
-                raw_peers = search_netmirror(show_base)
-                g_peers = group_and_deduplicate_results(raw_peers, query=show_base)
-                seen_langs = set()
-                for g in g_peers:
-                    for lang, a_item in g.get("audios", {}).items():
-                        if lang not in seen_langs:
-                            seen_langs.add(lang)
-                            audio_choices_list.append({
-                                "language": lang,
-                                "url": a_item.get("url", ""),
-                                "title": a_item.get("title", ""),
-                                "id": a_item.get("id"),
-                            })
-            except Exception:
-                pass
+            if show_base in _NETMIRROR_AUDIO_CACHE:
+                audio_choices_list = _NETMIRROR_AUDIO_CACHE[show_base]
+            else:
+                try:
+                    raw_peers = search_netmirror(show_base)
+                    g_peers = group_and_deduplicate_results(raw_peers, query=show_base)
+                    seen_langs = set()
+                    for g in g_peers:
+                        for lang, a_item in g.get("audios", {}).items():
+                            if lang not in seen_langs:
+                                seen_langs.add(lang)
+                                audio_choices_list.append({
+                                    "language": lang,
+                                    "url": a_item.get("url", ""),
+                                    "title": a_item.get("title", ""),
+                                    "id": a_item.get("id"),
+                                })
+                    _NETMIRROR_AUDIO_CACHE[show_base] = audio_choices_list
+                except Exception:
+                    pass
 
         def get_nm_aud_prio(c):
             l = c.get("language", "").lower()
@@ -3177,7 +3190,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         except Exception:
             pass
 
-        return {
+        res_dict = {
             "url": direct_stream_url,
             "direct_url": direct_stream_url,
             "proxy_url": proxy_stream_url,
@@ -3198,6 +3211,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             "season": int(se_val) if is_tv_series else None,
             "episode": int(ep_val) if is_tv_series else None,
         }
+        if 'cache_key' in locals() and cache_key:
+            _STREAM_RESOLVE_CACHE[cache_key] = (time.time(), res_dict)
+        return res_dict
 
     if action_mode in ('stream_only', 'stream', 'stream_and_download'):
         launch_player(direct_stream_url, player_choice="vlc", custom_headers=stream_headers, title=display_title)
@@ -4855,7 +4871,230 @@ def fetch_torrent_tiers(title, is_series=False, season=None, episode=None):
     except Exception as e:
         return {}
 
-def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, job_id=None):
+def format_size_bytes(num_bytes):
+    try:
+        num = float(num_bytes)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if num < 1024.0:
+                return f"{num:.1f} {unit}" if unit in ('MB', 'GB', 'TB') else f"{int(num)} {unit}"
+            num /= 1024.0
+        return f"{num:.1f} PB"
+    except Exception:
+        return "Unknown"
+
+def bdecode_with_info(src):
+    idx = 0
+    length = len(src)
+    info_slice = None
+
+    def decode():
+        nonlocal idx, info_slice
+        if idx >= length:
+            raise ValueError('Unexpected EOF in bencoded data')
+        ch = src[idx:idx+1]
+        if ch == b'i':
+            idx += 1
+            end = src.find(b'e', idx)
+            if end == -1:
+                raise ValueError('Unterminated integer')
+            val = int(src[idx:end])
+            idx = end + 1
+            return val
+        elif ch == b'l':
+            idx += 1
+            res = []
+            while src[idx:idx+1] != b'e':
+                res.append(decode())
+            idx += 1
+            return res
+        elif ch == b'd':
+            idx += 1
+            res = {}
+            while src[idx:idx+1] != b'e':
+                key = decode()
+                k_str = key.decode('utf-8', errors='replace') if isinstance(key, bytes) else str(key)
+                val_start = idx
+                val = decode()
+                val_end = idx
+                if k_str == 'info' and info_slice is None:
+                    info_slice = src[val_start:val_end]
+                res[k_str] = val
+            idx += 1
+            return res
+        elif ch.isdigit():
+            colon = src.find(b':', idx)
+            if colon == -1:
+                raise ValueError('Expected colon in bencoded string')
+            str_len = int(src[idx:colon])
+            start = colon + 1
+            end = start + str_len
+            if end > length:
+                raise ValueError('Bencoded string exceeds data length')
+            val = src[start:end]
+            idx = end
+            return val
+        else:
+            raise ValueError(f'Unknown bencode type: {ch}')
+
+    data = decode()
+    return data, info_slice
+
+def is_torrent_file(filepath):
+    try:
+        if not os.path.isfile(filepath):
+            return False
+        with open(filepath, "rb") as f:
+            header = f.read(20)
+            return header.startswith(b"d8:announce") or b"4:info" in header or header.startswith(b"d")
+    except Exception:
+        return False
+
+def parse_torrent_metadata(torrent_source, cache_dir=None):
+    clean = str(torrent_source).strip()
+    if clean.startswith("file://"):
+        clean = clean[7:]
+
+    # Handle magnet links
+    if clean.lower().startswith("magnet:"):
+        dn_m = re.search(r"dn=([^&]+)", clean)
+        xt_m = re.search(r"xt=urn:btih:([^&]+)", clean, re.I)
+        display_name = urllib.parse.unquote(dn_m.group(1)).replace("+", " ") if dn_m else "Torrent Media"
+        info_hash = xt_m.group(1).lower() if xt_m else ""
+        hash_short = f"{info_hash[:10]}..." if info_hash else "DHT"
+        lbl = "Best Available (Torrent)"
+        RESOLVED_TORRENT_MAP[lbl] = {
+            "magnet": clean,
+            "file_idx": None,
+            "label": lbl,
+        }
+        return {
+            "url": clean,
+            "target_url": clean,
+            "title": display_name,
+            "source": "BitTorrent",
+            "poster": "",
+            "quality": lbl,
+            "qualities": [lbl],
+            "can_stream": False,
+            "media_type": "file",
+            "detail": f"BitTorrent Swarm • Hash: {hash_short}",
+            "description": f"BitTorrent Magnet Link\nName: {display_name}\nInfo Hash: {info_hash}\nNetwork: Global DHT & Trackers",
+            "size": "BitTorrent Swarm",
+            "torrent_sources": {
+                lbl: { "magnet": clean, "file_idx": None }
+            }
+        }
+
+    # Handle .torrent file or URL
+    torrent_bytes = None
+    torrent_file_path = clean
+
+    if clean.startswith(("http://", "https://")):
+        try:
+            cache_tor_dir = os.path.expanduser("~/.cache/torrents")
+            if cache_dir:
+                cache_tor_dir = os.path.join(cache_dir, "torrents")
+            os.makedirs(cache_tor_dir, exist_ok=True)
+            r = requests.get(clean, headers=HEADERS, timeout=12)
+            if r.status_code == 200:
+                torrent_bytes = r.content
+                thash = hashlib.sha1(torrent_bytes).hexdigest()
+                torrent_file_path = os.path.join(cache_tor_dir, f"{thash}.torrent")
+                with open(torrent_file_path, "wb") as f:
+                    f.write(torrent_bytes)
+        except Exception as e:
+            print(f"[WARN] Error downloading torrent URL: {e}")
+
+    if torrent_bytes is None and os.path.isfile(torrent_file_path):
+        try:
+            with open(torrent_file_path, "rb") as f:
+                torrent_bytes = f.read()
+        except Exception as e:
+            print(f"[WARN] Error reading torrent file: {e}")
+
+    if not torrent_bytes:
+        raise Exception(f"Could not read BitTorrent file from: {clean}")
+
+    try:
+        data, info_slice = bdecode_with_info(torrent_bytes)
+        info = data.get("info", {})
+        raw_name = info.get("name", b"Torrent Media")
+        name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, bytes) else str(raw_name)
+        info_hash = hashlib.sha1(info_slice).hexdigest() if info_slice else ""
+
+        files_list = []
+        if "files" in info:
+            for f in info.get("files", []):
+                flen = f.get("length", 0)
+                raw_path = f.get("path", [])
+                parts = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in raw_path]
+                fpath = "/".join(parts) if parts else "file"
+                files_list.append({"name": fpath, "size": format_size_bytes(flen), "bytes": flen})
+            total_bytes = sum(f["bytes"] for f in files_list)
+            file_count = len(files_list)
+        else:
+            flen = info.get("length", 0)
+            total_bytes = flen
+            file_count = 1
+            files_list.append({"name": name, "size": format_size_bytes(flen), "bytes": flen})
+
+        size_str = format_size_bytes(total_bytes)
+        detail_str = f"{size_str} • {file_count} file{'s' if file_count != 1 else ''}"
+        
+        file_summary_lines = []
+        for i, f in enumerate(files_list[:12], 1):
+            file_summary_lines.append(f"{i}. {f['name']} ({f['size']})")
+        if len(files_list) > 12:
+            file_summary_lines.append(f"... and {len(files_list) - 12} more file(s)")
+
+        desc_str = f"BitTorrent Media ({file_count} items):\n" + "\n".join(file_summary_lines)
+        lbl = f"Best Available (Torrent - {size_str})"
+        magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}"
+
+        RESOLVED_TORRENT_MAP[lbl] = {
+            "magnet": magnet,
+            "torrent_path": torrent_file_path,
+            "file_idx": None,
+            "label": lbl,
+        }
+
+        return {
+            "url": torrent_file_path,
+            "target_url": torrent_file_path,
+            "title": name,
+            "source": "BitTorrent",
+            "poster": "",
+            "quality": lbl,
+            "qualities": [lbl],
+            "can_stream": False,
+            "media_type": "file",
+            "detail": detail_str,
+            "description": desc_str,
+            "size": size_str,
+            "torrent_sources": {
+                lbl: { "magnet": magnet, "torrent_path": torrent_file_path, "file_idx": None }
+            }
+        }
+    except Exception as e:
+        print(f"[WARN] Error decoding torrent bencode: {e}")
+        base_name = os.path.basename(torrent_file_path)
+        lbl = "Best Available (Torrent)"
+        return {
+            "url": torrent_file_path,
+            "target_url": torrent_file_path,
+            "title": base_name,
+            "source": "BitTorrent",
+            "poster": "",
+            "quality": lbl,
+            "qualities": [lbl],
+            "can_stream": False,
+            "media_type": "file",
+            "detail": "BitTorrent Package",
+            "description": f"Torrent file: {base_name}",
+            "size": "BitTorrent",
+        }
+
+def download_torrent(torrent_source, title="media", target_dir=None, file_idx=None, job_id=None):
     jid = job_id or get_current_job_id()
     target_dir = target_dir or DEFAULT_DIR
     os.makedirs(target_dir, exist_ok=True)
@@ -4865,10 +5104,30 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
     print(" [BITTORRENT] IN-APP ACCELERATED DOWNLOAD")
     print("="*65)
     print(f" Target: {clean_title}")
+    print(f" Source: {str(torrent_source)[:80]}...")
     print(f" Save Directory: {target_dir}")
     if file_idx is not None and str(file_idx).strip().isdigit():
         print(f" Mode: Single Episode Extraction (File #{file_idx})")
     print("="*65)
+
+    eff_source = str(torrent_source).strip()
+    if eff_source.startswith("file://"):
+        eff_source = eff_source[7:]
+
+    # If remote HTTP/HTTPS torrent URL, download to cache first
+    if eff_source.startswith(("http://", "https://")) and not eff_source.startswith("magnet:"):
+        try:
+            cache_tor_dir = os.path.expanduser("~/.cache/torrents")
+            os.makedirs(cache_tor_dir, exist_ok=True)
+            r = requests.get(eff_source, headers=HEADERS, timeout=15)
+            if r.status_code == 200:
+                tf_hash = hashlib.sha1(r.content).hexdigest()
+                cached_tf = os.path.join(cache_tor_dir, f"{tf_hash}.torrent")
+                with open(cached_tf, "wb") as f:
+                    f.write(r.content)
+                eff_source = cached_tf
+        except Exception as e:
+            print(f"[WARN] Failed to pre-download remote torrent file: {e}")
 
     cmd = [
         "aria2c",
@@ -4889,7 +5148,7 @@ def download_torrent(magnet_url, title="media", target_dir=None, file_idx=None, 
     ]
     if file_idx is not None and str(file_idx).strip().isdigit():
         cmd.append(f"--select-file={file_idx}")
-    cmd.append(magnet_url)
+    cmd.append(eff_source)
 
     ret = run_command_with_clean_progress(cmd)
     if ret == -1:
@@ -5083,30 +5342,18 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             except Exception:
                 pass
 
-    if lower.startswith("magnet:"):
-        print("> Detected Magnet link...")
-        dn_match = re.search(r"dn=([^&]+)", url)
-        display_name = urllib.parse.unquote(dn_match.group(1)).replace("+", " ") if dn_match else "Torrent Media"
-        lbl = "Best Available (Torrent)"
-        RESOLVED_TORRENT_MAP[lbl] = {
-            "magnet": url,
-            "file_idx": None,
-            "label": lbl,
-        }
-        return {
-            "url": url,
-            "target_url": url,
-            "title": display_name,
-            "source": "Torrent",
-            "poster": "",
-            "quality": lbl,
-            "qualities": [lbl],
-            "can_stream": False,
-            "media_type": "file",
-            "torrent_sources": {
-                lbl: { "magnet": url, "file_idx": None }
-            }
-        }
+    clean_url_stripped = url.strip()
+    if clean_url_stripped.startswith("file://"):
+        clean_url_stripped = clean_url_stripped[7:]
+    is_torrent_input = (
+        lower.startswith("magnet:") or
+        lower.endswith(".torrent") or
+        ".torrent?" in lower or
+        (os.path.isfile(clean_url_stripped) and (clean_url_stripped.lower().endswith(".torrent") or is_torrent_file(clean_url_stripped)))
+    )
+    if is_torrent_input:
+        print(f"> Detected BitTorrent target: {url[:80]}...")
+        return parse_torrent_metadata(url)
 
     if any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]):
         print("> Connecting to stream endpoint and resolving qualities...")
@@ -5714,7 +5961,6 @@ def app_download(payload):
         except Exception as e:
             print(f"[WARN] DDL bypass during download: {e}")
 
-    # Priority 1: India's Got Latent
     is_igl_target = (
         lower.startswith("igl:") or
         "/tv/999" in lower or
@@ -5725,7 +5971,28 @@ def app_download(payload):
         ("latent" in lower and any(w in lower for w in ["indias got latent", "india's got latent", "netmirror"])) or
         any(w in str(title).lower() for w in ["latent", "india's got latent", "indias got latent"])
     )
-    if is_igl_target:
+
+    # Priority 0.5: BitTorrent / Magnet links / .torrent files
+    clean_dl_url = url.strip()
+    if clean_dl_url.startswith("file://"):
+        clean_dl_url = clean_dl_url[7:]
+    is_torrent_target = (
+        lower.startswith("magnet:") or
+        stream_lower.startswith("magnet:") or
+        lower.endswith(".torrent") or
+        stream_lower.endswith(".torrent") or
+        ".torrent?" in lower or
+        stream_lower.endswith(".torrent") or
+        (os.path.isfile(clean_dl_url) and (clean_dl_url.lower().endswith(".torrent") or is_torrent_file(clean_dl_url)))
+    )
+    if is_torrent_target:
+        torrent_src = url or stream_url
+        file_idx = payload.get("file_idx")
+        print(f"> Processing BitTorrent download: {torrent_src[:80]}...")
+        path = download_torrent(torrent_src, title=title, target_dir=target_dir, file_idx=file_idx, job_id=jid)
+
+    # Priority 1: India's Got Latent
+    elif is_igl_target:
         st = "bonus" if ("bonus" in lower or "123114" in lower or "bonus" in str(title).lower()) else "main"
         is_series_request = (
             lower.startswith("igl:series:") or

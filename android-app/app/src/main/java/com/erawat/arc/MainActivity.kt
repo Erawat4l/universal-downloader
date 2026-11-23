@@ -28,6 +28,8 @@ import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.WebSettings
+import android.provider.OpenableColumns
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -259,6 +261,12 @@ private data class PlaylistEntry(
     val duration: Long = 0,
 )
 
+private data class PlayerStreamTarget(
+    val url: String,
+    val headers: Map<String, String> = emptyMap(),
+    val title: String = "",
+)
+
 private data class MediaTarget(
     val title: String,
     val source: String,
@@ -414,16 +422,57 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
         val action = intent.action
         val type = intent.type
-        if (Intent.ACTION_SEND == action && type != null && type.startsWith("text/")) {
+        if (Intent.ACTION_SEND == action) {
             val text = intent.getStringExtra(Intent.EXTRA_TEXT)
             if (!text.isNullOrBlank()) {
                 incomingUrl.value = extractUrlOrText(text)
+            } else {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+                if (streamUri != null) {
+                    incomingUrl.value = resolveAndCopyUri(streamUri)
+                }
             }
         } else if (Intent.ACTION_VIEW == action) {
-            val dataStr = intent.dataString
-            if (!dataStr.isNullOrBlank()) {
-                incomingUrl.value = dataStr
+            val uri = intent.data
+            if (uri != null) {
+                if (uri.scheme == "magnet") {
+                    incomingUrl.value = uri.toString()
+                } else if (uri.scheme in listOf("content", "file")) {
+                    incomingUrl.value = resolveAndCopyUri(uri)
+                } else {
+                    val dataStr = intent.dataString
+                    if (!dataStr.isNullOrBlank()) {
+                        incomingUrl.value = dataStr
+                    }
+                }
             }
+        }
+    }
+
+    private fun resolveAndCopyUri(uri: Uri): String {
+        return try {
+            var fileName = "download.torrent"
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIdx != -1 && cursor.moveToFirst()) {
+                    fileName = cursor.getString(nameIdx) ?: "download.torrent"
+                }
+            }
+            val torrentsDir = File(cacheDir, "torrents").apply { mkdirs() }
+            val destFile = File(torrentsDir, fileName)
+            contentResolver.openInputStream(uri)?.use { inStream ->
+                destFile.outputStream().use { outStream ->
+                    inStream.copyTo(outStream)
+                }
+            }
+            destFile.absolutePath
+        } catch (_: Exception) {
+            uri.toString()
         }
     }
 
@@ -682,6 +731,15 @@ private fun ArcApp(
     var selectedQuality by rememberSaveable { mutableStateOf("Best Available") }
     var showQualityDialog by rememberSaveable { mutableStateOf(false) }
 
+    var streamingPlayer by rememberSaveable {
+        mutableStateOf(preferences.getString("streaming_player_package", "arc_player") ?: "arc_player")
+    }
+    var streamingPlayerName by rememberSaveable {
+        mutableStateOf(preferences.getString("streaming_player_name", "ARC Player") ?: "ARC Player")
+    }
+    var showPlayerDialog by rememberSaveable { mutableStateOf(false) }
+    var inAppPlayerTarget by remember { mutableStateOf<PlayerStreamTarget?>(null) }
+
     var tabName by rememberSaveable { mutableStateOf(AppTab.HOME.name) }
     var overlay by rememberSaveable { mutableStateOf("") }
     var homeOverlay by rememberSaveable { mutableStateOf("") }
@@ -939,7 +997,12 @@ private fun ArcApp(
         }
     }
 
-    fun openStreamExternal(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
+    fun openStreamExternal(
+        streamUrl: String,
+        headers: Map<String, String> = emptyMap(),
+        title: String = "",
+        targetPackage: String = ""
+    ) {
         try {
             if (streamUrl.isBlank()) {
                 message("Resolving stream URL...")
@@ -1000,6 +1063,21 @@ private fun ArcApp(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
 
+            if (targetPackage.isNotBlank() && targetPackage != "system_chooser" && targetPackage != "arc_player") {
+                try {
+                    intent.setPackage(targetPackage)
+                    context.startActivity(intent)
+                    return
+                } catch (_: Exception) {
+                    intent.setPackage(null)
+                }
+            }
+
+            if (targetPackage == "system_chooser") {
+                context.startActivity(Intent.createChooser(intent, "Play stream with"))
+                return
+            }
+
             val vlcIntent = Intent(intent).setPackage("org.videolan.vlc")
             val isVlcAvailable = try {
                 context.packageManager.resolveActivity(vlcIntent, PackageManager.MATCH_DEFAULT_ONLY) != null ||
@@ -1013,6 +1091,14 @@ private fun ArcApp(
             }
         } catch (e: Exception) {
             message("Could not open stream: ${e.message}")
+        }
+    }
+
+    fun playStream(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
+        if (streamingPlayer == "arc_player") {
+            inAppPlayerTarget = PlayerStreamTarget(streamUrl, headers, title)
+        } else {
+            openStreamExternal(streamUrl, headers, title, targetPackage = streamingPlayer)
         }
     }
 
@@ -1530,6 +1616,8 @@ private fun ArcApp(
     val currentActivity = context as? ComponentActivity
     BackHandler(enabled = true) {
         when {
+            inAppPlayerTarget != null -> inAppPlayerTarget = null
+            showPlayerDialog -> showPlayerDialog = false
             showSeriesDownloadDialog -> showSeriesDownloadDialog = false
             showAudioSelectDialog -> {
                 showAudioSelectDialog = false
@@ -1620,10 +1708,17 @@ private fun ArcApp(
         analysisElapsedSeconds = 0f
         isAnalysisTraceExpanded = false
 
+        val isTorrent = clean.startsWith("magnet:", ignoreCase = true) ||
+            clean.endsWith(".torrent", ignoreCase = true) ||
+            clean.contains(".torrent?", ignoreCase = true) ||
+            (clean.startsWith("/") && clean.endsWith(".torrent", ignoreCase = true))
+
         val isDirectUrl = clean.startsWith("http://", ignoreCase = true) ||
             clean.startsWith("https://", ignoreCase = true) ||
             clean.startsWith("igl:", ignoreCase = true) ||
-            clean.startsWith("magnet:", ignoreCase = true)
+            clean.startsWith("file://", ignoreCase = true) ||
+            clean.startsWith("/") ||
+            isTorrent
         if (isDirectUrl) {
             val effLang = selectedAudioLang.lowercase().trim()
             val cachedTarget = if (effLang.isNotBlank()) AppSessionCache.targets["${clean}#${effLang}"] else AppSessionCache.targets[clean]
@@ -1654,24 +1749,25 @@ private fun ArcApp(
             val titleToUse = when {
                 titleOverride != null -> titleOverride
                 isYouTubeClean -> "YouTube Video"
+                isTorrent -> clean.split("/").lastOrNull { it.isNotBlank() }?.removeSuffix(".torrent") ?: "Torrent Media"
                 else -> clean.split("/").lastOrNull { it.isNotBlank() } ?: "Media stream"
             }
-            val fileExtMatch = Regex("""\.(zip|aip|rar|7z|tar|gz|apk|pdf|epub|iso|dmg|exe|bin|doc|docx|xls|xlsx|ppt|pptx)$""", RegexOption.IGNORE_CASE).containsMatchIn(clean.split("?").first())
-            val isDirectFile = fileExtMatch
+            val fileExtMatch = isTorrent || Regex("""\.(torrent|zip|aip|rar|7z|tar|gz|apk|pdf|epub|iso|dmg|exe|bin|doc|docx|xls|xlsx|ppt|pptx)$""", RegexOption.IGNORE_CASE).containsMatchIn(clean.split("?").first())
+            val isDirectFile = fileExtMatch || isTorrent
             val initialCanStream = !isDirectFile
-            val initialMediaType = if (isDirectFile) "file" else "video"
+            val initialMediaType = if (isTorrent) "torrent" else if (isDirectFile) "file" else "video"
 
-            val isMovieTitle = (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
-            val detectedSeries = !isMovieTitle && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
+            val isMovieTitle = !isTorrent && (titleToUse.contains("Movie", ignoreCase = true) || mediaCategoryOverride?.contains("MOVIE", ignoreCase = true) == true)
+            val detectedSeries = !isMovieTitle && !isTorrent && ((mediaCategoryOverride?.contains("SERIES", ignoreCase = true) == true) ||
                                  (mediaCategoryOverride?.contains("TV", ignoreCase = true) == true) ||
                                  Regex("""\b(S\d+|Season\s*\d+)\b""", RegexOption.IGNORE_CASE).containsMatchIn(titleToUse))
             val detectedCategory = when {
+                isTorrent -> "TORRENT"
                 isDirectFile -> "FILE"
                 isMovieTitle -> "MOVIE"
                 detectedSeries -> "TV SERIES"
                 clean.contains("youtu", ignoreCase = true) -> "YOUTUBE"
                 clean.startsWith("igl:", ignoreCase = true) -> "IGL EPISODE"
-                clean.startsWith("magnet:", ignoreCase = true) -> "TORRENT"
                 else -> "MOVIE"
             }
             val detectedYear = yearOverride ?: extractYear(titleToUse)
@@ -1777,6 +1873,33 @@ private fun ArcApp(
                 },
                 "search"
             )
+        }
+    }
+
+    val torrentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                var fileName = "download.torrent"
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx != -1 && cursor.moveToFirst()) {
+                        fileName = cursor.getString(nameIdx) ?: "download.torrent"
+                    }
+                }
+                val torrentsDir = File(context.cacheDir, "torrents").apply { mkdirs() }
+                val destFile = File(torrentsDir, fileName)
+                context.contentResolver.openInputStream(uri)?.use { inStream ->
+                    destFile.outputStream().use { outStream ->
+                        inStream.copyTo(outStream)
+                    }
+                }
+                input = destFile.absolutePath
+                analyze(destFile.absolutePath)
+            } catch (e: Exception) {
+                message("Failed to open torrent file: ${e.message}")
+            }
         }
     }
 
@@ -2180,7 +2303,7 @@ private fun ArcApp(
 
                                         if (isValidDirectStream && !resolveLoading) {
                                             streamLoading = true
-                                            openStreamExternal(directCandidate, target.streamHeaders, displayTitle)
+                                            playStream(directCandidate, target.streamHeaders, displayTitle)
                                             scope.launch {
                                                 kotlinx.coroutines.delay(1200)
                                                 streamLoading = false
@@ -2223,7 +2346,7 @@ private fun ArcApp(
                                                         proxyUrl = proxyUrl,
                                                         streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
                                                     )
-                                                    openStreamExternal(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
+                                                    playStream(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
                                                 } else {
                                                     message("Could not resolve stream for $displayTitle")
                                                 }
@@ -2357,9 +2480,12 @@ private fun ArcApp(
                                     onAnalyze = { analyze() },
                                     onPaste = {
                                         clipboard.getText()?.text?.let {
-                                            input = it
-                                            message("Pasted from clipboard.")
+                                             input = it
+                                             message("Pasted from clipboard.")
                                         }
+                                    },
+                                    onPickTorrent = {
+                                        torrentPickerLauncher.launch(arrayOf("application/x-bittorrent", "application/octet-stream", "*/*"))
                                     },
                                     onLibrary = { tabName = AppTab.LIBRARY.name },
                                     jobs = jobs.filter { it.status == "Complete" },
@@ -2389,6 +2515,8 @@ private fun ArcApp(
                         defaultVideoQuality = defaultVideoQuality,
                         defaultAudioQuality = defaultAudioQuality,
                         onOpenQualityDialog = { showQualityDialog = true },
+                        streamingPlayerName = streamingPlayerName,
+                        onOpenPlayerDialog = { showPlayerDialog = true },
                         notifications = notifications,
                         onToggleNotifications = { enabled ->
                             if (enabled) {
@@ -2634,6 +2762,23 @@ private fun ArcApp(
                 )
             }
 
+            // Player Selection Dialog
+            if (showPlayerDialog) {
+                PlayerSelectionDialog(
+                    currentPlayerPackage = streamingPlayer,
+                    onPlayerSelected = { pkg, name ->
+                        streamingPlayer = pkg
+                        streamingPlayerName = name
+                        preferences.edit()
+                            .putString("streaming_player_package", pkg)
+                            .putString("streaming_player_name", name)
+                            .apply()
+                        message("Streaming player set to $name")
+                    },
+                    onDismiss = { showPlayerDialog = false }
+                )
+            }
+
             // Onboarding Step 1: Notifications Permission Dialog
             if (showOnboardingNotificationDialog) {
                 OnboardingNotificationDialog(
@@ -2700,6 +2845,16 @@ private fun ArcApp(
                         showGoogleLoginDialog = false
                         googleLoginHint = ""
                     },
+                )
+            }
+
+            // In-App Video Player Overlay
+            if (inAppPlayerTarget != null) {
+                ArcPlayerScreen(
+                    streamUrl = inAppPlayerTarget!!.url,
+                    headers = inAppPlayerTarget!!.headers,
+                    title = inAppPlayerTarget!!.title,
+                    onClose = { inAppPlayerTarget = null }
                 )
             }
     }
@@ -2932,6 +3087,7 @@ private fun HomeScreen(
     onInput: (String) -> Unit,
     onAnalyze: () -> Unit,
     onPaste: () -> Unit,
+    onPickTorrent: () -> Unit = {},
     onLibrary: () -> Unit,
     jobs: List<DownloadJob>,
     onOpen: (String) -> Unit,
@@ -2971,7 +3127,25 @@ private fun HomeScreen(
                 colors = arcTextFieldColors(),
                 label = { Text("Link or search") },
                 leadingIcon = { Icon(Icons.Outlined.Link, contentDescription = null) },
-                trailingIcon = { TextButton(onClick = onPaste) { Text("Paste") } },
+                trailingIcon = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        IconButton(
+                            onClick = onPickTorrent,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                Icons.Outlined.Folder,
+                                contentDescription = "Add Torrent",
+                                tint = ArcMuted,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        TextButton(onClick = onPaste) { Text("Paste") }
+                    }
+                },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { onAnalyze() }),
             )
@@ -3535,7 +3709,10 @@ private fun AnalysisScreen(
                 target.proxyUrl.isNotBlank() ||
                 target.qualityUrls.isNotEmpty() ||
                 target.isPlaylist ||
-                target.targetUrl.startsWith("magnet:", ignoreCase = true)
+                target.targetUrl.startsWith("magnet:", ignoreCase = true) ||
+                target.source.contains("torrent", ignoreCase = true) ||
+                target.mediaType == "file" ||
+                target.mediaType == "torrent"
 
             if (!loading && !streamLoading && !episodeLoading && !hasResolvedMedia && target.title.isNotBlank()) {
                 item {
@@ -3585,11 +3762,15 @@ private fun AnalysisScreen(
                     ) {
                         Icon(Icons.Outlined.FileDownload, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
+                        val dlText = when {
+                            target.isSeries -> "Download $quality"
+                            target.isPlaylist -> "Download Playlist ($quality)"
+                            target.source.contains("torrent", ignoreCase = true) || target.mediaType == "torrent" -> "Download Torrent"
+                            !target.canStream || target.mediaType == "file" || target.source.equals("Direct file", true) -> "Download File"
+                            else -> "Download $quality"
+                        }
                         Text(
-                            if (target.isSeries) "Download $quality"
-                            else if (target.isPlaylist) "Download Playlist ($quality)"
-                            else if (!target.canStream || target.mediaType == "file" || target.source.equals("Direct file", true)) "Download File"
-                            else "Download $quality",
+                            dlText,
                             fontWeight = FontWeight.Bold,
                         )
                     }
@@ -4019,6 +4200,8 @@ private fun SettingsScreen(
     defaultVideoQuality: String,
     defaultAudioQuality: String,
     onOpenQualityDialog: () -> Unit,
+    streamingPlayerName: String = "ARC Player",
+    onOpenPlayerDialog: () -> Unit = {},
     notifications: Boolean,
     onToggleNotifications: (Boolean) -> Unit,
     googleAccountEmail: String,
@@ -4082,6 +4265,30 @@ private fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Default Quality", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                         Text("Video: $defaultVideoQuality · Audio: $defaultAudioQuality", color = ArcMuted, fontSize = 11.sp)
+                    }
+                    Icon(Icons.Outlined.Edit, contentDescription = "Change", tint = ArcMuted, modifier = Modifier.size(18.dp))
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable(onClick = onOpenPlayerDialog),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                ) {
+                    MediaGlyph(Icons.Outlined.PlayArrow, Modifier.size(36.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Streaming Player", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(streamingPlayerName, color = ArcMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Icon(Icons.Outlined.Edit, contentDescription = "Change", tint = ArcMuted, modifier = Modifier.size(18.dp))
                 }
@@ -4613,6 +4820,319 @@ private fun DefaultQualityDialog(
             }
         },
     )
+}
+
+private data class InstalledPlayerApp(
+    val packageName: String,
+    val label: String,
+)
+
+@Composable
+private fun PlayerSelectionDialog(
+    currentPlayerPackage: String,
+    onPlayerSelected: (pkg: String, name: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val installedPlayers = remember {
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(Uri.parse("https://example.com/video.mp4"), "video/*")
+        }
+        val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        }
+        val knownPackages = listOf(
+            "org.videolan.vlc",
+            "com.mxtech.videoplayer.ad",
+            "com.mxtech.videoplayer.pro",
+            "is.xyz.mpv",
+            "org.courville.nova",
+            "com.brouken.player"
+        )
+        val pkgs = resolveInfos.map { it.activityInfo.packageName }.toMutableSet()
+        for (kp in knownPackages) {
+            try {
+                pm.getPackageInfo(kp, 0)
+                pkgs.add(kp)
+            } catch (_: Exception) {}
+        }
+        pkgs.filter { it != context.packageName }.mapNotNull { pkg ->
+            try {
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                val label = pm.getApplicationLabel(appInfo).toString()
+                InstalledPlayerApp(packageName = pkg, label = label)
+            } catch (_: Exception) {
+                null
+            }
+        }.sortedBy { it.label }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ArcSurface,
+        titleContentColor = ArcWhite,
+        textContentColor = ArcWhite,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text("Streaming Player", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 380.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                item {
+                    val isArcSelected = currentPlayerPackage == "arc_player"
+                    PlayerOptionCard(
+                        title = "ARC Player (In-App)",
+                        subtitle = "Stream directly inside ARC with full playback controls",
+                        icon = Icons.Outlined.PlayArrow,
+                        isSelected = isArcSelected,
+                        onClick = {
+                            onPlayerSelected("arc_player", "ARC Player")
+                            onDismiss()
+                        }
+                    )
+                }
+
+                item {
+                    val isChooserSelected = currentPlayerPackage == "system_chooser"
+                    PlayerOptionCard(
+                        title = "System Chooser",
+                        subtitle = "Open Android app picker every time",
+                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
+                        isSelected = isChooserSelected,
+                        onClick = {
+                            onPlayerSelected("system_chooser", "System Chooser")
+                            onDismiss()
+                        }
+                    )
+                }
+
+                if (installedPlayers.isNotEmpty()) {
+                    item {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Installed Player Apps",
+                            color = ArcMuted,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    items(installedPlayers) { pApp ->
+                        val isAppSelected = currentPlayerPackage == pApp.packageName
+                        PlayerOptionCard(
+                            title = pApp.label,
+                            subtitle = pApp.packageName,
+                            icon = Icons.Outlined.Movie,
+                            isSelected = isAppSelected,
+                            onClick = {
+                                onPlayerSelected(pApp.packageName, pApp.label)
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text("Done")
+            }
+        }
+    )
+}
+
+@Composable
+private fun PlayerOptionCard(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) ArcRaised else ArcSurface,
+        ),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (isSelected) ArcWhite else Color(0xFF333333)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (isSelected) ArcWhite else ArcMuted,
+                modifier = Modifier.size(24.dp)
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    title,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                    color = if (isSelected) ArcWhite else ArcMuted,
+                    fontSize = 13.sp,
+                )
+                Text(
+                    subtitle,
+                    fontSize = 11.sp,
+                    color = ArcMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (isSelected) {
+                Icon(Icons.Outlined.Check, contentDescription = null, tint = ArcWhite, modifier = Modifier.size(16.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArcPlayerScreen(
+    streamUrl: String,
+    headers: Map<String, String> = emptyMap(),
+    title: String = "",
+    onClose: () -> Unit,
+) {
+    val context = LocalContext.current
+    val cleanHeaders = remember(streamUrl, headers) {
+        headers.toMutableMap().apply {
+            if (streamUrl.contains("okcdn", ignoreCase = true)) {
+                remove("Origin")
+                remove("Referer")
+            }
+        }
+    }
+
+    var playUrl by remember(streamUrl) { mutableStateOf(streamUrl) }
+
+    LaunchedEffect(streamUrl) {
+        val isDirectPlayable = streamUrl.contains("googlevideo.com") ||
+                              streamUrl.startsWith("file://") ||
+                              streamUrl.startsWith("/") ||
+                              (!streamUrl.contains("hakunaymatata") && !streamUrl.contains("mzfi.me"))
+
+        if (!isDirectPlayable && !streamUrl.contains("127.0.0.1")) {
+            val pPayload = JSONObject().apply {
+                put("action", "stream_proxy")
+                put("url", streamUrl)
+                val hObj = JSONObject()
+                cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
+                put("headers", hObj)
+            }
+            val pRes = withContext(Dispatchers.IO) {
+                runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
+            }
+            val px = pRes?.optJSONObject("result")?.optString("proxy_url")
+            if (!px.isNullOrBlank()) {
+                playUrl = px
+            }
+        }
+
+        if (playUrl.contains("127.0.0.1")) {
+            StreamService.start(context, streamUrl, cleanHeaders)
+        }
+    }
+
+    val exoPlayer = remember(playUrl) {
+        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .setDefaultRequestProperties(cleanHeaders)
+        val mediaSourceFactory = DefaultMediaSourceFactory(context)
+            .setDataSourceFactory(httpDataSourceFactory)
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build().apply {
+                setMediaItem(MediaItem.fromUri(Uri.parse(playUrl)))
+                prepare()
+                playWhenReady = true
+            }
+    }
+
+    DisposableEffect(exoPlayer) {
+        onDispose {
+            exoPlayer.release()
+            StreamService.stop(context)
+        }
+    }
+
+    BackHandler(onBack = onClose)
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    player = exoPlayer
+                    useController = true
+                    keepScreenOn = true
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                }
+            },
+            update = { view ->
+                view.player = exoPlayer
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Top control overlay bar with back button & title
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(Color(0x99000000), shape = CircleShape)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = "Close player",
+                    tint = Color.White
+                )
+            }
+            Spacer(Modifier.width(14.dp))
+            Text(
+                text = title.ifBlank { "Playing Stream" },
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .background(Color(0x99000000), shape = RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            )
+        }
+    }
 }
 
 private fun generateQrBitmap(content: String, sizePx: Int = 512): Bitmap? {
