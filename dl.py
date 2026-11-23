@@ -295,7 +295,7 @@ def get_stream_headers_for_url(url, base_headers=None):
         hostname = (parsed.hostname or '').lower()
         if 'okcdn' in hostname:
             for k in list(headers.keys()):
-                if k.lower() in ('origin', 'referer', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest'):
+                if k.lower() in ('origin', 'referer', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'user-agent'):
                     headers.pop(k, None)
             headers['Accept-Encoding'] = 'identity'
         elif 'freeforall.dev' in hostname or 'indiassgetlentp' in hostname:
@@ -462,6 +462,8 @@ class StreamProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         if 'okcdn' in req_target.lower():
             req_headers.pop('Origin', None)
             req_headers.pop('Referer', None)
+            req_headers.pop('User-Agent', None)
+            req_headers.pop('user-agent', None)
         range_header = self.headers.get('Range')
         if range_header:
             req_headers['Range'] = range_header
@@ -1225,7 +1227,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
             req_headers['Accept-Encoding'] = 'identity'
             if 'okcdn' in url.lower():
                 for k in list(req_headers.keys()):
-                    if k.lower() in ('origin', 'referer', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest'):
+                    if k.lower() in ('origin', 'referer', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'user-agent'):
                         req_headers.pop(k, None)
             if downloaded > 0:
                 req_headers['Range'] = f'bytes={downloaded}-'
@@ -1657,17 +1659,18 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     if not HAS_YTDLP:
         return 'best[ext=mp4]/best/b', False
 
-    # Standard format map (prefers progressive single-file streams with video+audio fallback)
+    # Standard format map (prefers best video + audio streams with progressive fallback)
     format_map = {
-        '1': ('best[ext=mp4]/best/bestvideo+bestaudio/best', 'Best Available (Auto - Highest Quality)'),
-        '2160p': ('best[height<=2160][ext=mp4]/best[height<=2160]/bestvideo[height<=2160]+bestaudio/best', '2160p (4K)'),
-        '1440p': ('best[height<=1440][ext=mp4]/best[height<=1440]/bestvideo[height<=1440]+bestaudio/best', '1440p (2K)'),
-        '1080p': ('best[height<=1080][ext=mp4]/best[height<=1080]/bestvideo[height<=1080]+bestaudio/best', '1080p (Full HD)'),
-        '720p': ('best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best', '720p (HD)'),
-        '480p': ('best[height<=480][ext=mp4]/best[height<=480]/bestvideo[height<=480]+bestaudio/best', '480p (SD)'),
-        '360p': ('best[height<=360][ext=mp4]/best[height<=360]/bestvideo[height<=360]+bestaudio/best', '360p (Low)'),
-        '240p': ('best[height<=240][ext=mp4]/best[height<=240]/bestvideo[height<=240]+bestaudio/best', '240p'),
-        '144p': ('best[height<=144][ext=mp4]/best[height<=144]/bestvideo[height<=144]+bestaudio/best', '144p'),
+        '1': ('bestvideo+bestaudio/best', 'Best Available (Auto - Highest Quality)'),
+        '4320p': ('bestvideo[height<=4320]+bestaudio/best[height<=4320]/best', '4320p (8K)'),
+        '2160p': ('bestvideo[height<=2160]+bestaudio/best[height<=2160]/best', '2160p (4K)'),
+        '1440p': ('bestvideo[height<=1440]+bestaudio/best[height<=1440]/best', '1440p (2K)'),
+        '1080p': ('bestvideo[height<=1080]+bestaudio/best[height<=1080]/best', '1080p (Full HD)'),
+        '720p': ('bestvideo[height<=720]+bestaudio/best[height<=720]/best', '720p (HD)'),
+        '480p': ('bestvideo[height<=480]+bestaudio/best[height<=480]/best', '480p (SD)'),
+        '360p': ('bestvideo[height<=360]+bestaudio/best[height<=360]/best', '360p (Low)'),
+        '240p': ('bestvideo[height<=240]+bestaudio/best[height<=240]/best', '240p'),
+        '144p': ('bestvideo[height<=144]+bestaudio/best[height<=144]/best', '144p'),
         'audio': ('bestaudio/best', 'Audio Only (MP3/M4A)'),
         'mp3': ('bestaudio/best', 'Audio Only (MP3)'),
     }
@@ -1784,7 +1787,9 @@ def mux_video_and_audio(video_path, audio_path, output_path):
 
     jid = get_current_job_id()
     if jid:
-        render_download_progress(95.0, "Muxing media...", "Muxing", "--", job_id=jid)
+        render_download_progress(0.0, "Combining audio & video", "Muxing", "0%", job_id=jid, downloaded_str="Muxing 0%")
+        if str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
+            ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
 
     temp_out = output_path
     needs_rename = False
@@ -1837,6 +1842,12 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
     valid_audios = [p for p in audio_paths if os.path.exists(p) and os.path.getsize(p) > 0]
     if not valid_audios:
         return False
+
+    jid = get_current_job_id()
+    if jid:
+        render_download_progress(0.0, "Combining audio & video", "Muxing", "0%", job_id=jid, downloaded_str="Muxing 0%")
+        if str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
+            ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
 
     temp_out = output_path
     needs_rename = False
@@ -1980,10 +1991,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 render_download_progress(overall_pct, p_label, spd_str, eta_str, job_id=jid)
             else:
                 if is_video_only_stream:
-                    scaled_pct = round(raw_percent * 0.88, 1)
+                    scaled_pct = round(raw_percent * 0.90, 1)
                     render_download_progress(scaled_pct, tot_str, spd_str, eta_str, job_id=jid)
                 elif is_audio_only_stream:
-                    scaled_pct = round(88.0 + (raw_percent * 0.10), 1)
+                    scaled_pct = round(90.0 + (raw_percent * 0.10), 1)
                     render_download_progress(scaled_pct, f"Audio {tot_str}", spd_str, eta_str, job_id=jid)
                 else:
                     render_download_progress(round(raw_percent, 1), tot_str, spd_str, eta_str, job_id=jid)
@@ -1997,9 +2008,11 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             else:
                 if is_video_only_stream:
-                    render_download_progress(88.0, "Audio track downloading...", "Processing", "--", job_id=jid)
+                    render_download_progress(90.0, "Video downloaded", "Audio next", "--", job_id=jid, downloaded_str="Video ready")
                 elif is_audio_only_stream:
-                    render_download_progress(98.5, "Muxing media...", "Muxing", "--", job_id=jid)
+                    render_download_progress(100.0, "100% Downloaded", "Muxing", "0%", job_id=jid, downloaded_str="100% Downloaded")
+                    if jid and str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
+                        ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
                 else:
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
 
@@ -2042,12 +2055,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         )
     else:
         format_spec = (
-            f"bestvideo[height<={cap}][vcodec^=avc][ext=mp4]+{audio_sel}/"
-            f"bestvideo[height<={cap}][vcodec^=avc]+{audio_sel}/"
-            f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
             f"bestvideo[height<={cap}]+{audio_sel}/"
-            f"best[height<={cap}][vcodec^=avc][ext=mp4]/"
-            f"best[height<={cap}][ext=mp4]/"
+            f"bestvideo[height<={cap}][ext=mp4]+{audio_sel}/"
+            f"best[height<={cap}]/"
+            f"bestvideo+{audio_sel}/"
             f"best"
         )
 
@@ -4850,6 +4861,7 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
                     "poster": poster,
                     "quality": yt_res.get('quality', 'Best Available'),
                     "qualities": yt_res.get('qualities', ["Best Available", "1080p (Full HD)", "720p (HD)"]),
+                    "quality_urls": yt_res.get('quality_urls', {}),
                     "stream_headers": yt_res.get('stream_headers', {}),
                     "headers": yt_res.get('headers', {}),
                     "is_series": False,
@@ -4861,9 +4873,30 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
         except Exception as e:
             print(f"[WARN] IGL YouTube direct stream resolution: {e}")
 
-    # OKCDN direct stream: NEVER include Origin header (okcdn.ru rejects Origin with HTTP 400)
+    # Build available quality tiers and mapped URLs from resolved stream choices
+    qualities = ["Best Available"]
+    quality_urls = {}
+    if stream_url:
+        quality_urls["Best Available"] = stream_url
+
+    for s in (info.get('streams') or []):
+        stype = str(s.get('type') or '')
+        surl = s.get('url')
+        if not surl: continue
+        lbl = stype
+        if stype == '4k': lbl = "2160p (4K UHD)"
+        elif stype == '2k': lbl = "1440p (2K QHD)"
+        elif stype == '1080p': lbl = "1080p (Full HD)"
+        elif stype == '720p': lbl = "720p (HD)"
+        elif stype == '480p': lbl = "480p (SD)"
+        elif stype == '360p': lbl = "360p"
+        if lbl not in qualities:
+            qualities.append(lbl)
+        quality_urls[lbl] = surl
+
+    # OKCDN direct stream: NEVER include User-Agent, Origin, or Referer headers (okcdn.ru rejects them with HTTP 400)
     clean_headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept-Encoding': 'identity',
     }
 
     return {
@@ -4876,7 +4909,8 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
         "type": "IGL",
         "poster": poster,
         "quality": info.get('quality', 'best'),
-        "qualities": ["Best Available", "4K (2160p)", "1080p (Full HD)", "720p (HD)", "480p (SD)"],
+        "qualities": qualities if len(qualities) > 1 else ["Best Available", "4K (2160p)", "1080p (Full HD)", "720p (HD)", "480p (SD)"],
+        "quality_urls": quality_urls,
         "stream_headers": clean_headers,
         "headers": clean_headers,
         "is_series": False,
@@ -5717,9 +5751,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) == target_h and f.get("url")]
                 if not matching_hls_v:
                     matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) <= target_h and f.get("url")]
-                    matching_hls_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
-                # Universal hardware decoder compatibility: Prefer AVC1 (H.264) over VP9
-                matching_hls_v.sort(key=lambda f: (1 if 'avc1' in str(f.get('vcodec') or '') else 0), reverse=True)
+                matching_hls_v.sort(key=lambda f: (f.get("height") or 0, 1 if 'avc1' in str(f.get('vcodec') or '') else 0), reverse=True)
 
                 if matching_hls_v:
                     v_fmt = matching_hls_v[0]

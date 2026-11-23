@@ -213,6 +213,10 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import androidx.media3.ui.AspectRatioFrameLayout
+import android.app.Activity
+import androidx.compose.material.icons.outlined.FitScreen
+import androidx.compose.material.icons.outlined.Fullscreen
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -2298,8 +2302,10 @@ private fun ArcApp(
                                         val qMapped = target.qualityUrls[selectedQuality]
                                         val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
                                         val isValidDirectStream = directCandidate.isNotBlank() &&
-                                            !directCandidate.contains("youtube.com") &&
-                                            !directCandidate.contains("youtu.be")
+                                            !directCandidate.startsWith("https://www.youtube.com/watch") &&
+                                            !directCandidate.startsWith("https://youtu.be/") &&
+                                            !directCandidate.startsWith("http://www.youtube.com/watch") &&
+                                            !directCandidate.startsWith("http://youtu.be/")
 
                                         if (isValidDirectStream && !resolveLoading) {
                                             streamLoading = true
@@ -2340,7 +2346,7 @@ private fun ArcApp(
                                                 val hMap = mutableMapOf<String, String>()
                                                 hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
                                                 val playUrl = directUrl.ifBlank { proxyUrl }
-                                                if (playUrl.isNotBlank() && !playUrl.contains("youtube.com") && !playUrl.contains("youtu.be")) {
+                                                if (playUrl.isNotBlank()) {
                                                     target = target.copy(
                                                         directStreamUrl = directUrl,
                                                         proxyUrl = proxyUrl,
@@ -2850,12 +2856,20 @@ private fun ArcApp(
 
             // In-App Video Player Overlay
             if (inAppPlayerTarget != null) {
-                ArcPlayerScreen(
-                    streamUrl = inAppPlayerTarget!!.url,
-                    headers = inAppPlayerTarget!!.headers,
-                    title = inAppPlayerTarget!!.title,
-                    onClose = { inAppPlayerTarget = null }
-                )
+                Dialog(
+                    onDismissRequest = { inAppPlayerTarget = null },
+                    properties = DialogProperties(
+                        usePlatformDefaultWidth = false,
+                        decorFitsSystemWindows = false
+                    )
+                ) {
+                    ArcPlayerScreen(
+                        streamUrl = inAppPlayerTarget!!.url,
+                        headers = inAppPlayerTarget!!.headers,
+                        title = inAppPlayerTarget!!.title,
+                        onClose = { inAppPlayerTarget = null }
+                    )
+                }
             }
     }
 }
@@ -3930,6 +3944,7 @@ private fun ActivityScreen(
                             val cleanDown = job.downloaded.replace(Regex("\\s+"), " ").trim()
                             val cleanTot = job.total.replace(Regex("\\s+"), " ").trim()
                             val progressText = when {
+                                job.status == "Muxing" -> "Muxing ${String.format(java.util.Locale.US, "%.1f", job.progress)}% · Combining tracks"
                                 isFetching -> "Connecting & resolving stream..."
                                 cleanDown.startsWith("Ep") ->
                                     "${String.format(java.util.Locale.US, "%.1f", job.progress)}% · $cleanDown ($cleanTot)"
@@ -5013,11 +5028,35 @@ private fun ArcPlayerScreen(
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
+    val activity = context as? Activity
+    var isFillMode by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        val window = activity?.window
+        if (window != null) {
+            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+            insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController.hide(WindowInsetsCompat.Type.systemBars())
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            val window = activity?.window
+            if (window != null) {
+                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
+
+    val isOkCdn = remember(streamUrl) { streamUrl.contains("okcdn", ignoreCase = true) }
     val cleanHeaders = remember(streamUrl, headers) {
         headers.toMutableMap().apply {
-            if (streamUrl.contains("okcdn", ignoreCase = true)) {
+            if (isOkCdn) {
                 remove("Origin")
                 remove("Referer")
+                remove("User-Agent")
+                remove("user-agent")
             }
         }
     }
@@ -5050,7 +5089,11 @@ private fun ArcPlayerScreen(
 
     val exoPlayer = remember(context) {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .apply {
+                if (!isOkCdn) {
+                    setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                }
+            }
             .setDefaultRequestProperties(cleanHeaders)
         val mediaSourceFactory = DefaultMediaSourceFactory(context)
             .setDataSourceFactory(httpDataSourceFactory)
@@ -5092,6 +5135,7 @@ private fun ArcPlayerScreen(
                     player = exoPlayer
                     useController = true
                     keepScreenOn = true
+                    resizeMode = if (isFillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -5100,11 +5144,12 @@ private fun ArcPlayerScreen(
             },
             update = { view ->
                 view.player = exoPlayer
+                view.resizeMode = if (isFillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top control overlay bar with back button & title
+        // Top control overlay bar with back button, title, and resize toggle
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -5133,9 +5178,23 @@ private fun ArcPlayerScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
+                    .weight(1f)
                     .background(Color(0x99000000), shape = RoundedCornerShape(8.dp))
                     .padding(horizontal = 10.dp, vertical = 6.dp)
             )
+            Spacer(Modifier.width(10.dp))
+            IconButton(
+                onClick = { isFillMode = !isFillMode },
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(Color(0x99000000), shape = CircleShape)
+            ) {
+                Icon(
+                    if (isFillMode) Icons.Outlined.FitScreen else Icons.Outlined.Fullscreen,
+                    contentDescription = if (isFillMode) "Fit to screen" else "Fill screen",
+                    tint = Color.White
+                )
+            }
         }
     }
 }

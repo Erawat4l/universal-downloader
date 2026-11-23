@@ -286,6 +286,7 @@ def resolve_stream_info(ep, base_url, target_quality="best"):
         'dest_path': dest_path,
         'stream_url': selected_stream.get('url'),
         'quality': selected_stream.get('type'),
+        'streams': streams,
         'web_player_url': web_player_url
     }
 

@@ -47,15 +47,22 @@ object EmbeddedEngine {
             val muxPct = currentMuxProgress
             if (muxPct >= 0.0) {
                 val pctInt = muxPct.toInt()
-                val targetKey = if (!jobId.isNullOrBlank()) jobId else obj.keys().asSequence().firstOrNull() ?: "job"
-                val existing = obj.optJSONObject(targetKey) ?: JSONObject()
-                existing.put("percent", muxPct)
-                existing.put("status", "Muxing")
-                existing.put("speed", "Muxing")
-                existing.put("eta", "$pctInt%")
-                existing.put("downloaded_str", "Muxing $pctInt%")
-                existing.put("total_str", "Combining tracks")
-                obj.put(targetKey, existing)
+                val keysToUpdate = if (!jobId.isNullOrBlank()) {
+                    listOf(jobId)
+                } else {
+                    val kList = obj.keys().asSequence().toList()
+                    if (kList.isNotEmpty()) kList else listOf("job")
+                }
+                for (k in keysToUpdate) {
+                    val existing = obj.optJSONObject(k) ?: JSONObject()
+                    existing.put("percent", muxPct)
+                    existing.put("status", "Muxing")
+                    existing.put("speed", "Muxing")
+                    existing.put("eta", "$pctInt%")
+                    existing.put("downloaded_str", "Muxing $pctInt%")
+                    existing.put("total_str", "Combining tracks")
+                    obj.put(k, existing)
+                }
             }
             obj
         } catch (_: Exception) {
