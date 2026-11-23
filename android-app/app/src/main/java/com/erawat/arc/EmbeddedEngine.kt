@@ -23,7 +23,17 @@ object EmbeddedEngine {
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(context.applicationContext))
         }
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val ariaFile = File(nativeDir, "libaria2c.so")
+        if (ariaFile.exists() && !ariaFile.canExecute()) {
+            try { ariaFile.setExecutable(true, false) } catch (_: Exception) {}
+        }
         val module = Python.getInstance().getModule("dl")
+        if (ariaFile.exists()) {
+            try {
+                module.callAttr("set_aria2c_path", ariaFile.absolutePath)
+            } catch (_: Exception) {}
+        }
         val rawResponse = module.callAttr("run_app_json_request_json", request.toString())
         return JSONObject(rawResponse.toString())
     }

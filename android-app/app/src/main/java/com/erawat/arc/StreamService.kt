@@ -38,7 +38,9 @@ class StreamService : Service() {
                 } else {
                     context.startService(intent)
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                android.util.Log.w("StreamService", "Could not startForegroundService: ${e.message}")
+            }
         }
 
         fun stop(context: Context) {
@@ -46,7 +48,7 @@ class StreamService : Service() {
                 val intent = Intent(context, StreamService::class.java).apply {
                     action = ACTION_STOP
                 }
-                context.stopService(intent)
+                context.startService(intent)
             } catch (_: Exception) {}
             try {
                 val nm = context.getSystemService(NotificationManager::class.java)
@@ -60,9 +62,12 @@ class StreamService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        safeStartForeground()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        safeStartForeground()
+
         if (intent?.action == ACTION_STOP) {
             cleanupAndStop()
             return START_NOT_STICKY
@@ -70,15 +75,7 @@ class StreamService : Service() {
 
         val url = intent?.getStringExtra("url").orEmpty()
         val headersStr = intent?.getStringExtra("headers").orEmpty()
-        val notification = buildNotification()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        } else {
-            startForeground(NOTIF_ID, notification)
-        }
-
-        // Keep proxy server and Python runtime active in foreground service
         if (url.isNotBlank()) {
             Thread {
                 runCatching {
@@ -95,6 +92,19 @@ class StreamService : Service() {
         }
 
         return START_NOT_STICKY
+    }
+
+    private fun safeStartForeground() {
+        try {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("StreamService", "safeStartForeground warning: ${e.message}")
+        }
     }
 
     private fun cleanupAndStop() {

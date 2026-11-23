@@ -5046,13 +5046,9 @@ private fun ArcPlayerScreen(
                 playUrl = px
             }
         }
-
-        if (playUrl.contains("127.0.0.1")) {
-            StreamService.start(context, streamUrl, cleanHeaders)
-        }
     }
 
-    val exoPlayer = remember(playUrl) {
+    val exoPlayer = remember(context) {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .setDefaultRequestProperties(cleanHeaders)
@@ -5060,17 +5056,26 @@ private fun ArcPlayerScreen(
             .setDataSourceFactory(httpDataSourceFactory)
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(mediaSourceFactory)
-            .build().apply {
-                setMediaItem(MediaItem.fromUri(Uri.parse(playUrl)))
-                prepare()
-                playWhenReady = true
-            }
+            .build()
     }
 
-    DisposableEffect(exoPlayer) {
+    LaunchedEffect(playUrl) {
+        if (playUrl.isNotBlank()) {
+            runCatching {
+                val mediaItem = MediaItem.fromUri(Uri.parse(playUrl))
+                exoPlayer.setMediaItem(mediaItem)
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
         onDispose {
-            exoPlayer.release()
-            StreamService.stop(context)
+            runCatching {
+                exoPlayer.stop()
+                exoPlayer.release()
+            }
         }
     }
 

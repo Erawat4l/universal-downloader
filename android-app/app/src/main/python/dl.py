@@ -887,6 +887,60 @@ def resume_download(job_id):
             ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Downloading"
     return True
 
+ACTIVE_SUBPROCESSES = {}
+ARIA2C_CUSTOM_PATH = None
+
+def set_aria2c_path(path):
+    global ARIA2C_CUSTOM_PATH
+    if path and os.path.exists(path):
+        ARIA2C_CUSTOM_PATH = str(path).strip()
+        print(f"> Registered native BitTorrent engine: {ARIA2C_CUSTOM_PATH}")
+
+def get_aria2c_binary():
+    global ARIA2C_CUSTOM_PATH
+    if ARIA2C_CUSTOM_PATH and os.path.isfile(ARIA2C_CUSTOM_PATH) and os.access(ARIA2C_CUSTOM_PATH, os.X_OK):
+        return ARIA2C_CUSTOM_PATH
+
+    env_path = os.environ.get("ARIA2C_PATH")
+    if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
+        return env_path
+
+    # Try Chaquopy Android Context nativeLibraryDir
+    try:
+        from com.chaquo.python import Python
+        app = Python.getPlatform().getApplication()
+        native_dir = str(app.getApplicationInfo().nativeLibraryDir)
+        cand = os.path.join(native_dir, "libaria2c.so")
+        if os.path.isfile(cand):
+            try:
+                os.chmod(cand, 0o755)
+            except Exception:
+                pass
+            return cand
+    except Exception:
+        pass
+
+    # Direct system PATH check
+    w = shutil.which("aria2c")
+    if w and os.access(w, os.X_OK):
+        return w
+
+    # Direct common Android native library paths
+    for cand in (
+        "/data/data/com.erawat.arc/lib/libaria2c.so",
+        "/data/user/0/com.erawat.arc/lib/libaria2c.so",
+        "/data/data/com.termux/files/usr/bin/aria2c",
+    ):
+        if os.path.isfile(cand):
+            try:
+                os.chmod(cand, 0o755)
+            except Exception:
+                pass
+            if os.access(cand, os.X_OK):
+                return cand
+
+    return "aria2c"
+
 def cancel_download(job_id):
     if job_id:
         j_str = str(job_id)
@@ -895,6 +949,12 @@ def cancel_download(job_id):
         evt = PAUSE_EVENTS.get(j_str)
         if evt:
             evt.set()
+        sub_p = ACTIVE_SUBPROCESSES.get(j_str)
+        if sub_p:
+            try:
+                sub_p.terminate()
+            except Exception:
+                pass
         if j_str in ACTIVE_DOWNLOAD_PROGRESS:
             ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Cancelled"
     return True
@@ -986,7 +1046,10 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
     sys.stdout.flush()
 
 ARIA_PROGRESS_REGEX = re.compile(
-    r'\[#[0-9a-fA-F]+\s+([\d\.]+[A-Za-z]+)/([\d\.]+[A-Za-z]+)\((\d+)%\)\s*(?:CN:\d+\s*)?DL:([\d\.]+[A-Za-z]+)?(?:\s*ETA:([^\s\]]+))?\]'
+    r'\[#[0-9a-fA-F]+\s+([\d\.]+[A-Za-z]+)/([\d\.]+[A-Za-z]+)\((\d+)%\).*?DL:([\d\.]+[A-Za-z]+(?:\/[A-Za-z]+)?).*?(?:ETA:([^\s\]]+))?\]'
+)
+ARIA_PROGRESS_SIMPLE_REGEX = re.compile(
+    r'\[#[0-9a-fA-F]+\s+([\d\.]+[A-Za-z]+)/([\d\.]+[A-Za-z]+)\((\d+)%\)'
 )
 YTDLP_PROGRESS_REGEX = re.compile(
     r'\[download\]\s+([\d\.]+)%\s+of\s+~?\s*([\d\.]+\s*[A-Za-z]+)\s+at\s+([\d\.]+\s*[A-Za-z]+/s)\s+ETA\s+([\d:]+)'
@@ -1007,6 +1070,17 @@ def _process_progress_line(line):
             spd = m_aria.group(4) or "--"
             eta = m_aria.group(5) or "--"
             render_download_progress(pct, total_str=f"{downloaded}/{total}", speed_str=spd, eta_str=eta)
+            return
+        except Exception:
+            pass
+
+    m_aria_s = ARIA_PROGRESS_SIMPLE_REGEX.search(line)
+    if m_aria_s:
+        try:
+            downloaded = m_aria_s.group(1)
+            total = m_aria_s.group(2)
+            pct = float(m_aria_s.group(3))
+            render_download_progress(pct, total_str=f"{downloaded}/{total}")
             return
         except Exception:
             pass
@@ -1044,9 +1118,10 @@ def _process_progress_line(line):
     sys.stdout.write(f"\r\033[K{line}\n")
     sys.stdout.flush()
 
-def run_command_with_clean_progress(cmd):
+def run_command_with_clean_progress(cmd, cwd=None, job_id=None):
     """Run subprocess while processing \r and \n into clean single-line progress updates."""
     p = None
+    jid = str(job_id) if job_id else None
     try:
         p = subprocess.Popen(
             cmd,
@@ -1054,10 +1129,26 @@ def run_command_with_clean_progress(cmd):
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            universal_newlines=True
+            universal_newlines=True,
+            cwd=cwd
         )
+        if jid:
+            ACTIVE_SUBPROCESSES[jid] = p
         buf = []
         while True:
+            if jid and jid in CANCELLED_DOWNLOAD_JOBS:
+                try:
+                    p.terminate()
+                    p.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                sys.stdout.write("\n[WARN] Download cancelled by user.\n")
+                sys.stdout.flush()
+                return -1
+
             ch = p.stdout.read(1)
             if not ch:
                 if buf:
@@ -1071,7 +1162,7 @@ def run_command_with_clean_progress(cmd):
                 buf.append(ch)
         p.wait()
         if p.returncode == 0:
-            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s")
+            render_download_progress(100.0, total_str="Complete", speed_str="Done", eta_str="0s", job_id=jid)
         sys.stdout.write("\n")
         sys.stdout.flush()
         return p.returncode
@@ -1091,6 +1182,9 @@ def run_command_with_clean_progress(cmd):
     except Exception as e:
         print(f"[FAIL] Process execution error: {e}")
         return 1
+    finally:
+        if jid and jid in ACTIVE_SUBPROCESSES:
+            ACTIVE_SUBPROCESSES.pop(jid, None)
 
 def download_file_stream(url, filename, custom_headers=None, target_dir=None, cache_dir=None, job_id=None, batch_info=None):
     headers = get_stream_headers_for_url(url, {**HEADERS, **(custom_headers or {})})
@@ -5117,7 +5211,7 @@ def download_torrent(torrent_source, title="media", target_dir=None, file_idx=No
     # If remote HTTP/HTTPS torrent URL, download to cache first
     if eff_source.startswith(("http://", "https://")) and not eff_source.startswith("magnet:"):
         try:
-            cache_tor_dir = os.path.expanduser("~/.cache/torrents")
+            cache_tor_dir = os.path.join(tempfile.gettempdir(), "torrents")
             os.makedirs(cache_tor_dir, exist_ok=True)
             r = requests.get(eff_source, headers=HEADERS, timeout=15)
             if r.status_code == 200:
@@ -5129,10 +5223,18 @@ def download_torrent(torrent_source, title="media", target_dir=None, file_idx=No
         except Exception as e:
             print(f"[WARN] Failed to pre-download remote torrent file: {e}")
 
+    aria_bin = get_aria2c_binary()
+    print(f"> Using BitTorrent Engine: {aria_bin}")
+
+    dht_dat = os.path.join(tempfile.gettempdir(), "dht.dat")
+    dht6_dat = os.path.join(tempfile.gettempdir(), "dht6.dat")
+
     cmd = [
-        "aria2c",
+        aria_bin,
         f"--dir={target_dir}",
         "--enable-dht=true",
+        f"--dht-file-path={dht_dat}",
+        f"--dht-file-path6={dht6_dat}",
         "--dht-listen-port=6881",
         "--enable-peer-exchange=true",
         "--bt-enable-lpd=true",
@@ -5150,7 +5252,7 @@ def download_torrent(torrent_source, title="media", target_dir=None, file_idx=No
         cmd.append(f"--select-file={file_idx}")
     cmd.append(eff_source)
 
-    ret = run_command_with_clean_progress(cmd)
+    ret = run_command_with_clean_progress(cmd, cwd=target_dir, job_id=jid)
     if ret == -1:
         print("[WARN] Torrent download cancelled.")
         return None
