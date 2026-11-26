@@ -2614,6 +2614,9 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
 _NETMIRROR_META_CACHE = {}
 _STREAM_RESOLVE_CACHE = {}
 _NETMIRROR_AUDIO_CACHE = {}
+_NM_SEARCH_CACHE = {}
+_TMDB_OTT_CACHE = {}
+_YT_RESOLVE_CACHE = {}
 
 def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False, quality_arg=None, action_mode=None, target_season=None, target_episode=None, download_scope="episode", job_id=None, cache_dir=None, audio_lang=None):
     jid = job_id or get_current_job_id()
@@ -2663,22 +2666,37 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         results = _NETMIRROR_META_CACHE[media_id].get("results", [])
         media_type = _NETMIRROR_META_CACHE[media_id].get("media_type", media_type)
     else:
-        hosts_to_try = ['api2.imdb4.shop', 'api2.imdb3.shop']
+        hosts_to_try = ['api2.imdb3.shop', 'api2.imdb4.shop']
         types_to_try = list(dict.fromkeys([media_type, 'tv', 'series', 'movie']))
-        for h in hosts_to_try:
-            for m_type in types_to_try:
-                try:
-                    api_url = f'https://{h}/api/{m_type}/{media_id}'
-                    res = requests.get(api_url, headers=headers, timeout=5)
-                    if res.status_code == 200:
-                        data = res.json()
-                        results = data.get('results', [])
-                        if results:
-                            media_type = m_type
+
+        def _fetch_meta(h, m_type):
+            try:
+                api_url = f'https://{h}/api/{m_type}/{media_id}'
+                res = requests.get(api_url, headers=headers, timeout=3.5)
+                if res.status_code == 200:
+                    data = res.json()
+                    r_list = data.get('results', [])
+                    if r_list:
+                        return m_type, r_list
+            except Exception:
+                pass
+            return None
+
+        # Race primary media_type across both hosts first; fall back to remaining types concurrently
+        for batch_types in ([types_to_try[0]], types_to_try[1:]):
+            if not batch_types:
+                continue
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                futs = [ex.submit(_fetch_meta, h, mt) for mt in batch_types for h in hosts_to_try]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        out = fut.result()
+                        if out:
+                            media_type, results = out
                             _NETMIRROR_META_CACHE[media_id] = {"results": results, "media_type": media_type}
                             break
-                except Exception:
-                    continue
+                    except Exception:
+                        pass
             if results:
                 break
     if not results:
@@ -3028,31 +3046,16 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             else:
                 print("[FAIL] (no direct stream nodes found)")
 
-            # Step 4: Validate candidate streams and prompt quality
+            # Step 4: Fast selection when labeled qualities already resolved cleanly
             if candidate_streams:
-                sys.stdout.write("  [4/4]  Validating media stream health... ")
+                sys.stdout.write("  [4/4]  Finalizing media stream candidates... ")
                 sys.stdout.flush()
 
-                valid_qualities = {}
+                valid_qualities = dict(qualities_dict) if qualities_dict else {}
                 q_order = {'4k': 6, '2160p': 6, '1080p': 5, '720p': 4, '480p': 3, '360p': 2, 'auto': 1}
-                def _probe(item):
-                    q_k, q_info = item
-                    chk_h = get_stream_headers_for_url(q_info['url'])
-                    try:
-                        chk = requests.head(q_info['url'], headers=chk_h, timeout=2.5)
-                        if chk.status_code in (200, 206, 302, 301, 429):
-                            return q_k, q_info
-                    except Exception:
-                        pass
-                    return q_k, q_info
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(qualities_dict) or 1)) as ex:
-                    for pres in ex.map(_probe, list(qualities_dict.items())):
-                        if pres:
-                            valid_qualities[pres[0]] = pres[1]
 
                 if valid_qualities:
-                    print("[OK] Verified (status 200)")
+                    print("[OK] Ready")
                     sorted_q = sorted(valid_qualities.keys(), key=lambda q: q_order.get(q, 0), reverse=True)
                     chosen_q_key = None
                     if quality_arg:
@@ -3277,9 +3280,11 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         proxy_stream_url = start_local_stream_proxy(direct_stream_url, custom_headers=stream_headers)
 
         audio_choices_list = []
-        if 'show_base' in locals() and show_base:
-            if show_base in _NETMIRROR_AUDIO_CACHE:
-                audio_choices_list = _NETMIRROR_AUDIO_CACHE[show_base]
+        cache_aud_key = show_base.lower() if ('show_base' in locals() and show_base) else ""
+        if cache_aud_key:
+            cached_aud = _NETMIRROR_AUDIO_CACHE.get(cache_aud_key) or _NETMIRROR_AUDIO_CACHE.get(show_base)
+            if cached_aud is not None:
+                audio_choices_list = list(cached_aud)
             else:
                 try:
                     raw_peers = search_netmirror(show_base)
@@ -3295,7 +3300,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                     "title": a_item.get("title", ""),
                                     "id": a_item.get("id"),
                                 })
-                    _NETMIRROR_AUDIO_CACHE[show_base] = audio_choices_list
+                    _NETMIRROR_AUDIO_CACHE[cache_aud_key] = audio_choices_list
                 except Exception:
                     pass
 
@@ -3603,6 +3608,13 @@ def download_youtube_audio(url, codec='mp3', quality='320', target_dir=None):
 
 def search_netmirror(query):
     try:
+        norm_q = ' '.join(str(query or '').strip().split())
+        if not norm_q:
+            return []
+        cache_entry = _NM_SEARCH_CACHE.get(norm_q.lower())
+        if cache_entry and (time.time() - cache_entry[0]) < 60:
+            return list(cache_entry[1])
+
         s = requests.Session()
         s.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -3610,7 +3622,6 @@ def search_netmirror(query):
             'Origin': 'https://netmirror.center'
         })
         
-        norm_q = ' '.join(query.strip().split())
         queries_to_try = []
         def add_q(val):
             c_val = ' '.join(val.strip().split())
@@ -3709,10 +3720,11 @@ def search_netmirror(query):
 
         def query_api(q):
             clean_q = urllib.parse.quote(q)
-            for host in ['api2.imdb4.shop', 'api2.imdb3.shop']:
+
+            def _hit_host(host):
                 try:
                     url = f'https://{host}/api/search2/{clean_q}?page=0'
-                    r = s.get(url, timeout=3.0)
+                    r = s.get(url, timeout=2.2)
                     if r.status_code == 200:
                         data = r.json()
                         results = data.get('results', [])
@@ -3741,12 +3753,21 @@ def search_netmirror(query):
                         if parsed:
                             return sorted(parsed, key=lambda x: rank_score(x, norm_q.lower()))
                 except Exception:
-                    continue
+                    pass
+                return []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                futs = [ex.submit(_hit_host, h) for h in ('api2.imdb3.shop', 'api2.imdb4.shop')]
+                for fut in concurrent.futures.as_completed(futs):
+                    res = fut.result()
+                    if res:
+                        return res
             return []
 
         for q in queries_to_try:
             res = query_api(q)
             if res:
+                _NM_SEARCH_CACHE[norm_q.lower()] = (time.time(), list(res))
                 return res
 
         # Fallback 1: Wikipedia opensearch for typo-correction (e.g. "son f anachy" -> "Sons of Anarchy")
@@ -3851,9 +3872,13 @@ def handle_video_stream_and_download(url):
 def get_ott_providers_for_title(title, m_type, year):
     """Fetch OTT platforms / networks hosting this title via TMDB API."""
     clean_q = re.sub(r'\[.*?\]', '', title).strip()
+    cache_key = (clean_q.lower(), str(m_type), str(year or ""))
+    cached = _TMDB_OTT_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < 600:
+        return list(cached[1])
     api_key = 'c8dea14dc917687ac631a52620e4f7ad'
     try:
-        sr = requests.get(f'https://api.themoviedb.org/3/search/{m_type}?query={urllib.parse.quote(clean_q)}&api_key={api_key}', timeout=2).json()
+        sr = requests.get(f'https://api.themoviedb.org/3/search/{m_type}?query={urllib.parse.quote(clean_q)}&api_key={api_key}', timeout=1.1).json()
         hits = sr.get('results', [])
         matched_id = None
         for h in hits:
@@ -3867,13 +3892,13 @@ def get_ott_providers_for_title(title, m_type, year):
             ott_list = []
             if m_type == 'tv':
                 try:
-                    s_r = requests.get(f'https://api.themoviedb.org/3/tv/{matched_id}?api_key={api_key}', timeout=2).json()
+                    s_r = requests.get(f'https://api.themoviedb.org/3/tv/{matched_id}?api_key={api_key}', timeout=1.1).json()
                     for n in s_r.get('networks', []):
                         ott_list.append(n['name'])
                 except Exception:
                     pass
             try:
-                r_p = requests.get(f'https://api.themoviedb.org/3/{m_type}/{matched_id}/watch/providers?api_key={api_key}', timeout=2).json()
+                r_p = requests.get(f'https://api.themoviedb.org/3/{m_type}/{matched_id}/watch/providers?api_key={api_key}', timeout=1.1).json()
                 for c in ['IN', 'US']:
                     for p in r_p.get('results', {}).get(c, {}).get('flatrate', []):
                         pname = p['provider_name']
@@ -3891,9 +3916,12 @@ def get_ott_providers_for_title(title, m_type, year):
                             ott_list.append(pname)
             except Exception:
                 pass
-            return ott_list[:2]
+            res_otts = ott_list[:2]
+            _TMDB_OTT_CACHE[cache_key] = (time.time(), res_otts)
+            return res_otts
     except Exception:
         pass
+    _TMDB_OTT_CACHE[cache_key] = (time.time(), [])
     return []
 
 def compute_query_relevance(title, query):
@@ -4012,12 +4040,31 @@ def group_and_deduplicate_results(results, query=None):
             }
         groups[key]['items'].append(it)
 
-    # Fetch OTT providers in parallel
+    # Fetch OTT providers in parallel with strict 1.1s latency budget so search stays fast
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         f_map = {ex.submit(get_ott_providers_for_title, g['title'], g['type'].lower(), g['year']): k for k, g in groups.items()}
-        for f in concurrent.futures.as_completed(f_map):
-            k = f_map[f]
-            groups[k]['otts'] = f.result() or []
+        try:
+            for f in concurrent.futures.as_completed(f_map, timeout=1.1):
+                k = f_map[f]
+                try:
+                    groups[k]['otts'] = f.result() or []
+                except Exception:
+                    groups[k]['otts'] = []
+        except concurrent.futures.TimeoutError:
+            pass
+    for g in groups.values():
+        g.setdefault('otts', [])
+        t_key = str(g.get('title') or '').strip().lower()
+        if t_key and g.get('audios'):
+            _NETMIRROR_AUDIO_CACHE[t_key] = [
+                {
+                    "language": lang,
+                    "url": item.get("url", ""),
+                    "title": item.get("title", ""),
+                    "id": item.get("id"),
+                }
+                for lang, item in g['audios'].items()
+            ]
 
     # Rank by query relevance score first (highest relevance first), then year, then title
     for g in groups.values():
@@ -4794,6 +4841,35 @@ def get_igl_catalog_split():
     return _IGL_CATALOG_CACHE
 
 
+_IGL_PREFETCH_INFLIGHT = set()
+_IGL_PREFETCH_LOCK = threading.Lock()
+
+
+def _trigger_igl_prefetch(ep_obj, quality="best", audio_lang=None):
+    if not isinstance(ep_obj, dict):
+        return
+    did = ep_obj.get("dataId") or ep_obj.get("id")
+    if not did or ep_obj.get("type") != "youtube":
+        return
+    pf_key = (str(did), str(audio_lang or "").strip().lower())
+    with _IGL_PREFETCH_LOCK:
+        if pf_key in _IGL_PREFETCH_INFLIGHT:
+            return
+        _IGL_PREFETCH_INFLIGHT.add(pf_key)
+
+    def _worker():
+        try:
+            app_igl_resolve(did, quality=quality, audio_lang=audio_lang)
+        except Exception:
+            pass
+        finally:
+            with _IGL_PREFETCH_LOCK:
+                _IGL_PREFETCH_INFLIGHT.discard(pf_key)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
 def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="best", audio_lang=None):
     cat = get_igl_catalog_split()
     if not cat:
@@ -4823,6 +4899,12 @@ def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="bes
 
     clean_quality = quality if (quality and "ask" not in quality.lower()) else "best"
     res = app_igl_resolve(target_ep.get("dataId") or target_ep.get("id"), quality=clean_quality, audio_lang=audio_lang)
+
+    # Background prefetch next YouTube episode (and S2E1 when opening S1E1) for instant switching
+    if ep_num < ep_count:
+        _trigger_igl_prefetch(ep_list[ep_num], quality=clean_quality, audio_lang=audio_lang)
+    if st == "main" and s_num == 1 and ep_num == 1 and series_map.get(2):
+        _trigger_igl_prefetch(series_map[2][0], quality=clean_quality, audio_lang=audio_lang)
 
     series_title = "India's Got Latent" if st == "main" else "India's Got Latent Bonus"
     poster = "https://i.ytimg.com/vi/GTxMSPqtbRc/hqdefault.jpg" if st == "main" else "https://i.ytimg.com/vi/NQ6gWHMvna8/hq720.jpg"
@@ -5636,17 +5718,75 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 "media_type": "video",
             }
 
+        clean_audio_lang_req = str(audio_lang or "").strip().lower()
+        yt_cache_key = (url.strip(), clean_audio_lang_req)
+
+        def _yt_select_for_quality(base_payload, req_quality):
+            out = dict(base_payload)
+            out["qualities"] = list(base_payload.get("qualities") or [])
+            out["quality_urls"] = dict(base_payload.get("quality_urls") or {})
+            qt_map = {k: dict(v) for k, v in (base_payload.get("quality_tracks") or {}).items()}
+            out["quality_tracks"] = qt_map
+            out["quality"] = req_quality
+
+            sel_track = None
+            if req_quality in qt_map:
+                sel_track = qt_map[req_quality]
+            else:
+                req_low = req_quality.lower()
+                for q_k, q_v in qt_map.items():
+                    if req_low in q_k.lower() or \
+                       (req_low.startswith("2160") and "2160" in q_k) or \
+                       (req_low.startswith("1440") and "1440" in q_k) or \
+                       (req_low.startswith("1080") and "1080" in q_k) or \
+                       (req_low.startswith("720") and "720" in q_k) or \
+                       (req_low.startswith("480") and "480" in q_k) or \
+                       (req_low.startswith("360") and "360" in q_k):
+                        sel_track = q_v
+                        break
+            if not sel_track:
+                sel_track = qt_map.get("Best Available") or {}
+
+            prog_fb_u = out.get("_prog_fb_url", "")
+            prog_fb_s = out.get("_prog_fb_summary", "")
+            s_url = sel_track.get("url") or out["quality_urls"].get(req_quality) or out["quality_urls"].get("Best Available") or prog_fb_u
+            v_url = sel_track.get("video_url", "")
+            a_url = sel_track.get("audio_url", "")
+            f_url = sel_track.get("fallback_url", "") or prog_fb_u
+            v_fmt = sel_track.get("video_format", "")
+            a_fmt = sel_track.get("audio_format", "")
+            f_fmt = sel_track.get("fallback_format", "") or prog_fb_s
+
+            if v_url and not a_url:
+                v_url = ""
+                if prog_fb_u:
+                    s_url = prog_fb_u
+                    v_fmt = prog_fb_s
+                    a_fmt = "muxed"
+
+            out["url"] = s_url
+            out["stream_url"] = s_url
+            out["direct_url"] = s_url
+            out["video_url"] = v_url
+            out["audio_url"] = a_url
+            out["fallback_url"] = f_url
+            out["video_format"] = v_fmt
+            out["audio_format"] = a_fmt
+            out["fallback_format"] = f_fmt
+            out.pop("_prog_fb_url", None)
+            out.pop("_prog_fb_summary", None)
+            return out
+
+        cached_yt = _YT_RESOLVE_CACHE.get(yt_cache_key)
+        if cached_yt and (time.time() - cached_yt[0]) < 600:
+            res_cached = _yt_select_for_quality(cached_yt[1], clean_quality)
+            print(f"[CACHE] Instant YouTube resolve hit: {res_cached.get('title', 'Video')}")
+            return res_cached
+
         print("> Analyzing video manifest with yt-dlp...")
         info = None
         formats = []
         last_err = None
-
-        client_attempts = [
-            None,
-            ['tv_embedded'],
-            ['web_creator'],
-            ['android'],
-        ]
 
         safari_headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
@@ -5735,19 +5875,25 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         used_client = None
         android_progressive = []
 
-        for client in client_attempts:
+        def _extract_for_client(cl):
             ydl_opts = get_ytdlp_opts({
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
-                "socket_timeout": 12,
+                "socket_timeout": 10,
             }, cookie=cookie)
-            if client:
-                ydl_opts["extractor_args"] = {"youtube": {"player_client": client}}
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    extracted = ydl.extract_info(url, download=False)
+            if cl:
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": cl}}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return cl, ydl.extract_info(url, download=False)
+
+        # Fetch tv_embedded (HD/4K DASH+HLS) and android (progressive mp4 fallback) in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_extract_for_client, cl) for cl in (['tv_embedded'], ['android'])]
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    cl, extracted = fut.result()
                     if extracted and isinstance(extracted, dict):
                         extracted_fmts = [f for f in extracted.get("formats", []) if isinstance(f, dict) and f.get("url")]
                         if extracted_fmts:
@@ -5755,20 +5901,35 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                                 if not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"):
                                     android_progressive.append(f)
                             curr_h = max([f.get("height") or 0 for f in extracted_fmts if f.get("vcodec") != "none"] or [0])
-                            if curr_h > best_max_h:
-                                best_max_h = curr_h
+                            if curr_h > best_max_h or not best_extracted:
+                                best_max_h = max(best_max_h, curr_h)
                                 best_extracted = extracted
                                 best_formats = extracted.get("formats", [])
-                                used_client = client
+                                used_client = cl
+                except Exception as e:
+                    last_err = str(e)
+
+        # Fall back to default/web_creator only if concurrent fetch didn't obtain >= 720p
+        if best_max_h < 720:
+            for cl in (None, ['web_creator']):
+                try:
+                    _, extracted = _extract_for_client(cl)
+                    if extracted and isinstance(extracted, dict):
+                        extracted_fmts = [f for f in extracted.get("formats", []) if isinstance(f, dict) and f.get("url")]
+                        if extracted_fmts:
+                            for f in extracted_fmts:
+                                if not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"):
+                                    android_progressive.append(f)
+                            curr_h = max([f.get("height") or 0 for f in extracted_fmts if f.get("vcodec") != "none"] or [0])
+                            if curr_h > best_max_h or not best_extracted:
+                                best_max_h = max(best_max_h, curr_h)
+                                best_extracted = extracted
+                                best_formats = extracted.get("formats", [])
+                                used_client = cl
                                 if best_max_h >= 720:
                                     break
-                            elif not best_extracted:
-                                best_extracted = extracted
-                                best_formats = extracted.get("formats", [])
-                                used_client = client
-            except Exception as e:
-                last_err = str(e)
-                continue
+                except Exception as e:
+                    last_err = str(e)
 
         info = best_extracted
         formats = best_formats
@@ -5785,24 +5946,6 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             f for f in formats
             if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
         ]
-        if not progressive and used_client != ["android"]:
-            try:
-                fb_opts = get_ytdlp_opts({
-                    "quiet": True,
-                    "no_warnings": True,
-                    "skip_download": True,
-                    "noplaylist": True,
-                    "socket_timeout": 5,
-                    "extractor_args": {"youtube": {"player_client": ["android"]}},
-                }, cookie=cookie)
-                with yt_dlp.YoutubeDL(fb_opts) as ydl:
-                    fb_info = ydl.extract_info(url, download=False)
-                    if fb_info and isinstance(fb_info, dict):
-                        for f in (fb_info.get("formats") or []):
-                            if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"):
-                                progressive.append(f)
-            except Exception:
-                pass
         if not progressive and android_progressive:
             progressive = list(android_progressive)
 
@@ -6001,8 +6144,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     "fallback_format": "",
                 }
 
-        # Map "Best Available"
-        top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_tracks_map), None)
+        # Map "Best Available" (prefer hardware-decoded 1080p MP4 for smooth YouTube startup, else highest tier)
+        top_res_key = "1080p (Full HD)" if "1080p (Full HD)" in quality_tracks_map else next(
+            (q for q in real_qualities if q != "Best Available" and q in quality_tracks_map), None
+        )
         if top_res_key:
             quality_urls_map["Best Available"] = quality_urls_map.get(top_res_key, "")
             quality_tracks_map["Best Available"] = dict(quality_tracks_map[top_res_key])
@@ -6092,63 +6237,10 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
 
         audio_choices.sort(key=get_audio_priority)
 
-        selected_track = None
-        if clean_quality in quality_tracks_map:
-            selected_track = quality_tracks_map[clean_quality]
-        else:
-            clean_q_lower = clean_quality.lower()
-            for q_key, q_val in quality_tracks_map.items():
-                if clean_q_lower in q_key.lower() or \
-                   (clean_q_lower.startswith("1080") and "1080" in q_key) or \
-                   (clean_q_lower.startswith("720") and "720" in q_key) or \
-                   (clean_q_lower.startswith("480") and "480" in q_key) or \
-                   (clean_q_lower.startswith("360") and "360" in q_key):
-                    selected_track = q_val
-                    break
-        if not selected_track:
-            selected_track = quality_tracks_map.get("Best Available") or {}
-
-        stream_url = selected_track.get("url") or quality_urls_map.get(clean_quality) or quality_urls_map.get("Best Available")
-        top_video_url = selected_track.get("video_url", "")
-        top_audio_url = selected_track.get("audio_url", "")
-        top_fallback_url = selected_track.get("fallback_url", "") or prog_fallback_url
-        top_video_format = selected_track.get("video_format", "")
-        top_audio_format = selected_track.get("audio_format", "")
-        top_fallback_format = selected_track.get("fallback_format", "") or prog_fallback_summary
-
-        # Never leave a split video_url without an audio track unless it's pure progressive/audio-only
-        if top_video_url and not top_audio_url:
-            top_video_url = ""
-            if prog_fallback_url:
-                stream_url = prog_fallback_url
-                top_video_format = prog_fallback_summary
-                top_audio_format = "muxed"
-
-        if not stream_url:
-            if progressive_sorted:
-                stream_url = progressive_sorted[0].get("url")
-                top_video_format = _yt_fmt_summary(progressive_sorted[0])
-                top_audio_format = "muxed"
-            else:
-                raise Exception("No direct playable muxed or merged stream could be extracted from YouTube format manifest")
-
-        if not stream_url or stream_url == url or "youtube.com" in stream_url or "youtu.be" in stream_url:
-            raise Exception("Failed to resolve direct playable stream URL for this YouTube video")
-
         thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get("id") else "")
+        yt_http_hdrs = dict(info.get("http_headers") or {})
 
-        print(f"[FMT] Selected stream [{clean_quality}] video=({top_video_format or 'muxed'}) | audio=({top_audio_format or 'embedded'}) | fallback=({top_fallback_format or 'none'})")
-        print(f"[OK] Stream resolved: {info.get('title', 'Video')}")
-        return {
-            "url": stream_url,
-            "stream_url": stream_url,
-            "direct_url": stream_url,
-            "video_url": top_video_url,
-            "audio_url": top_audio_url,
-            "fallback_url": top_fallback_url,
-            "video_format": top_video_format,
-            "audio_format": top_audio_format,
-            "fallback_format": top_fallback_format,
+        base_yt_payload = {
             "target_url": url,
             "title": info.get("title", "Resolved video"),
             "source": info.get("extractor_key", "YouTube"),
@@ -6163,9 +6255,30 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "audio_only": False,
             "can_stream": True,
             "media_type": "video",
-            "headers": info.get("http_headers", {}),
-            "stream_headers": info.get("http_headers", {}),
+            "headers": yt_http_hdrs,
+            "stream_headers": yt_http_hdrs,
+            "_prog_fb_url": prog_fallback_url,
+            "_prog_fb_summary": prog_fallback_summary,
         }
+        _YT_RESOLVE_CACHE[yt_cache_key] = (time.time(), base_yt_payload)
+        final_yt_res = _yt_select_for_quality(base_yt_payload, clean_quality)
+
+        stream_url = final_yt_res.get("url")
+        if not stream_url or stream_url == url or "youtube.com" in stream_url or "youtu.be" in stream_url:
+            if progressive_sorted:
+                stream_url = progressive_sorted[0].get("url")
+                final_yt_res["url"] = stream_url
+                final_yt_res["stream_url"] = stream_url
+                final_yt_res["direct_url"] = stream_url
+                final_yt_res["video_url"] = ""
+                final_yt_res["video_format"] = _yt_fmt_summary(progressive_sorted[0])
+                final_yt_res["audio_format"] = "muxed"
+            else:
+                raise Exception("Failed to resolve direct playable stream URL for this YouTube video")
+
+        print(f"[FMT] Selected stream [{clean_quality}] video=({final_yt_res.get('video_format') or 'muxed'}) | audio=({final_yt_res.get('audio_format') or 'embedded'}) | fallback=({final_yt_res.get('fallback_format') or 'none'})")
+        print(f"[OK] Stream resolved: {info.get('title', 'Video')}")
+        return final_yt_res
 
     if any(tg in lower for tg in ["t.me/", "telegram.me/", "telegram.dog/"]):
         print("> Resolving Telegram link...")

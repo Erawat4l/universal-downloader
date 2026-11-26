@@ -202,14 +202,30 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import android.content.ContentUris
+import android.media.MediaScannerConnection
+import android.provider.MediaStore
 import android.util.Log
+import android.view.LayoutInflater
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.material.icons.outlined.Brightness6
 import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.FullscreenExit
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -301,7 +317,94 @@ private data class PlayerStreamTarget(
     val fallbackFormat: String = "",
     val isAudioOnlyStream: Boolean = false,
     val downloadFilePath: String = "",
+    val currentQuality: String = "Best Available",
+    val availableQualities: List<String> = emptyList(),
+    val qualityTracks: Map<String, StreamTrackSpec> = emptyMap(),
+    val qualityUrls: Map<String, String> = emptyMap(),
 )
+
+private fun requiredLocalMediaPermissions(isAudioFile: Boolean): Array<String> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (isAudioFile) {
+            arrayOf(Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.READ_MEDIA_VIDEO)
+        } else {
+            arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_AUDIO)
+        }
+    } else {
+        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
+}
+
+private fun hasLocalMediaPermission(context: Context, isAudioFile: Boolean): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+        return true
+    }
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val perm = if (isAudioFile) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_MEDIA_VIDEO
+        ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+private fun resolvePlayableLocalUri(context: Context, file: File, isAudioFile: Boolean): Uri {
+    val collections = buildList {
+        if (isAudioFile) add(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) else add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            add(MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+        }
+        add(MediaStore.Files.getContentUri("external"))
+    }
+    val pathsToTry = listOfNotNull(
+        file.absolutePath,
+        runCatching { file.canonicalPath }.getOrNull(),
+    ).distinct()
+
+    for (collection in collections) {
+        for (path in pathsToTry) {
+            val found = runCatching {
+                context.contentResolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    "${MediaStore.MediaColumns.DATA} = ?",
+                    arrayOf(path),
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
+                        ContentUris.withAppendedId(collection, id)
+                    } else null
+                }
+            }.getOrNull()
+            if (found != null) return found
+        }
+        val byName = runCatching {
+            context.contentResolver.query(
+                collection,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.SIZE} = ?",
+                arrayOf(file.name, file.length().toString()),
+                "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
+                    ContentUris.withAppendedId(collection, id)
+                } else null
+            }
+        }.getOrNull()
+        if (byName != null) return byName
+    }
+
+    return runCatching {
+        FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+    }.getOrElse { Uri.fromFile(file) }
+}
+
+private fun canOpenContentUri(context: Context, uri: Uri): Boolean {
+    return runCatching {
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+    }.getOrDefault(false)
+}
 
 private data class MediaTarget(
     val title: String,
@@ -1030,6 +1133,22 @@ private fun ArcApp(
         }
     }
 
+    var pendingLocalOpen by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var localPermRetryTrigger by remember { mutableIntStateOf(0) }
+
+    val mediaPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { results ->
+            val anyGranted = results.values.any { it }
+            if (anyGranted && pendingLocalOpen != null) {
+                localPermRetryTrigger++
+            } else if (!anyGranted && pendingLocalOpen != null) {
+                pendingLocalOpen = null
+                message("Media permission is required to play local files.")
+            }
+        }
+    )
+
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { isGranted ->
@@ -1178,7 +1297,7 @@ private fun ArcApp(
         }
     }
 
-    fun openFile(filePath: String, titleOverride: String = "") {
+    fun openFile(filePath: String, titleOverride: String = "", skipPermissionPrompt: Boolean = false) {
         if (filePath.isBlank()) return
         val file = File(filePath)
         if (!file.exists()) {
@@ -1194,9 +1313,28 @@ private fun ArcApp(
             val chosenPlayer = streamingPlayer.ifBlank {
                 preferences.getString("streaming_player_package", "arc_player") ?: "arc_player"
             }
+            var localUri = resolvePlayableLocalUri(context, file, isAudioFile)
+            var isReadable = canOpenContentUri(context, localUri) || file.canRead()
+            if (!isReadable && !hasLocalMediaPermission(context, isAudioFile)) {
+                if (!skipPermissionPrompt) {
+                    pendingLocalOpen = file.absolutePath to titleOverride
+                    mediaPermissionLauncher.launch(requiredLocalMediaPermissions(isAudioFile))
+                    return
+                }
+            }
+            if (!isReadable) {
+                runCatching { MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null) }
+                localUri = resolvePlayableLocalUri(context, file, isAudioFile)
+                isReadable = canOpenContentUri(context, localUri) || file.canRead()
+            }
+            if (!isReadable) {
+                message("Storage/media permission required to open this file.")
+                return
+            }
+
             if (chosenPlayer == "arc_player" || chosenPlayer == "system_chooser") {
                 inAppPlayerTarget = PlayerStreamTarget(
-                    url = Uri.fromFile(file).toString(),
+                    url = localUri.toString(),
                     title = displayTitle,
                     isAudioOnlyStream = isAudioFile,
                     downloadFilePath = file.absolutePath,
@@ -1204,17 +1342,15 @@ private fun ArcApp(
                 return
             }
             try {
-                val uri: Uri = try {
+                val shareUri = runCatching {
                     FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
-                } catch (_: Exception) {
-                    Uri.fromFile(file)
-                }
+                }.getOrElse { localUri }
                 val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when {
                     isAudioFile -> "audio/*"
                     else -> "video/*"
                 }
                 val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, mime)
+                    setDataAndType(shareUri, mime)
                     setPackage(chosenPlayer)
                     putExtra("title", displayTitle)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -1224,7 +1360,7 @@ private fun ArcApp(
                 return
             } catch (_: Exception) {
                 inAppPlayerTarget = PlayerStreamTarget(
-                    url = Uri.fromFile(file).toString(),
+                    url = localUri.toString(),
                     title = displayTitle,
                     isAudioOnlyStream = isAudioFile,
                     downloadFilePath = file.absolutePath,
@@ -1357,6 +1493,10 @@ private fun ArcApp(
         title: String = "",
         trackSpec: StreamTrackSpec? = null,
         isAudioOnlyStream: Boolean = false,
+        currentQuality: String = "Best Available",
+        availableQualities: List<String> = emptyList(),
+        qualityTracks: Map<String, StreamTrackSpec> = emptyMap(),
+        qualityUrls: Map<String, String> = emptyMap(),
     ) {
         val spec = trackSpec ?: StreamTrackSpec(url = streamUrl)
         val effUrl = streamUrl.ifBlank { spec.url }.ifBlank { spec.fallbackUrl }
@@ -1372,6 +1512,10 @@ private fun ArcApp(
                 audioFormat = spec.audioFormat,
                 fallbackFormat = spec.fallbackFormat,
                 isAudioOnlyStream = isAudioOnlyStream || (spec.videoUrl.isBlank() && effUrl.isNotBlank() && spec.audioUrl == effUrl),
+                currentQuality = currentQuality,
+                availableQualities = availableQualities,
+                qualityTracks = qualityTracks,
+                qualityUrls = qualityUrls,
             )
         } else {
             openStreamExternal(effUrl, headers, title, targetPackage = streamingPlayer)
@@ -1383,6 +1527,14 @@ private fun ArcApp(
         if (req != null && req.first.isNotBlank()) {
             openFile(req.first, titleOverride = req.second)
             onLocalPlayConsumed()
+        }
+    }
+
+    LaunchedEffect(localPermRetryTrigger) {
+        val req = pendingLocalOpen
+        if (localPermRetryTrigger > 0 && req != null) {
+            pendingLocalOpen = null
+            openFile(req.first, titleOverride = req.second, skipPermissionPrompt = true)
         }
     }
 
@@ -2353,6 +2505,7 @@ private fun ArcApp(
         message("Media file removed.")
     }
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         containerColor = ArcBlack,
         snackbarHost = {
@@ -2658,6 +2811,10 @@ private fun ArcApp(
                                                     title = displayTitle,
                                                     trackSpec = currentTrack,
                                                     isAudioOnlyStream = audioOnly,
+                                                    currentQuality = selectedQuality,
+                                                    availableQualities = target.availableQualities,
+                                                    qualityTracks = target.qualityTracks,
+                                                    qualityUrls = target.qualityUrls,
                                                 )
                                                 scope.launch {
                                                     kotlinx.coroutines.delay(1200)
@@ -2705,11 +2862,13 @@ private fun ArcApp(
                                                     val playUrl = resolvedSpec.url.ifBlank { directUrl.ifBlank { proxyUrl } }
                                                     if (playUrl.isNotBlank() || (resolvedSpec.videoUrl.isNotBlank() && resolvedSpec.audioUrl.isNotBlank())) {
                                                         val effHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                        val effQTracks = if (qTrackMap.isNotEmpty()) qTrackMap else target.qualityTracks
+                                                        val effQUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls
                                                         target = target.copy(
                                                             directStreamUrl = playUrl,
                                                             proxyUrl = proxyUrl,
-                                                            qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
-                                                            qualityTracks = if (qTrackMap.isNotEmpty()) qTrackMap else target.qualityTracks,
+                                                            qualityUrls = effQUrls,
+                                                            qualityTracks = effQTracks,
                                                             videoUrl = resolvedSpec.videoUrl,
                                                             audioUrl = resolvedSpec.audioUrl,
                                                             fallbackUrl = resolvedSpec.fallbackUrl,
@@ -2724,6 +2883,10 @@ private fun ArcApp(
                                                             title = displayTitle,
                                                             trackSpec = resolvedSpec,
                                                             isAudioOnlyStream = audioOnly,
+                                                            currentQuality = selectedQuality,
+                                                            availableQualities = target.availableQualities,
+                                                            qualityTracks = effQTracks,
+                                                            qualityUrls = effQUrls,
                                                         )
                                                     } else {
                                                         message("Could not resolve stream for $displayTitle")
@@ -3145,21 +3308,14 @@ private fun ArcApp(
                 )
             }
 
-            // In-App Video Player Overlay
-            if (inAppPlayerTarget != null) {
-                Dialog(
-                    onDismissRequest = { inAppPlayerTarget = null },
-                    properties = DialogProperties(
-                        usePlatformDefaultWidth = false,
-                        decorFitsSystemWindows = false
-                    )
-                ) {
-                    ArcPlayerScreen(
-                        streamTarget = inAppPlayerTarget!!,
-                        onClose = { inAppPlayerTarget = null }
-                    )
-                }
-            }
+            // In-App Video Player Overlay is rendered outside Scaffold so it covers bottomBar directly
+    }
+    if (inAppPlayerTarget != null) {
+        ArcPlayerScreen(
+            streamTarget = inAppPlayerTarget!!,
+            onClose = { inAppPlayerTarget = null }
+        )
+    }
     }
 }
 
@@ -3674,7 +3830,7 @@ private fun AnalysisScreen(
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp),
+        contentPadding = PaddingValues(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item {
@@ -5324,8 +5480,17 @@ private fun formatPlayerDuration(ms: Long): String {
 
 private fun toPlayerMediaUri(raw: String): Uri {
     val trimmed = raw.trim()
-    return if (trimmed.startsWith("/")) Uri.fromFile(File(trimmed)) else Uri.parse(trimmed)
+    return when {
+        trimmed.startsWith("/") -> Uri.fromFile(File(trimmed))
+        else -> Uri.parse(trimmed)
+    }
 }
+
+private data class PlayerCaptionTrack(
+    val label: String,
+    val group: Tracks.Group?,
+    val trackIndex: Int,
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -5336,22 +5501,91 @@ private fun ArcPlayerScreen(
     val context = LocalContext.current
     val activity = context as? Activity
     val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+    val coroutineScope = rememberCoroutineScope()
+    val audioManager = remember(context) {
+        context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
+
+    var selectedQuality by remember(streamTarget) {
+        mutableStateOf(streamTarget.currentQuality.ifBlank { "Best Available" })
+    }
+    val selectableQualities = remember(streamTarget) {
+        val raw = streamTarget.availableQualities
+        if (raw.isEmpty()) {
+            emptyList()
+        } else if (streamTarget.isAudioOnlyStream) {
+            raw
+        } else {
+            val videoOnly = raw.filterNot { it.contains("audio", ignoreCase = true) }
+            if (videoOnly.isNotEmpty()) videoOnly else raw
+        }
+    }
+    val initialSpec = remember(streamTarget) {
+        StreamTrackSpec(
+            url = streamTarget.url,
+            videoUrl = streamTarget.videoUrl,
+            audioUrl = streamTarget.audioUrl,
+            fallbackUrl = streamTarget.fallbackUrl,
+            videoFormat = streamTarget.videoFormat,
+            audioFormat = streamTarget.audioFormat,
+            fallbackFormat = streamTarget.fallbackFormat,
+        )
+    }
+    val activeTrack = remember(streamTarget, selectedQuality) {
+        if (streamTarget.qualityTracks.isNotEmpty() || streamTarget.qualityUrls.isNotEmpty()) {
+            resolveTrackForQuality(
+                quality = selectedQuality,
+                qualityTracks = streamTarget.qualityTracks,
+                qualityUrls = streamTarget.qualityUrls,
+                fallbackDirectUrl = streamTarget.url,
+                fallbackSpec = initialSpec,
+            )
+        } else {
+            initialSpec
+        }
+    }
 
     var isFullscreen by remember(streamTarget) { mutableStateOf(!streamTarget.isAudioOnlyStream) }
     var showControls by remember(streamTarget) { mutableStateOf(true) }
+    var isControlsLocked by remember(streamTarget) { mutableStateOf(false) }
+    var showLockedHint by remember(streamTarget) { mutableStateOf(false) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
     var interactionTick by remember { mutableIntStateOf(0) }
+
     var isPlaying by remember { mutableStateOf(true) }
+    var playWhenReadyState by remember { mutableStateOf(true) }
     var playbackState by remember { mutableIntStateOf(Player.STATE_BUFFERING) }
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(0L) }
+    var resumeSeekMs by remember(streamTarget) { mutableLongStateOf(0L) }
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableFloatStateOf(0f) }
-    var usingFallback by remember(streamTarget) { mutableStateOf(false) }
+
+    var usingFallback by remember(streamTarget, selectedQuality) { mutableStateOf(false) }
+    var lazyProxyUrl by remember(streamTarget, selectedQuality) { mutableStateOf("") }
     var retryCounter by remember(streamTarget) { mutableIntStateOf(0) }
     var playerErrorText by remember(streamTarget) { mutableStateOf<String?>(null) }
 
+    var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+    var availableCaptions by remember(streamTarget) { mutableStateOf<List<PlayerCaptionTrack>>(emptyList()) }
+    var selectedCaptionLabel by remember(streamTarget) { mutableStateOf("Off") }
+
+    var playerSize by remember { mutableStateOf(IntSize.Zero) }
+    var doubleTapText by remember { mutableStateOf<String?>(null) }
+    var doubleTapIsRight by remember { mutableStateOf(true) }
+    var doubleTapCumulativeSec by remember { mutableIntStateOf(0) }
+    var doubleTapSeq by remember { mutableIntStateOf(0) }
+
+    var gestureHudLabel by remember { mutableStateOf<String?>(null) }
+    var gestureHudFraction by remember { mutableFloatStateOf(0f) }
+    var gestureHudIsBrightness by remember { mutableStateOf(true) }
+    var gestureHudClearSeq by remember { mutableIntStateOf(0) }
+
     val originalOrientation = remember(activity) {
         activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+    val originalBrightness = remember(activity) {
+        activity?.window?.attributes?.screenBrightness ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
     }
 
     val applySystemBars: (Boolean) -> Unit = remember(activity, dialogWindow) {
@@ -5387,6 +5621,11 @@ private fun ArcPlayerScreen(
     DisposableEffect(activity, dialogWindow) {
         onDispose {
             activity?.requestedOrientation = originalOrientation
+            activity?.window?.let { win ->
+                val lp = win.attributes
+                lp.screenBrightness = originalBrightness
+                win.attributes = lp
+            }
             listOfNotNull(dialogWindow, activity?.window).forEach { win ->
                 WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
                 win.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -5394,13 +5633,13 @@ private fun ArcPlayerScreen(
         }
     }
 
-    val primaryUrl = streamTarget.url
-    val isOkCdn = remember(streamTarget) {
+    val primaryUrl = activeTrack.url.ifBlank { streamTarget.url }
+    val isOkCdn = remember(activeTrack, primaryUrl) {
         primaryUrl.contains("okcdn", ignoreCase = true) ||
-            streamTarget.videoUrl.contains("okcdn", ignoreCase = true) ||
-            streamTarget.fallbackUrl.contains("okcdn", ignoreCase = true)
+            activeTrack.videoUrl.contains("okcdn", ignoreCase = true) ||
+            activeTrack.fallbackUrl.contains("okcdn", ignoreCase = true)
     }
-    val cleanHeaders = remember(streamTarget) {
+    val cleanHeaders = remember(streamTarget, isOkCdn) {
         streamTarget.headers.toMutableMap().apply {
             if (isOkCdn) {
                 remove("Origin")
@@ -5412,55 +5651,38 @@ private fun ArcPlayerScreen(
             }
         }
     }
-    val effFallbackUrl = remember(streamTarget) {
-        streamTarget.fallbackUrl.ifBlank {
-            if (streamTarget.videoUrl.isNotBlank() && primaryUrl.isNotBlank() && primaryUrl != streamTarget.videoUrl) {
-                primaryUrl
-            } else {
-                ""
+    val effFallbackUrl = remember(activeTrack, primaryUrl, lazyProxyUrl) {
+        if (lazyProxyUrl.isNotBlank()) {
+            lazyProxyUrl
+        } else {
+            activeTrack.fallbackUrl.ifBlank {
+                if (activeTrack.videoUrl.isNotBlank() && primaryUrl.isNotBlank() && primaryUrl != activeTrack.videoUrl) {
+                    primaryUrl
+                } else {
+                    ""
+                }
             }
         }
     }
 
-    var resolvedPlayUrl by remember(streamTarget) { mutableStateOf(primaryUrl) }
-
-    LaunchedEffect(streamTarget) {
+    LaunchedEffect(streamTarget, selectedQuality) {
         usingFallback = false
         playerErrorText = null
         Log.i(
             "ArcPlayer",
-            "Format choice -> title='${streamTarget.title}', videoFmt='${streamTarget.videoFormat.ifBlank { "auto/muxed" }}', audioFmt='${streamTarget.audioFormat.ifBlank { "embedded" }}', fallbackFmt='${streamTarget.fallbackFormat.ifBlank { "none" }}', audioOnly=${streamTarget.isAudioOnlyStream}"
+            "Format choice -> title='${streamTarget.title}', quality='$selectedQuality', videoFmt='${activeTrack.videoFormat.ifBlank { "auto/muxed" }}', audioFmt='${activeTrack.audioFormat.ifBlank { "embedded" }}', fallbackFmt='${activeTrack.fallbackFormat.ifBlank { "none" }}', audioOnly=${streamTarget.isAudioOnlyStream}"
         )
-        if (primaryUrl.isNotBlank()) {
-            val isDirectPlayable = primaryUrl.contains("googlevideo.com") ||
-                primaryUrl.startsWith("file://") ||
-                primaryUrl.startsWith("/") ||
-                (!primaryUrl.contains("hakunaymatata") && !primaryUrl.contains("mzfi.me"))
-
-            if (!isDirectPlayable && !primaryUrl.contains("127.0.0.1")) {
-                val pPayload = JSONObject().apply {
-                    put("action", "stream_proxy")
-                    put("url", primaryUrl)
-                    val hObj = JSONObject()
-                    cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
-                    put("headers", hObj)
-                }
-                val pRes = withContext(Dispatchers.IO) {
-                    runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
-                }
-                val px = pRes?.optJSONObject("result")?.optString("proxy_url")
-                if (!px.isNullOrBlank()) {
-                    resolvedPlayUrl = px
-                }
-            }
-        }
     }
 
-    val dataSourceFactory = remember(context, streamTarget) {
+    val dataSourceFactory = remember(context, activeTrack, isOkCdn, cleanHeaders) {
         val httpFactory = DefaultHttpDataSource.Factory()
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(15_000)
             .setAllowCrossProtocolRedirects(true)
             .apply {
-                if (!isOkCdn && cleanHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
+                val isGoogleVideo = primaryUrl.contains("googlevideo.com", ignoreCase = true) ||
+                    activeTrack.videoUrl.contains("googlevideo.com", ignoreCase = true)
+                if (!isOkCdn && !isGoogleVideo && cleanHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
                     setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 }
                 if (cleanHeaders.isNotEmpty()) {
@@ -5471,7 +5693,18 @@ private fun ArcPlayerScreen(
     }
 
     val exoPlayer = remember(context) {
-        ExoPlayer.Builder(context).build()
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                20_000, // minBufferMs
+                60_000, // maxBufferMs
+                1_500,  // bufferForPlaybackMs
+                3_000   // bufferForPlaybackAfterRebufferMs
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+        ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .build()
     }
 
     fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean): MediaSource {
@@ -5487,12 +5720,13 @@ private fun ArcPlayerScreen(
         }
     }
 
-    DisposableEffect(exoPlayer, streamTarget) {
+    DisposableEffect(exoPlayer, streamTarget, selectedQuality) {
         val listener = object : Player.Listener {
             private fun inspectTracks(tag: String, tracks: Tracks) {
                 var selectedVideo = false
                 var selectedAudio = false
                 val summaryParts = mutableListOf<String>()
+                val foundCaptions = mutableListOf<PlayerCaptionTrack>()
                 for (group in tracks.groups) {
                     val kind = when (group.type) {
                         C.TRACK_TYPE_VIDEO -> "video"
@@ -5505,20 +5739,27 @@ private fun ArcPlayerScreen(
                     for (idx in 0 until group.length) {
                         val fmt = group.getTrackFormat(idx)
                         summaryParts.add("$kind[sel=${group.isTrackSelected(idx)},sup=${group.isTrackSupported(idx)},mime=${fmt.sampleMimeType},codecs=${fmt.codecs},${fmt.width}x${fmt.height}]")
+                        if (group.type == C.TRACK_TYPE_TEXT && group.isTrackSupported(idx)) {
+                            val capLabel = fmt.label?.takeIf { it.isNotBlank() }
+                                ?: fmt.language?.takeIf { it.isNotBlank() }?.uppercase()
+                                ?: "CC ${foundCaptions.size + 1}"
+                            foundCaptions.add(PlayerCaptionTrack(capLabel, group, idx))
+                        }
                     }
                 }
+                availableCaptions = foundCaptions
                 Log.i(
                     "ArcPlayer",
                     "$tag: selectedVideo=$selectedVideo selectedAudio=$selectedAudio usingFallback=$usingFallback tracks=${summaryParts.joinToString("; ")}"
                 )
                 val expectVideo = !streamTarget.isAudioOnlyStream
-                val expectAudio = streamTarget.audioUrl.isNotBlank() || streamTarget.isAudioOnlyStream
+                val expectAudio = activeTrack.audioUrl.isNotBlank() || streamTarget.isAudioOnlyStream
                 val missingTrack = (expectVideo && !selectedVideo) || (expectAudio && !selectedAudio)
                 if (exoPlayer.playbackState == Player.STATE_READY && missingTrack) {
                     if (!usingFallback && effFallbackUrl.isNotBlank()) {
                         Log.w(
                             "ArcPlayer",
-                            "Missing expected track (video=$selectedVideo audio=$selectedAudio); switching to fallback '${streamTarget.fallbackFormat}'"
+                            "Missing expected track (video=$selectedVideo audio=$selectedAudio); switching to fallback '${activeTrack.fallbackFormat}'"
                         )
                         usingFallback = true
                     }
@@ -5537,13 +5778,18 @@ private fun ArcPlayerScreen(
 
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
-                if (!playing && playbackState == Player.STATE_ENDED) {
+                playWhenReadyState = exoPlayer.playWhenReady
+                if (playing) {
+                    playbackState = exoPlayer.playbackState
+                } else if (playbackState == Player.STATE_ENDED) {
                     showControls = true
                 }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
                 playbackState = state
+                isPlaying = exoPlayer.isPlaying
+                playWhenReadyState = exoPlayer.playWhenReady
                 val dur = exoPlayer.duration
                 if (dur > 0L && dur != C.TIME_UNSET) {
                     durationMs = dur
@@ -5555,7 +5801,30 @@ private fun ArcPlayerScreen(
 
             override fun onPlayerError(error: PlaybackException) {
                 Log.e("ArcPlayer", "ExoPlayer error (${error.errorCodeName}) usingFallback=$usingFallback", error)
-                if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                val needsProxyFallback = lazyProxyUrl.isBlank() &&
+                    (primaryUrl.contains("hakunaymatata", ignoreCase = true) || primaryUrl.contains("mzfi.me", ignoreCase = true))
+                if (needsProxyFallback) {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val pPayload = JSONObject().apply {
+                            put("action", "stream_proxy")
+                            put("url", primaryUrl)
+                            val hObj = JSONObject()
+                            cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
+                            put("headers", hObj)
+                        }
+                        val pRes = runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
+                        val px = pRes?.optJSONObject("result")?.optString("proxy_url").orEmpty()
+                        withContext(Dispatchers.Main) {
+                            if (px.isNotBlank()) {
+                                lazyProxyUrl = px
+                                usingFallback = true
+                            } else {
+                                playerErrorText = error.errorCodeName.ifBlank { "Playback error" }
+                                showControls = true
+                            }
+                        }
+                    }
+                } else if (!usingFallback && effFallbackUrl.isNotBlank()) {
                     usingFallback = true
                 } else {
                     playerErrorText = error.errorCodeName.ifBlank { "Playback error" }
@@ -5569,29 +5838,29 @@ private fun ArcPlayerScreen(
         }
     }
 
-    LaunchedEffect(streamTarget, resolvedPlayUrl, usingFallback, retryCounter) {
+    LaunchedEffect(streamTarget, selectedQuality, usingFallback, lazyProxyUrl, retryCounter) {
         val hasSplitTracks = !usingFallback &&
             !streamTarget.isAudioOnlyStream &&
-            streamTarget.videoUrl.isNotBlank() &&
-            streamTarget.audioUrl.isNotBlank()
+            activeTrack.videoUrl.isNotBlank() &&
+            activeTrack.audioUrl.isNotBlank()
 
         val source = runCatching {
             if (hasSplitTracks) {
-                val videoSource = buildMediaSource(streamTarget.videoUrl, preferDirectExtractor = true)
-                val audioSource = buildMediaSource(streamTarget.audioUrl, preferDirectExtractor = true)
+                val videoSource = buildMediaSource(activeTrack.videoUrl, preferDirectExtractor = true)
+                val audioSource = buildMediaSource(activeTrack.audioUrl, preferDirectExtractor = true)
                 Log.i(
                     "ArcPlayer",
-                    "Preparing MergingMediaSource -> video=[${streamTarget.videoFormat}] audio=[${streamTarget.audioFormat}]"
+                    "Preparing MergingMediaSource -> video=[${activeTrack.videoFormat}] audio=[${activeTrack.audioFormat}]"
                 )
                 MergingMediaSource(videoSource, audioSource)
             } else {
-                val singleUrl = if (usingFallback) effFallbackUrl.ifBlank { resolvedPlayUrl } else resolvedPlayUrl
+                val singleUrl = if (usingFallback) effFallbackUrl.ifBlank { primaryUrl } else primaryUrl
                 if (singleUrl.isBlank()) {
                     null
                 } else {
                     Log.i(
                         "ArcPlayer",
-                        "Preparing single MediaSource (usingFallback=$usingFallback) -> fmt=[${if (usingFallback) streamTarget.fallbackFormat else streamTarget.videoFormat.ifBlank { "muxed" }}]"
+                        "Preparing single MediaSource (usingFallback=$usingFallback) -> fmt=[${if (usingFallback) activeTrack.fallbackFormat else activeTrack.videoFormat.ifBlank { "muxed" }}]"
                     )
                     buildMediaSource(singleUrl, preferDirectExtractor = false)
                 }
@@ -5609,7 +5878,14 @@ private fun ArcPlayerScreen(
         if (source != null) {
             runCatching {
                 playerErrorText = null
+                playbackState = Player.STATE_BUFFERING
+                val startPos = resumeSeekMs
+                resumeSeekMs = 0L
                 exoPlayer.setMediaSource(source)
+                if (startPos > 0L) {
+                    exoPlayer.seekTo(startPos)
+                }
+                exoPlayer.setPlaybackSpeed(playbackSpeed)
                 exoPlayer.prepare()
                 exoPlayer.playWhenReady = true
             }.onFailure { err ->
@@ -5624,8 +5900,22 @@ private fun ArcPlayerScreen(
         }
     }
 
-    LaunchedEffect(exoPlayer, isPlaying, playbackState) {
+    // Startup stall watchdog: if a split/4K stream remains stuck at 0:00 buffering >6.5s, fall back cleanly
+    LaunchedEffect(streamTarget, selectedQuality, usingFallback, retryCounter) {
+        if (!usingFallback && effFallbackUrl.isNotBlank() && !streamTarget.isAudioOnlyStream) {
+            delay(6500L)
+            if (playbackState == Player.STATE_BUFFERING && exoPlayer.currentPosition == 0L && playerErrorText == null) {
+                Log.w("ArcPlayer", "Startup buffering stall (>6.5s at 0:00); switching to fallback stream")
+                usingFallback = true
+            }
+        }
+    }
+
+    LaunchedEffect(exoPlayer) {
         while (isActive) {
+            playbackState = exoPlayer.playbackState
+            isPlaying = exoPlayer.isPlaying
+            playWhenReadyState = exoPlayer.playWhenReady
             if (!isScrubbing) {
                 val cur = exoPlayer.currentPosition
                 val dur = exoPlayer.duration
@@ -5636,10 +5926,32 @@ private fun ArcPlayerScreen(
         }
     }
 
-    LaunchedEffect(showControls, isPlaying, isScrubbing, interactionTick, playerErrorText) {
-        if (showControls && isPlaying && !isScrubbing && playerErrorText == null) {
+    LaunchedEffect(showControls, isPlaying, isScrubbing, interactionTick, playerErrorText, isControlsLocked, showSettingsSheet) {
+        if (showControls && isPlaying && !isScrubbing && playerErrorText == null && !isControlsLocked && !showSettingsSheet) {
             delay(3000L)
             showControls = false
+        }
+    }
+
+    LaunchedEffect(showLockedHint) {
+        if (showLockedHint) {
+            delay(2500L)
+            showLockedHint = false
+        }
+    }
+
+    LaunchedEffect(doubleTapSeq) {
+        if (doubleTapSeq > 0) {
+            delay(750L)
+            doubleTapText = null
+            doubleTapCumulativeSec = 0
+        }
+    }
+
+    LaunchedEffect(gestureHudClearSeq) {
+        if (gestureHudClearSeq > 0) {
+            delay(850L)
+            gestureHudLabel = null
         }
     }
 
@@ -5652,11 +5964,17 @@ private fun ArcPlayerScreen(
         }
     }
 
-    BackHandler(onBack = onClose)
+    BackHandler {
+        when {
+            showSettingsSheet -> showSettingsSheet = false
+            isControlsLocked -> showLockedHint = true
+            else -> onClose()
+        }
+    }
 
-    val rootInteraction = remember { MutableInteractionSource() }
     val controlSurfaceColor = ArcSurface.copy(alpha = 0.88f)
     val controlBorder = BorderStroke(1.dp, Color(0xFF2C2C2C))
+    val isActuallyBuffering = playbackState == Player.STATE_BUFFERING && playWhenReadyState && playerErrorText == null
     val displayPosMs = if (isScrubbing && durationMs > 0L) (scrubFraction * durationMs).toLong() else positionMs
     val sliderFraction = if (durationMs > 0L) {
         (if (isScrubbing) scrubFraction else (positionMs.toFloat() / durationMs.toFloat())).coerceIn(0f, 1f)
@@ -5668,18 +5986,114 @@ private fun ArcPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(ArcBlack)
-            .clickable(interactionSource = rootInteraction, indication = null) {
-                showControls = !showControls
-                if (showControls) interactionTick++
+            .onSizeChanged { playerSize = it }
+            .pointerInput(isControlsLocked, playerSize) {
+                detectTapGestures(
+                    onTap = {
+                        if (isControlsLocked) {
+                            showLockedHint = !showLockedHint
+                        } else {
+                            showControls = !showControls
+                            if (showControls) interactionTick++
+                        }
+                    },
+                    onDoubleTap = { offset ->
+                        if (isControlsLocked || playerSize.width <= 0) return@detectTapGestures
+                        val relX = offset.x / playerSize.width.toFloat()
+                        if (relX < 0.45f) {
+                            val nextPos = (exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)
+                            exoPlayer.seekTo(nextPos)
+                            positionMs = nextPos
+                            doubleTapIsRight = false
+                            doubleTapCumulativeSec = if (doubleTapText != null && !doubleTapIsRight) doubleTapCumulativeSec + 10 else 10
+                            doubleTapText = "-${doubleTapCumulativeSec}s"
+                            doubleTapSeq++
+                        } else if (relX > 0.55f) {
+                            val cap = if (durationMs > 0L) durationMs else Long.MAX_VALUE
+                            val nextPos = (exoPlayer.currentPosition + 10_000L).coerceAtMost(cap)
+                            exoPlayer.seekTo(nextPos)
+                            positionMs = nextPos
+                            doubleTapIsRight = true
+                            doubleTapCumulativeSec = if (doubleTapText != null && doubleTapIsRight) doubleTapCumulativeSec + 10 else 10
+                            doubleTapText = "+${doubleTapCumulativeSec}s"
+                            doubleTapSeq++
+                        } else {
+                            if (exoPlayer.isPlaying) {
+                                exoPlayer.pause()
+                            } else {
+                                if (playbackState == Player.STATE_ENDED) exoPlayer.seekTo(0L)
+                                exoPlayer.play()
+                            }
+                            interactionTick++
+                        }
+                    }
+                )
+            }
+            .pointerInput(isControlsLocked, playerSize, activity, audioManager) {
+                var dragStartX = 0f
+                var brightnessFrac = 0.5f
+                var volumeFrac = 0.5f
+                detectVerticalDragGestures(
+                    onDragStart = { startOffset ->
+                        if (isControlsLocked || playerSize.width <= 0) return@detectVerticalDragGestures
+                        dragStartX = startOffset.x
+                        if (dragStartX < playerSize.width * 0.5f) {
+                            val curAttr = activity?.window?.attributes?.screenBrightness ?: -1f
+                            brightnessFrac = if (curAttr >= 0f) {
+                                curAttr.coerceIn(0.02f, 1.0f)
+                            } else {
+                                runCatching {
+                                    Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+                                }.getOrDefault(0.5f).coerceIn(0.05f, 1.0f)
+                            }
+                        } else if (audioManager != null) {
+                            val maxV = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                            val curV = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                            volumeFrac = (curV.toFloat() / maxV.toFloat()).coerceIn(0f, 1f)
+                        }
+                    },
+                    onVerticalDrag = { _, dragAmount ->
+                        if (isControlsLocked || playerSize.height <= 0 || playerSize.width <= 0) return@detectVerticalDragGestures
+                        val deltaFrac = -dragAmount / (playerSize.height.toFloat() * 0.65f)
+                        if (dragStartX < playerSize.width * 0.5f) {
+                            brightnessFrac = (brightnessFrac + deltaFrac).coerceIn(0.02f, 1.0f)
+                            activity?.window?.let { win ->
+                                val lp = win.attributes
+                                lp.screenBrightness = brightnessFrac
+                                win.attributes = lp
+                            }
+                            gestureHudIsBrightness = true
+                            gestureHudFraction = brightnessFrac
+                            gestureHudLabel = "Brightness · ${(brightnessFrac * 100f).toInt()}%"
+                        } else if (audioManager != null) {
+                            val maxV = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                            volumeFrac = (volumeFrac + deltaFrac).coerceIn(0f, 1f)
+                            val targetStep = (volumeFrac * maxV + 0.5f).toInt().coerceIn(0, maxV)
+                            runCatching {
+                                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetStep, 0)
+                            }
+                            gestureHudIsBrightness = false
+                            gestureHudFraction = volumeFrac
+                            gestureHudLabel = "Volume · ${(volumeFrac * 100f).toInt()}%"
+                        }
+                    },
+                    onDragEnd = {
+                        if (gestureHudLabel != null) gestureHudClearSeq++
+                    },
+                    onDragCancel = {
+                        if (gestureHudLabel != null) gestureHudClearSeq++
+                    }
+                )
             }
     ) {
         AndroidView(
             factory = { ctx ->
-                PlayerView(ctx).apply {
+                (LayoutInflater.from(ctx).inflate(R.layout.arc_player_view, null, false) as PlayerView).apply {
                     player = exoPlayer
                     useController = false
                     keepScreenOn = true
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    setKeepContentOnPlayerReset(true)
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -5694,7 +6108,8 @@ private fun ArcPlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        if (playbackState == Player.STATE_BUFFERING && !showControls && playerErrorText == null) {
+        // Show spinner only while actually buffering
+        if (isActuallyBuffering && (!showControls || isControlsLocked)) {
             Surface(
                 color = controlSurfaceColor,
                 shape = CircleShape,
@@ -5713,8 +6128,124 @@ private fun ArcPlayerScreen(
             }
         }
 
+        // Double-tap seek feedback badge
+        if (doubleTapText != null) {
+            Surface(
+                color = controlSurfaceColor,
+                shape = RoundedCornerShape(20.dp),
+                border = controlBorder,
+                modifier = Modifier
+                    .align(if (doubleTapIsRight) Alignment.CenterEnd else Alignment.CenterStart)
+                    .padding(horizontal = 36.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        if (doubleTapIsRight) Icons.Outlined.Forward10 else Icons.Outlined.Replay10,
+                        contentDescription = null,
+                        tint = ArcWhite,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Text(
+                        doubleTapText.orEmpty(),
+                        color = ArcWhite,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
+
+        // Brightness / Volume vertical swipe HUD
+        if (gestureHudLabel != null) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = controlSurfaceColor),
+                shape = RoundedCornerShape(16.dp),
+                border = controlBorder,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 72.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .width(180.dp)
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(
+                            if (gestureHudIsBrightness) Icons.Outlined.Brightness6 else Icons.Outlined.VolumeUp,
+                            contentDescription = null,
+                            tint = ArcWhite,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Text(
+                            gestureHudLabel.orEmpty(),
+                            color = ArcWhite,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { gestureHudFraction.coerceIn(0f, 1f) },
+                        color = ArcWhite,
+                        trackColor = Color(0xFF3A3A3A),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp)),
+                    )
+                }
+            }
+        }
+
+        // Lock-controls unlock pill
+        if (isControlsLocked && showLockedHint) {
+            Surface(
+                onClick = {
+                    isControlsLocked = false
+                    showLockedHint = false
+                    showControls = true
+                    interactionTick++
+                },
+                color = controlSurfaceColor,
+                shape = RoundedCornerShape(22.dp),
+                border = controlBorder,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 28.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.LockOpen,
+                        contentDescription = "Unlock controls",
+                        tint = ArcWhite,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Text(
+                        "Controls locked · Tap to unlock",
+                        color = ArcWhite,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
+
         AnimatedVisibility(
-            visible = showControls,
+            visible = showControls && !isControlsLocked,
             enter = fadeIn(animationSpec = tween(180)),
             exit = fadeOut(animationSpec = tween(220)),
             modifier = Modifier.fillMaxSize()
@@ -5724,7 +6255,7 @@ private fun ArcPlayerScreen(
                     .fillMaxSize()
                     .background(Color(0x66000000))
             ) {
-                // Top bar: circular back, rounded title pill, circular fullscreen toggle
+                // Top bar: back, title pill, lock, settings, fullscreen
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -5732,7 +6263,7 @@ private fun ArcPlayerScreen(
                         .statusBarsPadding()
                         .padding(horizontal = 16.dp, vertical = 14.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Surface(
                         onClick = onClose,
@@ -5766,6 +6297,47 @@ private fun ArcPlayerScreen(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
                         )
+                    }
+
+                    Surface(
+                        onClick = {
+                            isControlsLocked = true
+                            showControls = false
+                            showLockedHint = true
+                        },
+                        color = controlSurfaceColor,
+                        shape = CircleShape,
+                        border = controlBorder,
+                        modifier = Modifier.size(42.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Outlined.Lock,
+                                contentDescription = "Lock controls",
+                                tint = ArcWhite,
+                                modifier = Modifier.size(19.dp),
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = {
+                            showSettingsSheet = true
+                            interactionTick++
+                        },
+                        color = controlSurfaceColor,
+                        shape = CircleShape,
+                        border = controlBorder,
+                        modifier = Modifier.size(42.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Outlined.Settings,
+                                contentDescription = "Player settings",
+                                tint = ArcWhite,
+                                modifier = Modifier.size(19.dp),
+                            )
+                        }
                     }
 
                     Surface(
@@ -5828,6 +6400,7 @@ private fun ArcPlayerScreen(
                                 Button(
                                     onClick = {
                                         usingFallback = false
+                                        lazyProxyUrl = ""
                                         playerErrorText = null
                                         retryCounter++
                                         interactionTick++
@@ -5885,7 +6458,7 @@ private fun ArcPlayerScreen(
                             modifier = Modifier.size(68.dp),
                         ) {
                             Box(contentAlignment = Alignment.Center) {
-                                if (playbackState == Player.STATE_BUFFERING && !isPlaying) {
+                                if (isActuallyBuffering) {
                                     CircularProgressIndicator(
                                         color = ArcBlack,
                                         strokeWidth = 2.5.dp,
@@ -6015,6 +6588,158 @@ private fun ArcPlayerScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if (showSettingsSheet) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = {
+                showSettingsSheet = false
+                interactionTick++
+            },
+            sheetState = sheetState,
+            containerColor = ArcSurface,
+            contentColor = ArcWhite,
+            shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text("Playback Settings", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = ArcWhite)
+
+                // Quality
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Outlined.Movie, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(18.dp))
+                        Text("Quality", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ArcWhite)
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            if (selectableQualities.isEmpty()) "Original" else selectedQuality,
+                            fontSize = 12.sp,
+                            color = ArcMuted,
+                        )
+                    }
+                    if (selectableQualities.isNotEmpty()) {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(selectableQualities) { qOpt ->
+                                val isSel = qOpt.equals(selectedQuality, ignoreCase = true)
+                                FilterChip(
+                                    selected = isSel,
+                                    onClick = {
+                                        if (!isSel) {
+                                            resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                            lazyProxyUrl = ""
+                                            selectedQuality = qOpt
+                                        }
+                                        showSettingsSheet = false
+                                        interactionTick++
+                                    },
+                                    label = { Text(qOpt) },
+                                    colors = arcFilterChipColors(),
+                                    border = arcFilterChipBorder(isSel),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Playback Speed
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Outlined.Speed, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(18.dp))
+                        Text("Playback Speed", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ArcWhite)
+                        Spacer(Modifier.weight(1f))
+                        Text("${playbackSpeed}x", fontSize = 12.sp, color = ArcMuted)
+                    }
+                    val speeds = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(speeds) { spd ->
+                            val isSel = playbackSpeed == spd
+                            FilterChip(
+                                selected = isSel,
+                                onClick = {
+                                    playbackSpeed = spd
+                                    exoPlayer.setPlaybackSpeed(spd)
+                                    showSettingsSheet = false
+                                    interactionTick++
+                                },
+                                label = { Text(if (spd == 1.0f) "1.0x Normal" else "${spd}x") },
+                                colors = arcFilterChipColors(),
+                                border = arcFilterChipBorder(isSel),
+                            )
+                        }
+                    }
+                }
+
+                // Captions
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Outlined.Subtitles, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(18.dp))
+                        Text("Captions", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ArcWhite)
+                        Spacer(Modifier.weight(1f))
+                        Text(selectedCaptionLabel, fontSize = 12.sp, color = ArcMuted)
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item {
+                            val isOff = selectedCaptionLabel == "Off"
+                            FilterChip(
+                                selected = isOff,
+                                onClick = {
+                                    selectedCaptionLabel = "Off"
+                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                        .buildUpon()
+                                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                                        .build()
+                                    showSettingsSheet = false
+                                    interactionTick++
+                                },
+                                label = { Text(if (availableCaptions.isEmpty()) "Off (None available)" else "Off") },
+                                colors = arcFilterChipColors(),
+                                border = arcFilterChipBorder(isOff),
+                            )
+                        }
+                        items(availableCaptions) { cap ->
+                            val isSel = selectedCaptionLabel == cap.label
+                            FilterChip(
+                                selected = isSel,
+                                onClick = {
+                                    selectedCaptionLabel = cap.label
+                                    cap.group?.let { grp ->
+                                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                            .buildUpon()
+                                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                                            .addOverride(TrackSelectionOverride(grp.mediaTrackGroup, cap.trackIndex))
+                                            .build()
+                                    }
+                                    showSettingsSheet = false
+                                    interactionTick++
+                                },
+                                label = { Text(cap.label) },
+                                colors = arcFilterChipColors(),
+                                border = arcFilterChipBorder(isSel),
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
             }
         }
     }

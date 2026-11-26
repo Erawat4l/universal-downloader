@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
@@ -197,6 +198,7 @@ class DownloadService : Service() {
         }.getOrDefault(false)
 
         if (fileActuallyExists) {
+            runCatching { MediaScannerConnection.scanFile(applicationContext, arrayOf(checkPath), null, null) }
             DownloadManager.markComplete(applicationContext, jobId, checkPath)
             postCompletionNotification(title.ifBlank { "Download" }, checkPath)
         } else if (!isOk || isCancelled || path.isBlank()) {
@@ -208,6 +210,7 @@ class DownloadService : Service() {
                 DownloadManager.markFailed(applicationContext, jobId, errMsg, engineLogs)
             }
         } else {
+            runCatching { MediaScannerConnection.scanFile(applicationContext, arrayOf(path), null, null) }
             DownloadManager.markComplete(applicationContext, jobId, path)
             postCompletionNotification(title.ifBlank { "Download" }, path)
         }
