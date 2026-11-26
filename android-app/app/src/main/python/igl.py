@@ -19,12 +19,35 @@ import subprocess
 import urllib.parse
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
+def _resolve_cache_file():
+    """Return a writable cache file path without assuming HOME is writable."""
+    try:
+        home_dir = os.path.expanduser("~")
+        if home_dir and home_dir != "/" and not home_dir.startswith("~"):
+            c_dir = os.path.join(home_dir, ".cache")
+            os.makedirs(c_dir, exist_ok=True)
+            if os.access(c_dir, os.W_OK):
+                return os.path.join(c_dir, "igl_episodes_cache.json")
+    except Exception:
+        pass
+    for cand in (os.environ.get("TMPDIR"), tempfile.gettempdir()):
+        if cand:
+            try:
+                os.makedirs(cand, exist_ok=True)
+                if os.access(cand, os.W_OK):
+                    return os.path.join(cand, "igl_episodes_cache.json")
+            except Exception:
+                pass
+    return None
+
 # Fast cache location
-CACHE_FILE = os.path.expanduser("~/.cache/igl_episodes_cache.json")
+CACHE_FILE = _resolve_cache_file()
 CACHE_TTL = 1800  # 30 minutes
+_MEM_IGL_CACHE = None
 
 # Default fallback domains
 PRIMARY_SHORT_LINK = "https://gdls.me/instaiglreel"
@@ -78,7 +101,7 @@ def print_banner(base_url, is_cached=False):
 def check_domain(domain):
     try:
         url = f"{domain}/okcdn.json"
-        res = requests.get(url, timeout=2.5)
+        res = requests.get(url, timeout=5.0)
         if res.status_code == 200 and isinstance(res.json(), list) and len(res.json()) > 0:
             return domain, res.json()
     except Exception:
@@ -87,31 +110,52 @@ def check_domain(domain):
 
 def resolve_domain_and_episodes_concurrent():
     """Concurrently check domains to find active endpoint in sub-second time."""
+    def _check_short_link():
+        try:
+            res = requests.get(PRIMARY_SHORT_LINK, allow_redirects=True, timeout=4.5)
+            if res.status_code == 200:
+                parsed = urllib.parse.urlparse(res.url)
+                base = f"{parsed.scheme}://{parsed.netloc}"
+                return check_domain(base)
+        except Exception:
+            pass
+        return None, None
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_check_short_link)] + [
+            executor.submit(check_domain, dom) for dom in FALLBACK_DOMAINS
+        ]
+        for f in as_completed(futures):
+            try:
+                dom, data = f.result()
+                if dom and data:
+                    return dom, data
+            except Exception:
+                pass
+
+    return FALLBACK_DOMAINS[1], []
+
+def _write_disk_cache(base_url, episodes):
+    if not CACHE_FILE or not episodes:
+        return
     try:
-        res = requests.get(PRIMARY_SHORT_LINK, allow_redirects=True, timeout=2.0)
-        if res.status_code == 200:
-            parsed = urllib.parse.urlparse(res.url)
-            base = f"{parsed.scheme}://{parsed.netloc}"
-            domain, data = check_domain(base)
-            if domain and data:
-                return domain, data
+        c_dir = os.path.dirname(CACHE_FILE)
+        if c_dir:
+            os.makedirs(c_dir, exist_ok=True)
+        with open(CACHE_FILE, "w") as f:
+            json.dump({"base_url": base_url, "episodes": episodes, "timestamp": time.time()}, f)
     except Exception:
         pass
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(check_domain, dom) for dom in FALLBACK_DOMAINS]
-        for f in futures:
-            dom, data = f.result()
-            if dom and data:
-                return dom, data
-
-    return FALLBACK_DOMAINS[0], []
-
 def get_episodes_data(force_refresh=False):
-    """Retrieve episodes data using local cache for 0.05s startup."""
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    """Retrieve episodes data using memory and local cache without failing on read-only paths."""
+    global _MEM_IGL_CACHE
+    if not force_refresh and _MEM_IGL_CACHE:
+        m_base, m_eps, m_ts = _MEM_IGL_CACHE
+        if m_base and m_eps and (time.time() - m_ts < CACHE_TTL):
+            return m_base, m_eps, True
 
-    if not force_refresh and os.path.exists(CACHE_FILE):
+    if not force_refresh and CACHE_FILE and os.path.exists(CACHE_FILE):
         try:
             mtime = os.path.getmtime(CACHE_FILE)
             if time.time() - mtime < CACHE_TTL:
@@ -120,6 +164,7 @@ def get_episodes_data(force_refresh=False):
                     base_url = cache_data.get("base_url")
                     episodes = cache_data.get("episodes")
                     if base_url and episodes:
+                        _MEM_IGL_CACHE = (base_url, episodes, mtime)
                         threading.Thread(target=refresh_cache_background, daemon=True).start()
                         return base_url, episodes, True
         except Exception:
@@ -127,19 +172,17 @@ def get_episodes_data(force_refresh=False):
 
     base_url, episodes = resolve_domain_and_episodes_concurrent()
     if episodes:
-        try:
-            with open(CACHE_FILE, "w") as f:
-                json.dump({"base_url": base_url, "episodes": episodes, "timestamp": time.time()}, f)
-        except Exception:
-            pass
+        _MEM_IGL_CACHE = (base_url, episodes, time.time())
+        _write_disk_cache(base_url, episodes)
     return base_url, episodes, False
 
 def refresh_cache_background():
+    global _MEM_IGL_CACHE
     try:
         base_url, episodes = resolve_domain_and_episodes_concurrent()
         if episodes:
-            with open(CACHE_FILE, "w") as f:
-                json.dump({"base_url": base_url, "episodes": episodes, "timestamp": time.time()}, f)
+            _MEM_IGL_CACHE = (base_url, episodes, time.time())
+            _write_disk_cache(base_url, episodes)
     except Exception:
         pass
 

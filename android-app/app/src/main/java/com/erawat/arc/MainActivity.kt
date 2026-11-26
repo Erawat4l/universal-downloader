@@ -202,21 +202,35 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import android.util.Log
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.material.icons.outlined.Fullscreen
+import androidx.compose.material.icons.outlined.FullscreenExit
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.AspectRatioFrameLayout
 import android.app.Activity
 import androidx.compose.material.icons.outlined.FitScreen
-import androidx.compose.material.icons.outlined.Fullscreen
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -265,10 +279,28 @@ private data class PlaylistEntry(
     val duration: Long = 0,
 )
 
+private data class StreamTrackSpec(
+    val url: String = "",
+    val videoUrl: String = "",
+    val audioUrl: String = "",
+    val fallbackUrl: String = "",
+    val videoFormat: String = "",
+    val audioFormat: String = "",
+    val fallbackFormat: String = "",
+)
+
 private data class PlayerStreamTarget(
     val url: String,
     val headers: Map<String, String> = emptyMap(),
     val title: String = "",
+    val videoUrl: String = "",
+    val audioUrl: String = "",
+    val fallbackUrl: String = "",
+    val videoFormat: String = "",
+    val audioFormat: String = "",
+    val fallbackFormat: String = "",
+    val isAudioOnlyStream: Boolean = false,
+    val downloadFilePath: String = "",
 )
 
 private data class MediaTarget(
@@ -282,6 +314,13 @@ private data class MediaTarget(
     val proxyUrl: String = "",
     val availableQualities: List<String> = emptyList(),
     val qualityUrls: Map<String, String> = emptyMap(),
+    val qualityTracks: Map<String, StreamTrackSpec> = emptyMap(),
+    val videoUrl: String = "",
+    val audioUrl: String = "",
+    val fallbackUrl: String = "",
+    val videoFormat: String = "",
+    val audioFormat: String = "",
+    val fallbackFormat: String = "",
     val poster: String = "",
     val streamHeaders: Map<String, String> = emptyMap(),
     val isSeries: Boolean = false,
@@ -298,6 +337,164 @@ private data class MediaTarget(
     val mediaCategory: String = "",
     val providers: String = "",
 )
+
+private fun parseStreamTrackSpec(obj: JSONObject?): StreamTrackSpec? {
+    if (obj == null) return null
+    return StreamTrackSpec(
+        url = obj.optString("url"),
+        videoUrl = obj.optString("video_url"),
+        audioUrl = obj.optString("audio_url"),
+        fallbackUrl = obj.optString("fallback_url"),
+        videoFormat = obj.optString("video_format"),
+        audioFormat = obj.optString("audio_format"),
+        fallbackFormat = obj.optString("fallback_format"),
+    )
+}
+
+private fun parseQualityTracks(data: JSONObject?): Map<String, StreamTrackSpec> {
+    val out = mutableMapOf<String, StreamTrackSpec>()
+    data?.optJSONObject("quality_tracks")?.let { qtObj ->
+        qtObj.keys().forEach { k ->
+            parseStreamTrackSpec(qtObj.optJSONObject(k))?.let { spec ->
+                out[k] = spec
+            }
+        }
+    }
+    return out
+}
+
+private fun resolveTrackForQuality(
+    quality: String,
+    qualityTracks: Map<String, StreamTrackSpec>,
+    qualityUrls: Map<String, String>,
+    fallbackDirectUrl: String,
+    fallbackSpec: StreamTrackSpec = StreamTrackSpec(),
+): StreamTrackSpec {
+    qualityTracks[quality]?.let { return it }
+    val qLow = quality.lowercase()
+    for ((k, v) in qualityTracks) {
+        val kLow = k.lowercase()
+        if (qLow in kLow ||
+            (qLow.startsWith("2160") && "2160" in kLow) ||
+            (qLow.startsWith("1440") && "1440" in kLow) ||
+            (qLow.startsWith("1080") && "1080" in kLow) ||
+            (qLow.startsWith("720") && "720" in kLow) ||
+            (qLow.startsWith("480") && "480" in kLow) ||
+            (qLow.startsWith("360") && "360" in kLow)
+        ) {
+            return v
+        }
+    }
+    val mapped = qualityUrls[quality]
+    if (!mapped.isNullOrBlank()) {
+        val matchesFallbackSpec = mapped == fallbackSpec.url && fallbackSpec.videoUrl.isNotBlank() && fallbackSpec.audioUrl.isNotBlank()
+        return StreamTrackSpec(
+            url = mapped,
+            videoUrl = if (matchesFallbackSpec) fallbackSpec.videoUrl else "",
+            audioUrl = if (matchesFallbackSpec) fallbackSpec.audioUrl else "",
+            fallbackUrl = fallbackSpec.fallbackUrl,
+            videoFormat = if (matchesFallbackSpec) fallbackSpec.videoFormat else "",
+            audioFormat = if (matchesFallbackSpec) fallbackSpec.audioFormat else "",
+            fallbackFormat = fallbackSpec.fallbackFormat,
+        )
+    }
+    return if (fallbackSpec.url.isNotBlank() || (fallbackSpec.videoUrl.isNotBlank() && fallbackSpec.audioUrl.isNotBlank())) {
+        fallbackSpec.copy(url = fallbackSpec.url.ifBlank { fallbackDirectUrl })
+    } else {
+        StreamTrackSpec(url = fallbackDirectUrl)
+    }
+}
+
+private fun loadSeriesEpisode(
+    seasonNum: Int,
+    episodeNum: Int,
+    target: MediaTarget,
+    inputFallback: String,
+    selectedQuality: String,
+    episodeCache: MutableMap<String, MediaTarget>,
+    context: Context,
+    scope: kotlinx.coroutines.CoroutineScope,
+    currentJob: Job?,
+    onJobChange: (Job?) -> Unit,
+    onLoadingChange: (Boolean) -> Unit,
+    onQualitySelected: (String) -> Unit,
+    onTargetUpdated: (MediaTarget) -> Unit,
+) {
+    currentJob?.cancel()
+    val cacheKey = "${target.targetUrl}_S${seasonNum}_E${episodeNum}"
+    val cached = episodeCache[cacheKey]
+    if (cached != null) {
+        onTargetUpdated(cached.copy(selectedSeason = seasonNum, selectedEpisode = episodeNum))
+        onLoadingChange(false)
+        return
+    }
+    onLoadingChange(true)
+    onTargetUpdated(target.copy(selectedSeason = seasonNum, selectedEpisode = episodeNum))
+    val job = scope.launch {
+        val sPayload = JSONObject().apply {
+            put("action", "resolve")
+            put("url", target.targetUrl.ifBlank { inputFallback })
+            if (target.selectedAudioLang.isNotBlank()) {
+                put("audio_lang", target.selectedAudioLang)
+            }
+            put("season", seasonNum)
+            put("episode", episodeNum)
+            put("quality", selectedQuality)
+        }
+        val res = withContext(Dispatchers.IO) {
+            runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
+        }
+        val data = res?.optJSONObject("result")
+        val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
+        val proxyUrl = data?.optString("proxy_url").orEmpty()
+        val qUrlMap = mutableMapOf<String, String>()
+        data?.optJSONObject("quality_urls")?.let { qObj ->
+            qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+        }
+        val qTrackMap = parseQualityTracks(data)
+        val topTrack = parseStreamTrackSpec(data) ?: StreamTrackSpec(url = directUrl)
+        val qList = mutableListOf<String>()
+        data?.optJSONArray("qualities")?.let { qArr ->
+            for (i in 0 until qArr.length()) {
+                val q = qArr.optString(i)
+                if (q.isNotBlank()) qList.add(q)
+            }
+        }
+        val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else target.availableQualities
+        val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
+        onQualitySelected(activeQ)
+        val resolvedSpec = resolveTrackForQuality(
+            quality = activeQ,
+            qualityTracks = qTrackMap,
+            qualityUrls = qUrlMap,
+            fallbackDirectUrl = directUrl,
+            fallbackSpec = topTrack,
+        )
+        val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+        val hMap = mutableMapOf<String, String>()
+        hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+        val updatedTarget = target.copy(
+            selectedSeason = seasonNum,
+            selectedEpisode = episodeNum,
+            directStreamUrl = resolvedSpec.url.ifBlank { directUrl },
+            proxyUrl = proxyUrl,
+            availableQualities = if (sortedQ.isNotEmpty()) sortedQ else target.availableQualities,
+            qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
+            qualityTracks = qTrackMap,
+            videoUrl = resolvedSpec.videoUrl,
+            audioUrl = resolvedSpec.audioUrl,
+            fallbackUrl = resolvedSpec.fallbackUrl,
+            videoFormat = resolvedSpec.videoFormat,
+            audioFormat = resolvedSpec.audioFormat,
+            fallbackFormat = resolvedSpec.fallbackFormat,
+            streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders,
+        )
+        onTargetUpdated(updatedTarget)
+        episodeCache[cacheKey] = updatedTarget
+        onLoadingChange(false)
+    }
+    onJobChange(job)
+}
 
 private fun extractYear(title: String, yearProp: String = ""): String {
     val cleanProp = yearProp.trim()
@@ -401,6 +598,7 @@ private fun requestIgnoreBatteryOptimizations(context: Context) {
 
 class MainActivity : ComponentActivity() {
     private val incomingUrl = mutableStateOf<String?>(null)
+    private val incomingLocalPlay = mutableStateOf<Pair<String, String>?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -410,7 +608,9 @@ class MainActivity : ComponentActivity() {
             ArcTheme {
                 ArcApp(
                     sharedUrl = incomingUrl.value,
-                    onSharedUrlConsumed = { incomingUrl.value = null }
+                    onSharedUrlConsumed = { incomingUrl.value = null },
+                    localPlayRequest = incomingLocalPlay.value,
+                    onLocalPlayConsumed = { incomingLocalPlay.value = null },
                 )
             }
         }
@@ -424,6 +624,12 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
+        val localFile = intent.getStringExtra("play_local_file")
+        if (!localFile.isNullOrBlank()) {
+            val localTitle = intent.getStringExtra("play_local_title").orEmpty()
+            incomingLocalPlay.value = localFile to localTitle
+            return
+        }
         val action = intent.action
         val type = intent.type
         if (Intent.ACTION_SEND == action) {
@@ -705,6 +911,8 @@ private fun prioritizeAudioTracks(tracks: List<AudioChoice>): List<AudioChoice> 
 private fun ArcApp(
     sharedUrl: String? = null,
     onSharedUrlConsumed: () -> Unit = {},
+    localPlayRequest: Pair<String, String>? = null,
+    onLocalPlayConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -970,23 +1178,68 @@ private fun ArcApp(
         }
     }
 
-    fun openFile(filePath: String) {
+    fun openFile(filePath: String, titleOverride: String = "") {
         if (filePath.isBlank()) return
         val file = File(filePath)
         if (!file.exists()) {
             message("File not found on device: $filePath")
             return
         }
+        val ext = file.extension.lowercase()
+        val isAudioFile = ext in listOf("mp3", "m4a", "aac", "flac", "ogg", "wav", "opus")
+        val isMediaFile = isAudioFile || ext in listOf("mp4", "mkv", "webm", "avi", "mov", "ts", "m3u8")
+        val displayTitle = titleOverride.ifBlank { file.nameWithoutExtension.ifBlank { file.name } }
+
+        if (isMediaFile) {
+            val chosenPlayer = streamingPlayer.ifBlank {
+                preferences.getString("streaming_player_package", "arc_player") ?: "arc_player"
+            }
+            if (chosenPlayer == "arc_player" || chosenPlayer == "system_chooser") {
+                inAppPlayerTarget = PlayerStreamTarget(
+                    url = Uri.fromFile(file).toString(),
+                    title = displayTitle,
+                    isAudioOnlyStream = isAudioFile,
+                    downloadFilePath = file.absolutePath,
+                )
+                return
+            }
+            try {
+                val uri: Uri = try {
+                    FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+                } catch (_: Exception) {
+                    Uri.fromFile(file)
+                }
+                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when {
+                    isAudioFile -> "audio/*"
+                    else -> "video/*"
+                }
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, mime)
+                    setPackage(chosenPlayer)
+                    putExtra("title", displayTitle)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                return
+            } catch (_: Exception) {
+                inAppPlayerTarget = PlayerStreamTarget(
+                    url = Uri.fromFile(file).toString(),
+                    title = displayTitle,
+                    isAudioOnlyStream = isAudioFile,
+                    downloadFilePath = file.absolutePath,
+                )
+                return
+            }
+        }
+
         try {
             val uri: Uri = try {
                 FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
             } catch (_: Exception) {
                 Uri.fromFile(file)
             }
-            val ext = file.extension.lowercase()
             val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when {
-                ext in listOf("mp4", "mkv", "webm", "avi", "mov", "ts") -> "video/*"
-                ext in listOf("mp3", "m4a", "aac", "flac", "ogg", "wav") -> "audio/*"
                 ext == "pdf" -> "application/pdf"
                 else -> "*/*"
             }
@@ -995,7 +1248,7 @@ private fun ArcApp(
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(Intent.createChooser(intent, "Open media"))
+            context.startActivity(intent)
         } catch (e: Exception) {
             message("Could not open media: ${e.message}")
         }
@@ -1098,11 +1351,38 @@ private fun ArcApp(
         }
     }
 
-    fun playStream(streamUrl: String, headers: Map<String, String> = emptyMap(), title: String = "") {
+    fun playStream(
+        streamUrl: String,
+        headers: Map<String, String> = emptyMap(),
+        title: String = "",
+        trackSpec: StreamTrackSpec? = null,
+        isAudioOnlyStream: Boolean = false,
+    ) {
+        val spec = trackSpec ?: StreamTrackSpec(url = streamUrl)
+        val effUrl = streamUrl.ifBlank { spec.url }.ifBlank { spec.fallbackUrl }
         if (streamingPlayer == "arc_player") {
-            inAppPlayerTarget = PlayerStreamTarget(streamUrl, headers, title)
+            inAppPlayerTarget = PlayerStreamTarget(
+                url = effUrl,
+                headers = headers,
+                title = title,
+                videoUrl = spec.videoUrl,
+                audioUrl = spec.audioUrl,
+                fallbackUrl = spec.fallbackUrl,
+                videoFormat = spec.videoFormat,
+                audioFormat = spec.audioFormat,
+                fallbackFormat = spec.fallbackFormat,
+                isAudioOnlyStream = isAudioOnlyStream || (spec.videoUrl.isBlank() && effUrl.isNotBlank() && spec.audioUrl == effUrl),
+            )
         } else {
-            openStreamExternal(streamUrl, headers, title, targetPackage = streamingPlayer)
+            openStreamExternal(effUrl, headers, title, targetPackage = streamingPlayer)
+        }
+    }
+
+    LaunchedEffect(localPlayRequest) {
+        val req = localPlayRequest
+        if (req != null && req.first.isNotBlank()) {
+            openFile(req.first, titleOverride = req.second)
+            onLocalPlayConsumed()
         }
     }
 
@@ -1251,6 +1531,10 @@ private fun ArcApp(
                                         rData.optJSONObject("quality_urls")?.let { qObj ->
                                             qObj.keys().forEach { k -> qUrls[k] = qObj.optString(k) }
                                         }
+                                        val qTracks = parseQualityTracks(rData)
+                                        val topTrack = parseStreamTrackSpec(rData) ?: StreamTrackSpec(url = rDirect)
+                                        val initQ = qList.firstOrNull() ?: "Best Available"
+                                        val effTrack = resolveTrackForQuality(initQ, qTracks, qUrls, rDirect, topTrack)
                                         val aList = mutableListOf<AudioChoice>()
                                         (rData.optJSONArray("audio_choices") ?: rData.optJSONArray("audios"))?.let { aArr ->
                                             for (ai in 0 until aArr.length()) {
@@ -1276,10 +1560,17 @@ private fun ArcApp(
                                             size = "",
                                             description = rData.optString("description", ""),
                                             targetUrl = preUrl,
-                                            directStreamUrl = rDirect,
+                                            directStreamUrl = effTrack.url.ifBlank { rDirect },
                                             proxyUrl = rProxy,
                                             availableQualities = if (qList.isNotEmpty()) qList else listOf("Best Available"),
                                             qualityUrls = qUrls,
+                                            qualityTracks = qTracks,
+                                            videoUrl = effTrack.videoUrl,
+                                            audioUrl = effTrack.audioUrl,
+                                            fallbackUrl = effTrack.fallbackUrl,
+                                            videoFormat = effTrack.videoFormat,
+                                            audioFormat = effTrack.audioFormat,
+                                            fallbackFormat = effTrack.fallbackFormat,
                                             poster = rPoster,
                                             streamHeaders = hMap,
                                             isSeries = isSeries,
@@ -1459,8 +1750,16 @@ private fun ArcApp(
                 }
                 selectedQuality = initialQuality
 
-                val initialMappedUrl = qUrlMap[initialQuality]
-                val finalDirectUrl = if (!initialMappedUrl.isNullOrBlank()) initialMappedUrl else resolvedDirectUrl
+                val qTrackMap = parseQualityTracks(data)
+                val topTrackSpec = parseStreamTrackSpec(data) ?: StreamTrackSpec(url = resolvedDirectUrl)
+                val initialSpec = resolveTrackForQuality(
+                    quality = initialQuality,
+                    qualityTracks = qTrackMap,
+                    qualityUrls = qUrlMap,
+                    fallbackDirectUrl = resolvedDirectUrl,
+                    fallbackSpec = topTrackSpec,
+                )
+                val finalDirectUrl = initialSpec.url.ifBlank { resolvedDirectUrl }
 
                 target = target.copy(
                     title = resolvedTitle,
@@ -1471,6 +1770,13 @@ private fun ArcApp(
                     targetUrl = data?.optString("target_url").takeUnless { it.isNullOrBlank() } ?: target.targetUrl,
                     availableQualities = sortedQualities,
                     qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
+                    qualityTracks = qTrackMap,
+                    videoUrl = initialSpec.videoUrl,
+                    audioUrl = initialSpec.audioUrl,
+                    fallbackUrl = initialSpec.fallbackUrl,
+                    videoFormat = initialSpec.videoFormat,
+                    audioFormat = initialSpec.audioFormat,
+                    fallbackFormat = initialSpec.fallbackFormat,
                     poster = resolvedPoster,
                     streamHeaders = headersMap,
                     isSeries = isSeriesResolved,
@@ -2245,18 +2551,40 @@ private fun ArcApp(
                                     },
                                     onQuality = { q ->
                                         selectedQuality = q
-                                        val mappedUrl = target.qualityUrls[q]
+                                        val nextSpec = resolveTrackForQuality(
+                                            quality = q,
+                                            qualityTracks = target.qualityTracks,
+                                            qualityUrls = target.qualityUrls,
+                                            fallbackDirectUrl = target.directStreamUrl,
+                                        )
                                         target = target.copy(
-                                            directStreamUrl = if (!mappedUrl.isNullOrBlank()) mappedUrl else target.directStreamUrl,
+                                            directStreamUrl = nextSpec.url.ifBlank { target.directStreamUrl },
+                                            videoUrl = nextSpec.videoUrl,
+                                            audioUrl = nextSpec.audioUrl,
+                                            fallbackUrl = nextSpec.fallbackUrl,
+                                            videoFormat = nextSpec.videoFormat,
+                                            audioFormat = nextSpec.audioFormat,
+                                            fallbackFormat = nextSpec.fallbackFormat,
                                         )
                                     },
                                     onAudioOnly = { aOnly ->
                                         audioOnly = aOnly
                                         val activeQ = if (aOnly) "Best Audio (320kbps)" else (target.availableQualities.firstOrNull() ?: "Best Available")
                                         selectedQuality = activeQ
-                                        val mappedUrl = target.qualityUrls[activeQ]
+                                        val nextSpec = resolveTrackForQuality(
+                                            quality = activeQ,
+                                            qualityTracks = target.qualityTracks,
+                                            qualityUrls = target.qualityUrls,
+                                            fallbackDirectUrl = target.directStreamUrl,
+                                        )
                                         target = target.copy(
-                                            directStreamUrl = if (!mappedUrl.isNullOrBlank()) mappedUrl else target.directStreamUrl,
+                                            directStreamUrl = nextSpec.url.ifBlank { target.directStreamUrl },
+                                            videoUrl = nextSpec.videoUrl,
+                                            audioUrl = nextSpec.audioUrl,
+                                            fallbackUrl = nextSpec.fallbackUrl,
+                                            videoFormat = nextSpec.videoFormat,
+                                            audioFormat = nextSpec.audioFormat,
+                                            fallbackFormat = nextSpec.fallbackFormat,
                                         )
                                     },
                                     onSelectAudio = { audio ->
@@ -2299,182 +2627,145 @@ private fun ArcApp(
                                             } else {
                                                 target.title
                                             }
-                                        val qMapped = target.qualityUrls[selectedQuality]
-                                        val directCandidate = if (!qMapped.isNullOrBlank()) qMapped else target.directStreamUrl.ifBlank { target.proxyUrl }
-                                        val isValidDirectStream = directCandidate.isNotBlank() &&
-                                            !directCandidate.startsWith("https://www.youtube.com/watch") &&
-                                            !directCandidate.startsWith("https://youtu.be/") &&
-                                            !directCandidate.startsWith("http://www.youtube.com/watch") &&
-                                            !directCandidate.startsWith("http://youtu.be/")
+                                            val currentTrack = resolveTrackForQuality(
+                                                quality = selectedQuality,
+                                                qualityTracks = target.qualityTracks,
+                                                qualityUrls = target.qualityUrls,
+                                                fallbackDirectUrl = target.directStreamUrl.ifBlank { target.proxyUrl },
+                                                fallbackSpec = StreamTrackSpec(
+                                                    url = target.directStreamUrl,
+                                                    videoUrl = target.videoUrl,
+                                                    audioUrl = target.audioUrl,
+                                                    fallbackUrl = target.fallbackUrl,
+                                                    videoFormat = target.videoFormat,
+                                                    audioFormat = target.audioFormat,
+                                                    fallbackFormat = target.fallbackFormat,
+                                                ),
+                                            )
+                                            val directCandidate = currentTrack.url.ifBlank { target.directStreamUrl.ifBlank { target.proxyUrl } }
+                                            val hasMergedTracks = currentTrack.videoUrl.isNotBlank() && currentTrack.audioUrl.isNotBlank()
+                                            val isValidDirectStream = (directCandidate.isNotBlank() || hasMergedTracks) &&
+                                                !directCandidate.startsWith("https://www.youtube.com/watch") &&
+                                                !directCandidate.startsWith("https://youtu.be/") &&
+                                                !directCandidate.startsWith("http://www.youtube.com/watch") &&
+                                                !directCandidate.startsWith("http://youtu.be/")
 
-                                        if (isValidDirectStream && !resolveLoading) {
-                                            streamLoading = true
-                                            playStream(directCandidate, target.streamHeaders, displayTitle)
-                                            scope.launch {
-                                                kotlinx.coroutines.delay(1200)
-                                                streamLoading = false
-                                            }
-                                        } else {
-                                            streamLoading = true
-                                            scope.launch {
-                                                val sPayload = JSONObject().apply {
-                                                    put("action", "resolve")
-                                                    put("url", target.targetUrl.ifBlank { input })
-                                                    if (target.selectedAudioLang.isNotBlank()) {
-                                                        put("audio_lang", target.selectedAudioLang)
+                                            if (isValidDirectStream && !resolveLoading) {
+                                                streamLoading = true
+                                                playStream(
+                                                    streamUrl = directCandidate,
+                                                    headers = target.streamHeaders,
+                                                    title = displayTitle,
+                                                    trackSpec = currentTrack,
+                                                    isAudioOnlyStream = audioOnly,
+                                                )
+                                                scope.launch {
+                                                    kotlinx.coroutines.delay(1200)
+                                                    streamLoading = false
+                                                }
+                                            } else {
+                                                streamLoading = true
+                                                scope.launch {
+                                                    val sPayload = JSONObject().apply {
+                                                        put("action", "resolve")
+                                                        put("url", target.targetUrl.ifBlank { input })
+                                                        if (target.selectedAudioLang.isNotBlank()) {
+                                                            put("audio_lang", target.selectedAudioLang)
+                                                        }
+                                                        if (target.isSeries) {
+                                                            put("season", target.selectedSeason)
+                                                            put("episode", target.selectedEpisode)
+                                                        }
+                                                        put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
                                                     }
-                                                    if (target.isSeries) {
-                                                        put("season", target.selectedSeason)
-                                                        put("episode", target.selectedEpisode)
+                                                    val res = withContext(Dispatchers.IO) {
+                                                        runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
                                                     }
-                                                    put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
-                                                }
-                                                val res = withContext(Dispatchers.IO) {
-                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                                }
-                                                val data = res?.optJSONObject("result")
-                                                val qUrlMap = mutableMapOf<String, String>()
-                                                data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                                }
-                                                val directUrl = qUrlMap[selectedQuality]
-                                                    ?: data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
-                                                    ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
-                                                    ?: data?.optString("url").orEmpty()
-                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                                val hMap = mutableMapOf<String, String>()
-                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val playUrl = directUrl.ifBlank { proxyUrl }
-                                                if (playUrl.isNotBlank()) {
-                                                    target = target.copy(
-                                                        directStreamUrl = directUrl,
-                                                        proxyUrl = proxyUrl,
-                                                        streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                    val data = res?.optJSONObject("result")
+                                                    val qUrlMap = mutableMapOf<String, String>()
+                                                    data?.optJSONObject("quality_urls")?.let { qObj ->
+                                                        qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                                                    }
+                                                    val qTrackMap = parseQualityTracks(data)
+                                                    val topTrack = parseStreamTrackSpec(data) ?: StreamTrackSpec()
+                                                    val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
+                                                        ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
+                                                        ?: data?.optString("url").orEmpty()
+                                                    val proxyUrl = data?.optString("proxy_url").orEmpty()
+                                                    val resolvedSpec = resolveTrackForQuality(
+                                                        quality = selectedQuality,
+                                                        qualityTracks = qTrackMap,
+                                                        qualityUrls = qUrlMap,
+                                                        fallbackDirectUrl = directUrl.ifBlank { proxyUrl },
+                                                        fallbackSpec = topTrack,
                                                     )
-                                                    playStream(playUrl, if (hMap.isNotEmpty()) hMap else target.streamHeaders, displayTitle)
-                                                } else {
-                                                    message("Could not resolve stream for $displayTitle")
+                                                    val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                                                    val hMap = mutableMapOf<String, String>()
+                                                    hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                                                    val playUrl = resolvedSpec.url.ifBlank { directUrl.ifBlank { proxyUrl } }
+                                                    if (playUrl.isNotBlank() || (resolvedSpec.videoUrl.isNotBlank() && resolvedSpec.audioUrl.isNotBlank())) {
+                                                        val effHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
+                                                        target = target.copy(
+                                                            directStreamUrl = playUrl,
+                                                            proxyUrl = proxyUrl,
+                                                            qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
+                                                            qualityTracks = if (qTrackMap.isNotEmpty()) qTrackMap else target.qualityTracks,
+                                                            videoUrl = resolvedSpec.videoUrl,
+                                                            audioUrl = resolvedSpec.audioUrl,
+                                                            fallbackUrl = resolvedSpec.fallbackUrl,
+                                                            videoFormat = resolvedSpec.videoFormat,
+                                                            audioFormat = resolvedSpec.audioFormat,
+                                                            fallbackFormat = resolvedSpec.fallbackFormat,
+                                                            streamHeaders = effHeaders,
+                                                        )
+                                                        playStream(
+                                                            streamUrl = playUrl,
+                                                            headers = effHeaders,
+                                                            title = displayTitle,
+                                                            trackSpec = resolvedSpec,
+                                                            isAudioOnlyStream = audioOnly,
+                                                        )
+                                                    } else {
+                                                        message("Could not resolve stream for $displayTitle")
+                                                    }
+                                                    streamLoading = false
                                                 }
-                                                streamLoading = false
                                             }
-                                        }
                                         }
                                     },
                                     onSelectSeason = { s ->
-                                        episodeResolveJob?.cancel()
-                                        val cacheKey = "${target.targetUrl}_S${s}_E1"
-                                        val cached = episodeCache[cacheKey]
-                                        if (cached != null) {
-                                            target = cached.copy(selectedSeason = s, selectedEpisode = 1)
-                                            episodeLoading = false
-                                        } else {
-                                            episodeLoading = true
-                                            target = target.copy(
-                                                selectedSeason = s,
-                                                selectedEpisode = 1,
-                                            )
-                                            episodeResolveJob = scope.launch {
-                                                val sPayload = JSONObject().apply {
-                                                    put("action", "resolve")
-                                                    put("url", target.targetUrl.ifBlank { input })
-                                                    put("season", s)
-                                                    put("episode", 1)
-                                                    put("quality", selectedQuality)
-                                                }
-                                                val res = withContext(Dispatchers.IO) {
-                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                                }
-                                                val data = res?.optJSONObject("result")
-                                                val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
-                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                                val qUrlMap = mutableMapOf<String, String>()
-                                                data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                                }
-                                                val qList = mutableListOf<String>()
-                                                data?.optJSONArray("qualities")?.let { qArr ->
-                                                    for (i in 0 until qArr.length()) {
-                                                        val q = qArr.optString(i)
-                                                        if (q.isNotBlank()) qList.add(q)
-                                                    }
-                                                }
-                                                val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else target.availableQualities
-                                                val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
-                                                selectedQuality = activeQ
-                                                val finalDirect = qUrlMap[activeQ] ?: directUrl
-                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                                val hMap = mutableMapOf<String, String>()
-                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val updatedTarget = target.copy(
-                                                    directStreamUrl = finalDirect,
-                                                    proxyUrl = proxyUrl,
-                                                    availableQualities = if (sortedQ.isNotEmpty()) sortedQ else target.availableQualities,
-                                                    qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
-                                                    streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                                )
-                                                target = updatedTarget
-                                                episodeCache[cacheKey] = updatedTarget
-                                                episodeLoading = false
-                                            }
-                                        }
+                                        loadSeriesEpisode(
+                                            seasonNum = s,
+                                            episodeNum = 1,
+                                            target = target,
+                                            inputFallback = input,
+                                            selectedQuality = selectedQuality,
+                                            episodeCache = episodeCache,
+                                            context = context,
+                                            scope = scope,
+                                            currentJob = episodeResolveJob,
+                                            onJobChange = { episodeResolveJob = it },
+                                            onLoadingChange = { episodeLoading = it },
+                                            onQualitySelected = { selectedQuality = it },
+                                            onTargetUpdated = { target = it },
+                                        )
                                     },
                                     onSelectEpisode = { ep ->
-                                        episodeResolveJob?.cancel()
-                                        val cacheKey = "${target.targetUrl}_S${target.selectedSeason}_E${ep}"
-                                        val cached = episodeCache[cacheKey]
-                                        if (cached != null) {
-                                            target = cached.copy(selectedEpisode = ep)
-                                            episodeLoading = false
-                                        } else {
-                                            episodeLoading = true
-                                            target = target.copy(
-                                                selectedEpisode = ep,
-                                            )
-                                            episodeResolveJob = scope.launch {
-                                                val sPayload = JSONObject().apply {
-                                                    put("action", "resolve")
-                                                    put("url", target.targetUrl.ifBlank { input })
-                                                    put("season", target.selectedSeason)
-                                                    put("episode", ep)
-                                                    put("quality", selectedQuality)
-                                                }
-                                                val res = withContext(Dispatchers.IO) {
-                                                    runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
-                                                }
-                                                val data = res?.optJSONObject("result")
-                                                val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() } ?: data?.optString("url").orEmpty()
-                                                val proxyUrl = data?.optString("proxy_url").orEmpty()
-                                                val qUrlMap = mutableMapOf<String, String>()
-                                                data?.optJSONObject("quality_urls")?.let { qObj ->
-                                                    qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
-                                                }
-                                                val qList = mutableListOf<String>()
-                                                data?.optJSONArray("qualities")?.let { qArr ->
-                                                    for (i in 0 until qArr.length()) {
-                                                        val q = qArr.optString(i)
-                                                        if (q.isNotBlank()) qList.add(q)
-                                                    }
-                                                }
-                                                val sortedQ = if (qList.isNotEmpty()) sortQualitiesDescending(qList) else target.availableQualities
-                                                val activeQ = if (sortedQ.contains(selectedQuality)) selectedQuality else (sortedQ.firstOrNull() ?: "Best Available")
-                                                selectedQuality = activeQ
-                                                val finalDirect = qUrlMap[activeQ] ?: directUrl
-                                                val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
-                                                val hMap = mutableMapOf<String, String>()
-                                                hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
-                                                val updatedTarget = target.copy(
-                                                    directStreamUrl = finalDirect,
-                                                    proxyUrl = proxyUrl,
-                                                    availableQualities = if (sortedQ.isNotEmpty()) sortedQ else target.availableQualities,
-                                                    qualityUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls,
-                                                    streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
-                                                )
-                                                target = updatedTarget
-                                                episodeCache[cacheKey] = updatedTarget
-                                                episodeLoading = false
-                                            }
-                                        }
+                                        loadSeriesEpisode(
+                                            seasonNum = target.selectedSeason,
+                                            episodeNum = ep,
+                                            target = target,
+                                            inputFallback = input,
+                                            selectedQuality = selectedQuality,
+                                            episodeCache = episodeCache,
+                                            context = context,
+                                            scope = scope,
+                                            currentJob = episodeResolveJob,
+                                            onJobChange = { episodeResolveJob = it },
+                                            onLoadingChange = { episodeLoading = it },
+                                            onQualitySelected = { selectedQuality = it },
+                                            onTargetUpdated = { target = it },
+                                        )
                                     },
                                     onSelectPlaylistItem = { entry ->
                                         analyze(entry.url, titleOverride = entry.title, posterOverride = entry.thumbnail)
@@ -2864,9 +3155,7 @@ private fun ArcApp(
                     )
                 ) {
                     ArcPlayerScreen(
-                        streamUrl = inAppPlayerTarget!!.url,
-                        headers = inAppPlayerTarget!!.headers,
-                        title = inAppPlayerTarget!!.title,
+                        streamTarget = inAppPlayerTarget!!,
                         onClose = { inAppPlayerTarget = null }
                     )
                 }
@@ -5020,96 +5309,337 @@ private fun PlayerOptionCard(
     }
 }
 
+private fun formatPlayerDuration(ms: Long): String {
+    if (ms <= 0L) return "0:00"
+    val totalSec = ms / 1000L
+    val hours = totalSec / 3600L
+    val mins = (totalSec % 3600L) / 60L
+    val secs = totalSec % 60L
+    return if (hours > 0L) {
+        String.format(java.util.Locale.US, "%d:%02d:%02d", hours, mins, secs)
+    } else {
+        String.format(java.util.Locale.US, "%d:%02d", mins, secs)
+    }
+}
+
+private fun toPlayerMediaUri(raw: String): Uri {
+    val trimmed = raw.trim()
+    return if (trimmed.startsWith("/")) Uri.fromFile(File(trimmed)) else Uri.parse(trimmed)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ArcPlayerScreen(
-    streamUrl: String,
-    headers: Map<String, String> = emptyMap(),
-    title: String = "",
+    streamTarget: PlayerStreamTarget,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
-    var isFillMode by remember { mutableStateOf(false) }
+    val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
 
-    DisposableEffect(Unit) {
-        val window = activity?.window
-        if (window != null) {
-            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-            insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            insetsController.hide(WindowInsetsCompat.Type.systemBars())
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-        onDispose {
-            val window = activity?.window
-            if (window != null) {
-                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-                insetsController.show(WindowInsetsCompat.Type.systemBars())
-                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    var isFullscreen by remember(streamTarget) { mutableStateOf(!streamTarget.isAudioOnlyStream) }
+    var showControls by remember(streamTarget) { mutableStateOf(true) }
+    var interactionTick by remember { mutableIntStateOf(0) }
+    var isPlaying by remember { mutableStateOf(true) }
+    var playbackState by remember { mutableIntStateOf(Player.STATE_BUFFERING) }
+    var positionMs by remember { mutableLongStateOf(0L) }
+    var durationMs by remember { mutableLongStateOf(0L) }
+    var isScrubbing by remember { mutableStateOf(false) }
+    var scrubFraction by remember { mutableFloatStateOf(0f) }
+    var usingFallback by remember(streamTarget) { mutableStateOf(false) }
+    var retryCounter by remember(streamTarget) { mutableIntStateOf(0) }
+    var playerErrorText by remember(streamTarget) { mutableStateOf<String?>(null) }
+
+    val originalOrientation = remember(activity) {
+        activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    val applySystemBars: (Boolean) -> Unit = remember(activity, dialogWindow) {
+        { fullscreenActive: Boolean ->
+            listOfNotNull(dialogWindow, activity?.window).forEach { win ->
+                val controller = WindowCompat.getInsetsController(win, win.decorView)
+                if (fullscreenActive) {
+                    controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    controller.hide(WindowInsetsCompat.Type.systemBars())
+                    win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        val lp = win.attributes
+                        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        win.attributes = lp
+                    }
+                } else {
+                    controller.show(WindowInsetsCompat.Type.systemBars())
+                    win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
             }
         }
     }
 
-    val isOkCdn = remember(streamUrl) { streamUrl.contains("okcdn", ignoreCase = true) }
-    val cleanHeaders = remember(streamUrl, headers) {
-        headers.toMutableMap().apply {
+    LaunchedEffect(isFullscreen) {
+        activity?.requestedOrientation = if (isFullscreen) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            originalOrientation
+        }
+        applySystemBars(isFullscreen)
+    }
+
+    DisposableEffect(activity, dialogWindow) {
+        onDispose {
+            activity?.requestedOrientation = originalOrientation
+            listOfNotNull(dialogWindow, activity?.window).forEach { win ->
+                WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
+                win.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
+
+    val primaryUrl = streamTarget.url
+    val isOkCdn = remember(streamTarget) {
+        primaryUrl.contains("okcdn", ignoreCase = true) ||
+            streamTarget.videoUrl.contains("okcdn", ignoreCase = true) ||
+            streamTarget.fallbackUrl.contains("okcdn", ignoreCase = true)
+    }
+    val cleanHeaders = remember(streamTarget) {
+        streamTarget.headers.toMutableMap().apply {
             if (isOkCdn) {
                 remove("Origin")
                 remove("Referer")
                 remove("User-Agent")
                 remove("user-agent")
+                remove("origin")
+                remove("referer")
+            }
+        }
+    }
+    val effFallbackUrl = remember(streamTarget) {
+        streamTarget.fallbackUrl.ifBlank {
+            if (streamTarget.videoUrl.isNotBlank() && primaryUrl.isNotBlank() && primaryUrl != streamTarget.videoUrl) {
+                primaryUrl
+            } else {
+                ""
             }
         }
     }
 
-    var playUrl by remember(streamUrl) { mutableStateOf(streamUrl) }
+    var resolvedPlayUrl by remember(streamTarget) { mutableStateOf(primaryUrl) }
 
-    LaunchedEffect(streamUrl) {
-        val isDirectPlayable = streamUrl.contains("googlevideo.com") ||
-                              streamUrl.startsWith("file://") ||
-                              streamUrl.startsWith("/") ||
-                              (!streamUrl.contains("hakunaymatata") && !streamUrl.contains("mzfi.me"))
+    LaunchedEffect(streamTarget) {
+        usingFallback = false
+        playerErrorText = null
+        Log.i(
+            "ArcPlayer",
+            "Format choice -> title='${streamTarget.title}', videoFmt='${streamTarget.videoFormat.ifBlank { "auto/muxed" }}', audioFmt='${streamTarget.audioFormat.ifBlank { "embedded" }}', fallbackFmt='${streamTarget.fallbackFormat.ifBlank { "none" }}', audioOnly=${streamTarget.isAudioOnlyStream}"
+        )
+        if (primaryUrl.isNotBlank()) {
+            val isDirectPlayable = primaryUrl.contains("googlevideo.com") ||
+                primaryUrl.startsWith("file://") ||
+                primaryUrl.startsWith("/") ||
+                (!primaryUrl.contains("hakunaymatata") && !primaryUrl.contains("mzfi.me"))
 
-        if (!isDirectPlayable && !streamUrl.contains("127.0.0.1")) {
-            val pPayload = JSONObject().apply {
-                put("action", "stream_proxy")
-                put("url", streamUrl)
-                val hObj = JSONObject()
-                cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
-                put("headers", hObj)
-            }
-            val pRes = withContext(Dispatchers.IO) {
-                runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
-            }
-            val px = pRes?.optJSONObject("result")?.optString("proxy_url")
-            if (!px.isNullOrBlank()) {
-                playUrl = px
+            if (!isDirectPlayable && !primaryUrl.contains("127.0.0.1")) {
+                val pPayload = JSONObject().apply {
+                    put("action", "stream_proxy")
+                    put("url", primaryUrl)
+                    val hObj = JSONObject()
+                    cleanHeaders.forEach { (k, v) -> hObj.put(k, v) }
+                    put("headers", hObj)
+                }
+                val pRes = withContext(Dispatchers.IO) {
+                    runCatching { EmbeddedEngine.execute(context, pPayload) }.getOrNull()
+                }
+                val px = pRes?.optJSONObject("result")?.optString("proxy_url")
+                if (!px.isNullOrBlank()) {
+                    resolvedPlayUrl = px
+                }
             }
         }
+    }
+
+    val dataSourceFactory = remember(context, streamTarget) {
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .apply {
+                if (!isOkCdn && cleanHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
+                    setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                }
+                if (cleanHeaders.isNotEmpty()) {
+                    setDefaultRequestProperties(cleanHeaders)
+                }
+            }
+        DefaultDataSource.Factory(context, httpFactory)
     }
 
     val exoPlayer = remember(context) {
-        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
-            .apply {
-                if (!isOkCdn) {
-                    setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                }
-            }
-            .setDefaultRequestProperties(cleanHeaders)
-        val mediaSourceFactory = DefaultMediaSourceFactory(context)
-            .setDataSourceFactory(httpDataSourceFactory)
-        ExoPlayer.Builder(context)
-            .setMediaSourceFactory(mediaSourceFactory)
-            .build()
+        ExoPlayer.Builder(context).build()
     }
 
-    LaunchedEffect(playUrl) {
-        if (playUrl.isNotBlank()) {
+    fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean): MediaSource {
+        val uri = toPlayerMediaUri(rawUrl)
+        val item = MediaItem.fromUri(uri)
+        val isHls = rawUrl.contains(".m3u8", ignoreCase = true) ||
+            rawUrl.contains("manifest/hls_playlist", ignoreCase = true) ||
+            rawUrl.contains("hls_playlist", ignoreCase = true)
+        return when {
+            isHls -> HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
+            preferDirectExtractor -> ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
+            else -> DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory).createMediaSource(item)
+        }
+    }
+
+    DisposableEffect(exoPlayer, streamTarget) {
+        val listener = object : Player.Listener {
+            private fun inspectTracks(tag: String, tracks: Tracks) {
+                var selectedVideo = false
+                var selectedAudio = false
+                val summaryParts = mutableListOf<String>()
+                for (group in tracks.groups) {
+                    val kind = when (group.type) {
+                        C.TRACK_TYPE_VIDEO -> "video"
+                        C.TRACK_TYPE_AUDIO -> "audio"
+                        C.TRACK_TYPE_TEXT -> "text"
+                        else -> "other(${group.type})"
+                    }
+                    if (group.type == C.TRACK_TYPE_VIDEO && group.isSelected) selectedVideo = true
+                    if (group.type == C.TRACK_TYPE_AUDIO && group.isSelected) selectedAudio = true
+                    for (idx in 0 until group.length) {
+                        val fmt = group.getTrackFormat(idx)
+                        summaryParts.add("$kind[sel=${group.isTrackSelected(idx)},sup=${group.isTrackSupported(idx)},mime=${fmt.sampleMimeType},codecs=${fmt.codecs},${fmt.width}x${fmt.height}]")
+                    }
+                }
+                Log.i(
+                    "ArcPlayer",
+                    "$tag: selectedVideo=$selectedVideo selectedAudio=$selectedAudio usingFallback=$usingFallback tracks=${summaryParts.joinToString("; ")}"
+                )
+                val expectVideo = !streamTarget.isAudioOnlyStream
+                val expectAudio = streamTarget.audioUrl.isNotBlank() || streamTarget.isAudioOnlyStream
+                val missingTrack = (expectVideo && !selectedVideo) || (expectAudio && !selectedAudio)
+                if (exoPlayer.playbackState == Player.STATE_READY && missingTrack) {
+                    if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                        Log.w(
+                            "ArcPlayer",
+                            "Missing expected track (video=$selectedVideo audio=$selectedAudio); switching to fallback '${streamTarget.fallbackFormat}'"
+                        )
+                        usingFallback = true
+                    }
+                }
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                inspectTracks("onTracksChanged", tracks)
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    Log.i("ArcPlayer", "Video output dimensions: ${videoSize.width}x${videoSize.height}")
+                }
+            }
+
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+                if (!playing && playbackState == Player.STATE_ENDED) {
+                    showControls = true
+                }
+            }
+
+            override fun onPlaybackStateChanged(state: Int) {
+                playbackState = state
+                val dur = exoPlayer.duration
+                if (dur > 0L && dur != C.TIME_UNSET) {
+                    durationMs = dur
+                }
+                if (state == Player.STATE_READY) {
+                    inspectTracks("STATE_READY", exoPlayer.currentTracks)
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                Log.e("ArcPlayer", "ExoPlayer error (${error.errorCodeName}) usingFallback=$usingFallback", error)
+                if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                    usingFallback = true
+                } else {
+                    playerErrorText = error.errorCodeName.ifBlank { "Playback error" }
+                    showControls = true
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+        }
+    }
+
+    LaunchedEffect(streamTarget, resolvedPlayUrl, usingFallback, retryCounter) {
+        val hasSplitTracks = !usingFallback &&
+            !streamTarget.isAudioOnlyStream &&
+            streamTarget.videoUrl.isNotBlank() &&
+            streamTarget.audioUrl.isNotBlank()
+
+        val source = runCatching {
+            if (hasSplitTracks) {
+                val videoSource = buildMediaSource(streamTarget.videoUrl, preferDirectExtractor = true)
+                val audioSource = buildMediaSource(streamTarget.audioUrl, preferDirectExtractor = true)
+                Log.i(
+                    "ArcPlayer",
+                    "Preparing MergingMediaSource -> video=[${streamTarget.videoFormat}] audio=[${streamTarget.audioFormat}]"
+                )
+                MergingMediaSource(videoSource, audioSource)
+            } else {
+                val singleUrl = if (usingFallback) effFallbackUrl.ifBlank { resolvedPlayUrl } else resolvedPlayUrl
+                if (singleUrl.isBlank()) {
+                    null
+                } else {
+                    Log.i(
+                        "ArcPlayer",
+                        "Preparing single MediaSource (usingFallback=$usingFallback) -> fmt=[${if (usingFallback) streamTarget.fallbackFormat else streamTarget.videoFormat.ifBlank { "muxed" }}]"
+                    )
+                    buildMediaSource(singleUrl, preferDirectExtractor = false)
+                }
+            }
+        }.onFailure { err ->
+            Log.e("ArcPlayer", "Error preparing media source", err)
+            if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                usingFallback = true
+            } else {
+                playerErrorText = err.message ?: "Playback unavailable"
+                showControls = true
+            }
+        }.getOrNull()
+
+        if (source != null) {
             runCatching {
-                val mediaItem = MediaItem.fromUri(Uri.parse(playUrl))
-                exoPlayer.setMediaItem(mediaItem)
+                playerErrorText = null
+                exoPlayer.setMediaSource(source)
                 exoPlayer.prepare()
                 exoPlayer.playWhenReady = true
+            }.onFailure { err ->
+                Log.e("ArcPlayer", "ExoPlayer prepare failed", err)
+                if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                    usingFallback = true
+                } else {
+                    playerErrorText = err.message ?: "Playback error"
+                    showControls = true
+                }
             }
+        }
+    }
+
+    LaunchedEffect(exoPlayer, isPlaying, playbackState) {
+        while (isActive) {
+            if (!isScrubbing) {
+                val cur = exoPlayer.currentPosition
+                val dur = exoPlayer.duration
+                if (cur >= 0L) positionMs = cur
+                if (dur > 0L && dur != C.TIME_UNSET) durationMs = dur
+            }
+            delay(250L)
+        }
+    }
+
+    LaunchedEffect(showControls, isPlaying, isScrubbing, interactionTick, playerErrorText) {
+        if (showControls && isPlaying && !isScrubbing && playerErrorText == null) {
+            delay(3000L)
+            showControls = false
         }
     }
 
@@ -5124,18 +5654,32 @@ private fun ArcPlayerScreen(
 
     BackHandler(onBack = onClose)
 
+    val rootInteraction = remember { MutableInteractionSource() }
+    val controlSurfaceColor = ArcSurface.copy(alpha = 0.88f)
+    val controlBorder = BorderStroke(1.dp, Color(0xFF2C2C2C))
+    val displayPosMs = if (isScrubbing && durationMs > 0L) (scrubFraction * durationMs).toLong() else positionMs
+    val sliderFraction = if (durationMs > 0L) {
+        (if (isScrubbing) scrubFraction else (positionMs.toFloat() / durationMs.toFloat())).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(ArcBlack)
+            .clickable(interactionSource = rootInteraction, indication = null) {
+                showControls = !showControls
+                if (showControls) interactionTick++
+            }
     ) {
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     player = exoPlayer
-                    useController = true
+                    useController = false
                     keepScreenOn = true
-                    resizeMode = if (isFillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -5144,56 +5688,333 @@ private fun ArcPlayerScreen(
             },
             update = { view ->
                 view.player = exoPlayer
-                view.resizeMode = if (isFillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                view.useController = false
+                view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top control overlay bar with back button, title, and resize toggle
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(
-                onClick = onClose,
+        if (playbackState == Player.STATE_BUFFERING && !showControls && playerErrorText == null) {
+            Surface(
+                color = controlSurfaceColor,
+                shape = CircleShape,
+                border = controlBorder,
                 modifier = Modifier
-                    .size(40.dp)
-                    .background(Color(0x99000000), shape = CircleShape)
+                    .align(Alignment.Center)
+                    .size(56.dp),
             ) {
-                Icon(
-                    Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Close player",
-                    tint = Color.White
-                )
+                Box(contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(
+                        color = ArcWhite,
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(26.dp),
+                    )
+                }
             }
-            Spacer(Modifier.width(14.dp))
-            Text(
-                text = title.ifBlank { "Playing Stream" },
-                color = Color.White,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        }
+
+        AnimatedVisibility(
+            visible = showControls,
+            enter = fadeIn(animationSpec = tween(180)),
+            exit = fadeOut(animationSpec = tween(220)),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(
                 modifier = Modifier
-                    .weight(1f)
-                    .background(Color(0x99000000), shape = RoundedCornerShape(8.dp))
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-            )
-            Spacer(Modifier.width(10.dp))
-            IconButton(
-                onClick = { isFillMode = !isFillMode },
-                modifier = Modifier
-                    .size(40.dp)
-                    .background(Color(0x99000000), shape = CircleShape)
+                    .fillMaxSize()
+                    .background(Color(0x66000000))
             ) {
-                Icon(
-                    if (isFillMode) Icons.Outlined.FitScreen else Icons.Outlined.Fullscreen,
-                    contentDescription = if (isFillMode) "Fit to screen" else "Fill screen",
-                    tint = Color.White
-                )
+                // Top bar: circular back, rounded title pill, circular fullscreen toggle
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Surface(
+                        onClick = onClose,
+                        color = controlSurfaceColor,
+                        shape = CircleShape,
+                        border = controlBorder,
+                        modifier = Modifier.size(42.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.AutoMirrored.Outlined.ArrowBack,
+                                contentDescription = "Close player",
+                                tint = ArcWhite,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+
+                    Surface(
+                        color = controlSurfaceColor,
+                        shape = RoundedCornerShape(22.dp),
+                        border = controlBorder,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(
+                            text = streamTarget.title.ifBlank { "ARC Player" },
+                            color = ArcWhite,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        )
+                    }
+
+                    Surface(
+                        onClick = {
+                            isFullscreen = !isFullscreen
+                            interactionTick++
+                        },
+                        color = controlSurfaceColor,
+                        shape = CircleShape,
+                        border = controlBorder,
+                        modifier = Modifier.size(42.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                if (isFullscreen) Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen,
+                                contentDescription = if (isFullscreen) "Exit fullscreen" else "Fullscreen",
+                                tint = ArcWhite,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
+
+                // Center controls or error card
+                if (playerErrorText != null) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ArcSurface),
+                        shape = RoundedCornerShape(18.dp),
+                        border = controlBorder,
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .padding(horizontal = 24.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Text(
+                                "Stream unavailable",
+                                color = ArcWhite,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                playerErrorText.orEmpty(),
+                                color = ArcMuted,
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedButton(
+                                    onClick = onClose,
+                                    border = controlBorder,
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Close", color = ArcWhite, fontSize = 12.sp)
+                                }
+                                Button(
+                                    onClick = {
+                                        usingFallback = false
+                                        playerErrorText = null
+                                        retryCounter++
+                                        interactionTick++
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArcWhite, contentColor = ArcBlack),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text("Retry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.align(Alignment.Center),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(26.dp),
+                    ) {
+                        Surface(
+                            onClick = {
+                                val nextPos = (exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)
+                                exoPlayer.seekTo(nextPos)
+                                positionMs = nextPos
+                                interactionTick++
+                            },
+                            color = controlSurfaceColor,
+                            shape = CircleShape,
+                            border = controlBorder,
+                            modifier = Modifier.size(50.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Outlined.Replay10,
+                                    contentDescription = "Rewind 10 seconds",
+                                    tint = ArcWhite,
+                                    modifier = Modifier.size(26.dp),
+                                )
+                            }
+                        }
+
+                        Surface(
+                            onClick = {
+                                if (exoPlayer.isPlaying) {
+                                    exoPlayer.pause()
+                                } else {
+                                    if (playbackState == Player.STATE_ENDED) {
+                                        exoPlayer.seekTo(0L)
+                                    }
+                                    exoPlayer.play()
+                                }
+                                interactionTick++
+                            },
+                            color = ArcWhite,
+                            shape = CircleShape,
+                            modifier = Modifier.size(68.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                if (playbackState == Player.STATE_BUFFERING && !isPlaying) {
+                                    CircularProgressIndicator(
+                                        color = ArcBlack,
+                                        strokeWidth = 2.5.dp,
+                                        modifier = Modifier.size(28.dp),
+                                    )
+                                } else {
+                                    Icon(
+                                        if (isPlaying) Icons.Outlined.Pause else Icons.Outlined.PlayArrow,
+                                        contentDescription = if (isPlaying) "Pause" else "Play",
+                                        tint = ArcBlack,
+                                        modifier = Modifier.size(34.dp),
+                                    )
+                                }
+                            }
+                        }
+
+                        Surface(
+                            onClick = {
+                                val cap = if (durationMs > 0L) durationMs else Long.MAX_VALUE
+                                val nextPos = (exoPlayer.currentPosition + 10_000L).coerceAtMost(cap)
+                                exoPlayer.seekTo(nextPos)
+                                positionMs = nextPos
+                                interactionTick++
+                            },
+                            color = controlSurfaceColor,
+                            shape = CircleShape,
+                            border = controlBorder,
+                            modifier = Modifier.size(50.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Outlined.Forward10,
+                                    contentDescription = "Forward 10 seconds",
+                                    tint = ArcWhite,
+                                    modifier = Modifier.size(26.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Bottom bar: thicker M3 slider with time labels above navigation bar inset
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = controlSurfaceColor),
+                    shape = RoundedCornerShape(18.dp),
+                    border = controlBorder,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                ) {
+                    val sliderInteraction = remember { MutableInteractionSource() }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Slider(
+                            value = sliderFraction,
+                            onValueChange = { frac ->
+                                isScrubbing = true
+                                scrubFraction = frac.coerceIn(0f, 1f)
+                                interactionTick++
+                            },
+                            onValueChangeFinished = {
+                                if (durationMs > 0L) {
+                                    val seekPos = (scrubFraction * durationMs).toLong()
+                                    exoPlayer.seekTo(seekPos)
+                                    positionMs = seekPos
+                                }
+                                isScrubbing = false
+                                interactionTick++
+                            },
+                            valueRange = 0f..1f,
+                            interactionSource = sliderInteraction,
+                            thumb = {
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .background(ArcWhite, CircleShape)
+                                )
+                            },
+                            track = { sliderState ->
+                                val activeFraction = ((sliderState.value - sliderState.valueRange.start) /
+                                    (sliderState.valueRange.endInclusive - sliderState.valueRange.start).coerceAtLeast(0.0001f)).coerceIn(0f, 1f)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(Color(0xFF3A3A3A))
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth(activeFraction)
+                                            .height(6.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                            .background(ArcWhite)
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(30.dp),
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = formatPlayerDuration(displayPosMs),
+                                color = ArcWhite,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = formatPlayerDuration(durationMs),
+                                color = ArcMuted,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

@@ -891,12 +891,34 @@ def resume_download(job_id):
 
 ACTIVE_SUBPROCESSES = {}
 ARIA2C_CUSTOM_PATH = None
+RUNTIME_FILES_DIR = None
+RUNTIME_CACHE_DIR = None
 
 def set_aria2c_path(path):
     global ARIA2C_CUSTOM_PATH
     if path and os.path.exists(path):
         ARIA2C_CUSTOM_PATH = str(path).strip()
         print(f"> Registered native BitTorrent engine: {ARIA2C_CUSTOM_PATH}")
+
+def set_runtime_paths(files_dir=None, cache_dir=None):
+    """Ensure writable HOME and TMPDIR on Android/Chaquopy before engine calls."""
+    global RUNTIME_FILES_DIR, RUNTIME_CACHE_DIR
+    if files_dir:
+        RUNTIME_FILES_DIR = str(files_dir).strip()
+        try:
+            os.makedirs(RUNTIME_FILES_DIR, exist_ok=True)
+        except Exception:
+            pass
+        if not os.environ.get("HOME") or os.environ.get("HOME") == "/":
+            os.environ["HOME"] = RUNTIME_FILES_DIR
+    if cache_dir:
+        RUNTIME_CACHE_DIR = str(cache_dir).strip()
+        try:
+            os.makedirs(RUNTIME_CACHE_DIR, exist_ok=True)
+        except Exception:
+            pass
+        if not os.environ.get("TMPDIR"):
+            os.environ["TMPDIR"] = RUNTIME_CACHE_DIR
 
 def get_aria2c_binary():
     global ARIA2C_CUSTOM_PATH
@@ -4599,24 +4621,23 @@ def get_igl_poster(ep=None, category='NORMAL'):
 
 
 def search_igl_episodes(query):
-    igl = get_igl_module()
-    if not igl:
-        return []
-    try:
-        base_url, episodes, _ = igl.get_episodes_data()
-    except Exception:
-        return []
-
     q_clean = str(query).strip().lower()
     is_igl_query = any(k in q_clean for k in ["igl", "latent", "india's got latent", "indias got latent", "samay raina", "samay"])
     wants_bonus = any(w in q_clean for w in ["bonus", "bts", "special", "discarded", "deleted", "extra", "clip"])
 
-    stopwords = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "it", "india", "india's", "indias", "indias'", "got", "latent", "igl", "samay", "raina", "season", "episode", "ep", "episodes", "part", "show", "video", "videos", "s1", "s2"}
+    stopwords = {
+        "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "it",
+        "india", "india's", "indias", "indias'", "got", "latent", "igl", "samay", "raina",
+        "season", "episode", "ep", "episodes", "part", "show", "video", "videos",
+        "s1", "s2", "s01", "s02", "hindi", "full", "all", "new", "watch", "online",
+        "download", "free", "uncensored", "hd", "4k", "1080p", "720p", "series",
+        "season1", "season2",
+    }
     tokens = [w for w in re.findall(r'[a-zA-Z0-9]+', q_clean) if len(w) > 2]
     specific_keywords = [w for w in tokens if w not in stopwords]
 
-    if is_igl_query and not specific_keywords:
-        return [
+    if is_igl_query and (not specific_keywords or specific_keywords == ["bonus"]):
+        series_cards = [
             {
                 "title": "India's Got Latent",
                 "type": "TV",
@@ -4638,6 +4659,17 @@ def search_igl_episodes(query):
                 "url": "https://netmirror.center/tv/123114",
             }
         ]
+        if specific_keywords == ["bonus"]:
+            return [series_cards[1], series_cards[0]]
+        return series_cards
+
+    igl = get_igl_module()
+    if not igl:
+        return []
+    try:
+        base_url, episodes, _ = igl.get_episodes_data()
+    except Exception:
+        return []
 
     def get_ep_order(ep):
         did = str(ep.get('dataId') or '')
@@ -4708,50 +4740,75 @@ def get_igl_catalog_split():
         base_url, episodes, _ = igl.get_episodes_data()
     except Exception:
         return None
+    if not episodes:
+        return None
 
     s2_bonus, s2_normal, s1_episodes, s1_bonus, specials = [], [], [], [], []
     for ep in episodes:
-        season = ep.get("season")
-        if season == "s2":
-            if igl.is_members_only_content(ep):
+        season = str(ep.get("season") or "").strip().lower()
+        data_id = str(ep.get("dataId") or "").strip().lower()
+        is_bonus = igl.is_members_only_content(ep)
+        if season in ("s2", "2", "season 2") or (not season and data_id.startswith("s2")):
+            if is_bonus:
                 s2_bonus.append(ep)
             else:
                 s2_normal.append(ep)
-        elif season == "s1":
-            if igl.is_members_only_content(ep):
+        elif season in ("s1", "1", "season 1") or (not season and data_id.startswith("ep-")):
+            if is_bonus:
                 s1_bonus.append(ep)
             else:
                 s1_episodes.append(ep)
         else:
             specials.append(ep)
 
+    if s1_episodes and all(get_ep_sort_key(e) > 0 for e in s1_episodes):
+        s1_episodes.sort(key=get_ep_sort_key)
+    if s2_normal:
+        s2_normal = sorted(s2_normal, key=get_ep_sort_key) if all(get_ep_sort_key(e) > 0 for e in s2_normal) else list(reversed(s2_normal))
+    if s2_bonus:
+        s2_bonus = list(reversed(s2_bonus))
+
+    main_map = {}
+    if s1_episodes:
+        main_map[1] = s1_episodes
+    if s2_normal:
+        main_map[2] = s2_normal
+
+    bonus_map = {}
+    if s1_bonus:
+        bonus_map[1] = s1_bonus
+    if s2_bonus:
+        bonus_map[2] = s2_bonus
+    if specials:
+        bonus_map[3] = specials
+
+    if not main_map and not bonus_map:
+        return None
+
     _IGL_CATALOG_CACHE = {
         "base_url": base_url,
         "episodes": episodes,
-        "main": {
-            1: s1_episodes,
-            2: list(reversed(s2_normal)),
-        },
-        "bonus": {
-            1: s1_bonus,
-            2: list(reversed(s2_bonus)),
-            3: specials,
-        }
+        "main": main_map,
+        "bonus": bonus_map,
     }
     return _IGL_CATALOG_CACHE
 
 
-def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="best"):
+def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="best", audio_lang=None):
     cat = get_igl_catalog_split()
     if not cat:
         raise Exception("IGL catalog unavailable")
 
     st = "bonus" if "bonus" in str(series_type).lower() else "main"
-    series_map = cat[st]
+    series_map = cat.get(st) or {}
+    if not series_map:
+        series_map = cat.get("main") or cat.get("bonus") or {}
+    if not series_map:
+        raise Exception("IGL episodes unavailable")
 
     s_num = int(season or 1)
     if s_num not in series_map:
-        s_num = 1
+        s_num = sorted(series_map.keys())[0]
 
     ep_list = series_map[s_num]
     ep_count = len(ep_list)
@@ -4765,7 +4822,7 @@ def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="bes
     target_ep = ep_list[ep_num - 1]
 
     clean_quality = quality if (quality and "ask" not in quality.lower()) else "best"
-    res = app_igl_resolve(target_ep.get("dataId") or target_ep.get("id"), quality=clean_quality)
+    res = app_igl_resolve(target_ep.get("dataId") or target_ep.get("id"), quality=clean_quality, audio_lang=audio_lang)
 
     series_title = "India's Got Latent" if st == "main" else "India's Got Latent Bonus"
     poster = "https://i.ytimg.com/vi/GTxMSPqtbRc/hqdefault.jpg" if st == "main" else "https://i.ytimg.com/vi/NQ6gWHMvna8/hq720.jpg"
@@ -4773,10 +4830,11 @@ def app_igl_series_resolve(series_type="main", season=1, episode=1, quality="bes
 
     formatted_seasons = []
     for s_idx in sorted(series_map.keys()):
-        formatted_seasons.append({
-            "season": s_idx,
-            "episodes": len(series_map[s_idx])
-        })
+        if series_map[s_idx]:
+            formatted_seasons.append({
+                "season": s_idx,
+                "episodes": len(series_map[s_idx])
+            })
 
     res["is_series"] = True
     res["seasons"] = formatted_seasons
@@ -4815,7 +4873,7 @@ def app_igl_catalog():
     return {"ok": True, "episodes": categorized, "base_url": base_url}
 
 
-def app_igl_resolve(target_id, quality="best", season=None, episode=None):
+def app_igl_resolve(target_id, quality="best", season=None, episode=None, audio_lang=None):
     igl = get_igl_module()
     if not igl:
         raise Exception("IGL module unavailable")
@@ -4844,16 +4902,22 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
     poster = get_igl_poster(match_ep, category=classify_igl_ep(match_ep))
     resolved_title = info.get('title') or match_ep.get('title')
 
-    # If YouTube episode, resolve playable direct video stream for instant VLC streaming
+    # If YouTube episode, resolve playable direct/merged video+audio streams
     if ep_type == 'youtube' or "youtube.com" in stream_url or "youtu.be" in stream_url:
         try:
-            yt_res = app_resolve(stream_url, quality=quality, skip_igl=True)
-            if yt_res and yt_res.get('url'):
-                direct_stream = yt_res['url']
+            yt_res = app_resolve(stream_url, quality=quality, audio_lang=audio_lang, skip_igl=True)
+            if yt_res and (yt_res.get('url') or (yt_res.get('video_url') and yt_res.get('audio_url'))):
+                direct_stream = yt_res.get('url') or yt_res.get('fallback_url') or yt_res.get('video_url')
                 return {
                     "url": direct_stream,
-                    "stream_url": direct_stream,
-                    "direct_url": direct_stream,
+                    "stream_url": yt_res.get('stream_url') or direct_stream,
+                    "direct_url": yt_res.get('direct_url') or direct_stream,
+                    "video_url": yt_res.get('video_url', ''),
+                    "audio_url": yt_res.get('audio_url', ''),
+                    "fallback_url": yt_res.get('fallback_url', ''),
+                    "video_format": yt_res.get('video_format', ''),
+                    "audio_format": yt_res.get('audio_format', ''),
+                    "fallback_format": yt_res.get('fallback_format', ''),
                     "target_url": f"igl:{match_ep.get('dataId') or match_ep.get('id')}",
                     "title": resolved_title,
                     "source": "ARC",
@@ -4862,6 +4926,10 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None):
                     "quality": yt_res.get('quality', 'Best Available'),
                     "qualities": yt_res.get('qualities', ["Best Available", "1080p (Full HD)", "720p (HD)"]),
                     "quality_urls": yt_res.get('quality_urls', {}),
+                    "quality_tracks": yt_res.get('quality_tracks', {}),
+                    "audios": yt_res.get('audios', []),
+                    "audio_choices": yt_res.get('audio_choices', []),
+                    "selected_audio_lang": yt_res.get('selected_audio_lang', ''),
                     "stream_headers": yt_res.get('stream_headers', {}),
                     "headers": yt_res.get('headers', {}),
                     "is_series": False,
@@ -5347,7 +5415,11 @@ def app_search(query, platform="netmirror"):
 
     for group in groups[:10]:
         g_title = group.get("title", "").lower()
-        if "latent" in g_title or any(str(a.get("id")) in ("999", "123114") or "999" in str(a.get("url")) or "123114" in str(a.get("url")) for a in group.get("audios", {}).values()):
+        if "latent" in g_title or any(
+            str(a.get("id")) in ("999", "123114", "122350")
+            or any(x in str(a.get("url")) for x in ("999", "123114", "122350"))
+            for a in group.get("audios", {}).values()
+        ):
             if any("latent" in str(m.get("title")).lower() for m in igl_matches):
                 continue
         audio_items = []
@@ -5453,17 +5525,20 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         lower.startswith("igl:series:") or
         "/tv/999" in lower or
         "/tv/123114" in lower or
+        "/tv/122350" in lower or
         ("999" in lower and "latent" in lower) or
         ("123114" in lower and "latent" in lower) or
+        ("122350" in lower and "latent" in lower) or
         ("latent" in lower and any(nm in lower for nm in ["netmirror.", "net52.cc", "net77.cc", "watch21.", "watch22."]))
     ):
         st = "bonus" if ("bonus" in lower or "123114" in lower) else "main"
+        effective_season = 2 if (season is None and "/tv/122350" in lower) else season
         print(f"> Resolving India's Got Latent ({st.capitalize()} Series) via IGL engine...")
-        return app_igl_series_resolve(series_type=st, season=season, episode=episode, quality=clean_quality)
+        return app_igl_series_resolve(series_type=st, season=effective_season, episode=episode, quality=clean_quality, audio_lang=audio_lang)
 
     if not skip_igl and (lower.startswith("igl:") or any(dom in lower for dom in ["freeforall.dev", "indiassgetlentp", "okcdn.ru"])):
         print("> Resolving India's Got Latent episode stream via IGL engine...")
-        return app_igl_resolve(url, quality=clean_quality)
+        return app_igl_resolve(url, quality=clean_quality, audio_lang=audio_lang)
 
     if not skip_igl and ("youtube.com" in lower or "youtu.be" in lower) and any(w in lower for w in ["latent", "samay", "igl"]):
         igl = get_igl_module()
@@ -5577,9 +5652,88 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
         }
 
+        def _yt_is_hls(fmt):
+            proto = str(fmt.get("protocol") or "").lower()
+            u_str = str(fmt.get("url") or "").lower()
+            return "m3u8" in proto or ".m3u8" in u_str or "manifest/hls_playlist" in u_str
+
+        def _yt_fmt_summary(fmt):
+            if not isinstance(fmt, dict):
+                return ""
+            fid = fmt.get("format_id") or "?"
+            ext = fmt.get("ext") or "?"
+            h = fmt.get("height") or 0
+            vc = fmt.get("vcodec") or "none"
+            ac = fmt.get("acodec") or "none"
+            tbr = fmt.get("tbr") or fmt.get("abr") or 0
+            lang = fmt.get("language") or ""
+            proto = fmt.get("protocol") or ""
+            parts = [f"itag={fid}", ext]
+            if h:
+                parts.append(f"{h}p")
+            if vc != "none":
+                parts.append(f"v={vc}")
+            if ac != "none":
+                parts.append(f"a={ac}")
+            if tbr:
+                parts.append(f"{int(round(tbr))}k")
+            if lang:
+                parts.append(f"lang={lang}")
+            if proto:
+                parts.append(proto)
+            return " ".join(parts)
+
+        def _pick_yt_audio(audio_list, target_lang):
+            if not audio_list:
+                return None
+
+            def _score_audio(af):
+                lang = str(af.get("language") or af.get("format_note") or "").lower()
+                fid = str(af.get("format_id") or "").lower()
+                ac = str(af.get("acodec") or "").lower()
+                if target_lang and target_lang not in ("default", "original", "none"):
+                    lang_tier = 3 if (target_lang in lang or (len(lang) >= 2 and target_lang[:2] == lang[:2])) else 0
+                else:
+                    if "hi" in lang or "hindi" in lang:
+                        lang_tier = 3
+                    elif "en" in lang or "default" in lang or "original" in lang:
+                        lang_tier = 2
+                    else:
+                        lang_tier = 1
+                non_drc = 0 if "-drc" in fid else 1
+                is_m4a = 1 if ("mp4a" in ac or af.get("ext") == "m4a" or "234" in fid) else 0
+                bitrate = af.get("abr") or af.get("tbr") or 0
+                return (lang_tier, non_drc, is_m4a, bitrate)
+
+            return max(audio_list, key=_score_audio)
+
+        def _pick_yt_video(video_list, target_h):
+            if not video_list:
+                return None
+            if target_h:
+                candidates = [f for f in video_list if (f.get("height") or 0) <= target_h]
+                if not candidates:
+                    candidates = video_list
+            else:
+                candidates = video_list
+
+            def _score_video(vf):
+                h = vf.get("height") or 0
+                exact = 1 if (target_h and h == target_h) else 0
+                vc = str(vf.get("vcodec") or "").lower()
+                if target_h and target_h <= 1080:
+                    codec_rank = 3 if "avc1" in vc else (2 if ("vp9" in vc or "vp09" in vc) else (1 if "av01" in vc else 0))
+                else:
+                    codec_rank = 3 if ("vp9" in vc or "vp09" in vc) else (2 if "av01" in vc else (1 if "avc1" in vc else 0))
+                return (h, exact, codec_rank, vf.get("tbr") or 0)
+
+            return max(candidates, key=_score_video)
+
         best_extracted = None
         best_formats = []
         best_max_h = 0
+        used_client = None
+        android_progressive = []
 
         for client in client_attempts:
             ydl_opts = get_ytdlp_opts({
@@ -5597,16 +5751,21 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                     if extracted and isinstance(extracted, dict):
                         extracted_fmts = [f for f in extracted.get("formats", []) if isinstance(f, dict) and f.get("url")]
                         if extracted_fmts:
+                            for f in extracted_fmts:
+                                if not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"):
+                                    android_progressive.append(f)
                             curr_h = max([f.get("height") or 0 for f in extracted_fmts if f.get("vcodec") != "none"] or [0])
                             if curr_h > best_max_h:
                                 best_max_h = curr_h
                                 best_extracted = extracted
                                 best_formats = extracted.get("formats", [])
+                                used_client = client
                                 if best_max_h >= 720:
                                     break
                             elif not best_extracted:
                                 best_extracted = extracted
                                 best_formats = extracted.get("formats", [])
+                                used_client = client
             except Exception as e:
                 last_err = str(e)
                 continue
@@ -5624,70 +5783,79 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         # 1. Progressive streams (combined video + audio)
         progressive = [
             f for f in formats
-            if isinstance(f, dict) and f.get("url") and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+            if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
         ]
+        if not progressive and used_client != ["android"]:
+            try:
+                fb_opts = get_ytdlp_opts({
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "noplaylist": True,
+                    "socket_timeout": 5,
+                    "extractor_args": {"youtube": {"player_client": ["android"]}},
+                }, cookie=cookie)
+                with yt_dlp.YoutubeDL(fb_opts) as ydl:
+                    fb_info = ydl.extract_info(url, download=False)
+                    if fb_info and isinstance(fb_info, dict):
+                        for f in (fb_info.get("formats") or []):
+                            if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"):
+                                progressive.append(f)
+            except Exception:
+                pass
+        if not progressive and android_progressive:
+            progressive = list(android_progressive)
 
-        # 2. Collect HLS audio and video formats (Google Video HLS manifests)
+        progressive_sorted = sorted(
+            progressive,
+            key=lambda f: (f.get("height") or 0, 1 if f.get("ext") == "mp4" else 0, f.get("tbr") or 0),
+            reverse=True,
+        )
+        prog_fallback_fmt = progressive_sorted[0] if progressive_sorted else None
+        prog_fallback_url = prog_fallback_fmt.get("url", "") if prog_fallback_fmt else ""
+        prog_fallback_summary = _yt_fmt_summary(prog_fallback_fmt) if prog_fallback_fmt else ""
+
+        clean_audio_lang = str(audio_lang or "").strip().lower()
+
+        # 2. Separate DASH direct HTTPS streams and HLS manifests cleanly
+        dash_video_formats = [
+            f for f in formats
+            if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and
+               f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+        ]
+        dash_audio_formats = [
+            f for f in formats
+            if isinstance(f, dict) and f.get("url") and not _yt_is_hls(f) and
+               f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+        ]
+        dash_audio_fmt = _pick_yt_audio(dash_audio_formats, clean_audio_lang)
+
         hls_audio_formats = [
             f for f in formats
-            if isinstance(f, dict) and f.get("url") and
-               ('m3u8' in f.get('protocol', '') or 'm3u8' in str(f.get('url', '')) or 'manifest/hls_playlist' in str(f.get('url', ''))) and
-               f.get('vcodec') in (None, 'none') and
-               (f.get('resolution') == 'audio only' or f.get('height') in (None, 0))
+            if isinstance(f, dict) and f.get("url") and _yt_is_hls(f) and
+               f.get("vcodec") in (None, "none") and
+               (f.get("resolution") == "audio only" or f.get("height") in (None, 0))
         ]
-        # Prefer 128k (itag 234) over 48k (itag 233)
-        hls_audio_formats.sort(
-            key=lambda f: (
-                1 if ('234' in str(f.get('format_id') or '') or '234' in str(f.get('url') or '')) else 0,
-                f.get('tbr') or f.get('abr') or 0
-            ),
-            reverse=True
-        )
-        hls_audio_fmt = None
-        clean_audio_lang = str(audio_lang or "").strip().lower()
-        if clean_audio_lang and clean_audio_lang not in ("default", "original", "none"):
-            for af in hls_audio_formats:
-                lang = str(af.get('language') or af.get('format_note') or '').lower()
-                if clean_audio_lang in lang or clean_audio_lang[:2] == lang[:2]:
-                    hls_audio_fmt = af
-                    break
-
-        if not hls_audio_fmt:
-            # Priority 1: Hindi
-            for af in hls_audio_formats:
-                lang = str(af.get('language') or af.get('format_note') or '').lower()
-                if 'hi' in lang or 'hindi' in lang:
-                    hls_audio_fmt = af
-                    break
-        if not hls_audio_fmt:
-            # Priority 2: English / Original / Default
-            for af in hls_audio_formats:
-                lang = str(af.get('language') or af.get('format_note') or '').lower()
-                if 'en' in lang or 'default' in lang or 'original' in lang:
-                    hls_audio_fmt = af
-                    break
-        if not hls_audio_fmt and hls_audio_formats:
-            hls_audio_fmt = hls_audio_formats[0]
+        hls_audio_fmt = _pick_yt_audio(hls_audio_formats, clean_audio_lang)
 
         hls_video_formats = [
             f for f in formats
-            if isinstance(f, dict) and f.get("url") and
-               ('m3u8' in f.get('protocol', '') or 'm3u8' in str(f.get('url', '')) or 'manifest/hls_playlist' in str(f.get('url', ''))) and
-               f.get('vcodec') not in (None, 'none')
+            if isinstance(f, dict) and f.get("url") and _yt_is_hls(f) and
+               f.get("vcodec") not in (None, "none")
         ]
 
         # Extract REAL video quality tiers in descending order (exclude storyboard/thumbnails like sb0)
         tiers = set()
         for f in formats:
-            if f.get('vcodec') == 'none':
+            if f.get("vcodec") == "none":
                 continue
-            note = f.get('format_note') or ''
-            m = re.search(r'(\d+)p', str(note))
+            note = f.get("format_note") or ""
+            m = re.search(r"(\d+)p", str(note))
             if m:
                 tiers.add(int(m.group(1)))
             else:
-                w = f.get('width') or 0
-                h = f.get('height') or 0
+                w = f.get("width") or 0
+                h = f.get("height") or 0
                 dim = max(w, h)
                 if dim >= 3840 or h >= 2160: tiers.add(2160)
                 elif dim >= 2560 or h >= 1440: tiers.add(1440)
@@ -5699,11 +5867,12 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
                 elif dim >= 256 or h >= 144: tiers.add(144)
 
         for vf in hls_video_formats:
-            vh = vf.get('height') or 0
-            if vh: tiers.add(vh)
+            vh = vf.get("height") or 0
+            if vh:
+                tiers.add(vh)
 
         # Enforce all standard descending tiers based on real detected maximum video resolution
-        valid_heights = [info.get('height') or 0] + [f.get('height') or 0 for f in formats if isinstance(f, dict) and f.get('vcodec') != 'none'] + list(tiers)
+        valid_heights = [info.get("height") or 0] + [f.get("height") or 0 for f in formats if isinstance(f, dict) and f.get("vcodec") != "none"] + list(tiers)
         detected_max = max(valid_heights) if valid_heights else 720
         max_h = detected_max if detected_max > 0 else 720
         standard_tiers = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
@@ -5729,74 +5898,126 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
         real_qualities = ["Best Available"] + [quality_labels.get(t, f"{t}p") for t in sorted_tiers]
 
         quality_urls_map = {}
+        quality_tracks_map = {}
 
-        # Direct progressive and HLS stream mapping for clean, crash-free playback
+        def _build_hls_master_url(v_fmt, a_fmt, label_h):
+            if not (v_fmt and a_fmt and v_fmt.get("url") and a_fmt.get("url")):
+                return ""
+            v_w = v_fmt.get("width") or (label_h * 16 // 9)
+            v_h = v_fmt.get("height") or label_h
+            bw = int((v_fmt.get("tbr") or (label_h * 3.5)) * 1000)
+            v_codec = v_fmt.get("vcodec") or "avc1.640028"
+            codecs_str = f'CODECS="{v_codec},mp4a.40.2",' if v_codec else ""
+            selected_lang_name = (a_fmt.get("language") or clean_audio_lang or "Audio").capitalize()
+            media_audio_lines = [
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",LANGUAGE="{clean_audio_lang[:2] if clean_audio_lang else "en"}",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{a_fmt["url"]}"'
+            ]
+            master_m3u8 = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:6\n"
+                "#EXT-X-INDEPENDENT-SEGMENTS\n"
+                f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},{codecs_str}AUDIO="audio"\n'
+                f'{v_fmt["url"]}\n' +
+                "\n".join(media_audio_lines) + "\n"
+            )
+            return register_dynamic_playlist(f"yt_master_{label_h}.m3u8", master_m3u8)
+
+        # Build playable stream specs per quality tier:
+        # Prefer direct DASH video+audio (for Media3 MergingMediaSource) with HLS/progressive fallback
+        has_explicit_audio_lang = bool(clean_audio_lang and clean_audio_lang not in ("default", "original", "none"))
         for q_lbl in real_qualities:
             cap_match = re.search(r"(\d+)p", q_lbl)
             target_h = int(cap_match.group(1)) if cap_match else None
+            if not target_h:
+                continue
 
-            # 1. If 360p or lower, prefer direct progressive mp4 stream (format 18) only if user didn't pick a specific audio language
-            if target_h and target_h <= 360 and progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none")):
-                matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
-                if matching_prog:
-                    quality_urls_map[q_lbl] = matching_prog[0]["url"]
-                    continue
-                p_fallback = select_progressive_youtube_format(formats, q_lbl)
-                if p_fallback and p_fallback.get("url"):
-                    quality_urls_map[q_lbl] = p_fallback["url"]
-                    continue
-
-            # 2. For HD/SD tiers, pair HLS video with HLS audio into a streamable Master Playlist
-            if target_h and hls_audio_fmt and hls_audio_fmt.get('url'):
-                matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) == target_h and f.get("url")]
-                if not matching_hls_v:
-                    matching_hls_v = [f for f in hls_video_formats if (f.get("height") or 0) <= target_h and f.get("url")]
-                matching_hls_v.sort(key=lambda f: (f.get("height") or 0, 1 if 'avc1' in str(f.get('vcodec') or '') else 0), reverse=True)
-
-                if matching_hls_v:
-                    v_fmt = matching_hls_v[0]
-                    v_w = v_fmt.get('width') or (target_h * 16 // 9)
-                    v_h = v_fmt.get('height') or target_h
-                    bw = int((v_fmt.get('tbr') or (target_h * 3.5)) * 1000)
-                    a_url = hls_audio_fmt['url']
-                    v_url = v_fmt['url']
-                    v_codec = v_fmt.get('vcodec') or 'avc1.640028'
-                    codecs_str = f'CODECS="{v_codec},mp4a.40.2",' if v_codec else ''
-                    selected_lang_name = (hls_audio_fmt.get('language') or clean_audio_lang or 'Audio').capitalize()
-                    media_audio_lines = [
-                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{selected_lang_name}",LANGUAGE="{clean_audio_lang[:2] if clean_audio_lang else "en"}",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="{hls_audio_fmt["url"]}"'
-                    ]
-                    master_m3u8 = (
-                        "#EXTM3U\n"
-                        "#EXT-X-VERSION:6\n"
-                        "#EXT-X-INDEPENDENT-SEGMENTS\n"
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={v_w}x{v_h},{codecs_str}AUDIO="audio"\n'
-                        f'{v_url}\n' +
-                        "\n".join(media_audio_lines) + "\n"
-                    )
-                    quality_urls_map[q_lbl] = register_dynamic_playlist(f"yt_master_{target_h}.m3u8", master_m3u8)
+            # 1. If 360p or lower with no explicit alternate dub language, use muxed progressive MP4 directly
+            if target_h <= 360 and progressive_sorted and not has_explicit_audio_lang:
+                matching_prog = [f for f in progressive_sorted if (f.get("height") or 0) <= target_h and f.get("url")]
+                p_fmt = matching_prog[0] if matching_prog else select_progressive_youtube_format(formats, q_lbl)
+                if p_fmt and p_fmt.get("url"):
+                    p_url = p_fmt["url"]
+                    quality_urls_map[q_lbl] = p_url
+                    quality_tracks_map[q_lbl] = {
+                        "url": p_url,
+                        "video_url": "",
+                        "audio_url": "",
+                        "fallback_url": prog_fallback_url if prog_fallback_url != p_url else "",
+                        "video_format": _yt_fmt_summary(p_fmt),
+                        "audio_format": "muxed",
+                        "fallback_format": prog_fallback_summary if prog_fallback_url != p_url else "",
+                    }
                     continue
 
-            # 3. Progressive fallback if available
-            if target_h:
-                matching_prog = [f for f in progressive if (f.get("height") or 0) == target_h and f.get("url")]
-                if matching_prog:
-                    quality_urls_map[q_lbl] = matching_prog[0]["url"]
-                elif progressive:
-                    quality_urls_map[q_lbl] = progressive[0]["url"]
+            # 2. DASH video + DASH audio pair for Media3 MergingMediaSource
+            hls_v_match = _pick_yt_video(hls_video_formats, target_h) if (hls_video_formats and hls_audio_fmt) else None
+            hls_master_url = _build_hls_master_url(hls_v_match, hls_audio_fmt, target_h) if hls_v_match else ""
+
+            if dash_video_formats and dash_audio_fmt:
+                dash_v = _pick_yt_video(dash_video_formats, target_h)
+                if dash_v and dash_v.get("url"):
+                    fallback_u = prog_fallback_url or hls_master_url
+                    fallback_s = prog_fallback_summary if prog_fallback_url else (_yt_fmt_summary(hls_v_match) if hls_master_url else "")
+                    single_u = hls_master_url or prog_fallback_url or dash_v["url"]
+                    quality_urls_map[q_lbl] = single_u
+                    quality_tracks_map[q_lbl] = {
+                        "url": single_u,
+                        "video_url": dash_v["url"],
+                        "audio_url": dash_audio_fmt["url"],
+                        "fallback_url": fallback_u,
+                        "video_format": _yt_fmt_summary(dash_v),
+                        "audio_format": _yt_fmt_summary(dash_audio_fmt),
+                        "fallback_format": fallback_s,
+                    }
+                    continue
+
+            # 3. HLS video + HLS audio pair (merged via HlsMediaSource or master m3u8)
+            if hls_v_match and hls_audio_fmt:
+                single_u = hls_master_url or prog_fallback_url
+                quality_urls_map[q_lbl] = single_u
+                quality_tracks_map[q_lbl] = {
+                    "url": single_u,
+                    "video_url": hls_v_match["url"],
+                    "audio_url": hls_audio_fmt["url"],
+                    "fallback_url": prog_fallback_url or hls_master_url,
+                    "video_format": _yt_fmt_summary(hls_v_match),
+                    "audio_format": _yt_fmt_summary(hls_audio_fmt),
+                    "fallback_format": prog_fallback_summary if prog_fallback_url else "hls_master",
+                }
+                continue
+
+            # 4. Progressive muxed fallback (never leave bare video-only when audio track is absent)
+            if progressive_sorted:
+                matching_prog = [f for f in progressive_sorted if (f.get("height") or 0) <= target_h and f.get("url")]
+                p_fmt = matching_prog[0] if matching_prog else progressive_sorted[0]
+                quality_urls_map[q_lbl] = p_fmt["url"]
+                quality_tracks_map[q_lbl] = {
+                    "url": p_fmt["url"],
+                    "video_url": "",
+                    "audio_url": "",
+                    "fallback_url": "",
+                    "video_format": _yt_fmt_summary(p_fmt),
+                    "audio_format": "muxed",
+                    "fallback_format": "",
+                }
 
         # Map "Best Available"
-        top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_urls_map), None)
+        top_res_key = next((q for q in real_qualities if q != "Best Available" and q in quality_tracks_map), None)
         if top_res_key:
-            quality_urls_map["Best Available"] = quality_urls_map[top_res_key]
-        elif progressive and not (clean_audio_lang and clean_audio_lang not in ("default", "original", "none")):
-            progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
-            quality_urls_map["Best Available"] = progressive_sorted[0].get("url")
-        else:
-            for q_lbl in real_qualities:
-                if q_lbl != "Best Available" and q_lbl in quality_urls_map:
-                    quality_urls_map["Best Available"] = quality_urls_map[q_lbl]
-                    break
+            quality_urls_map["Best Available"] = quality_urls_map.get(top_res_key, "")
+            quality_tracks_map["Best Available"] = dict(quality_tracks_map[top_res_key])
+        elif progressive_sorted:
+            p_fmt = progressive_sorted[0]
+            quality_urls_map["Best Available"] = p_fmt.get("url", "")
+            quality_tracks_map["Best Available"] = {
+                "url": p_fmt.get("url", ""),
+                "video_url": "",
+                "audio_url": "",
+                "fallback_url": "",
+                "video_format": _yt_fmt_summary(p_fmt),
+                "audio_format": "muxed",
+                "fallback_format": "",
+            }
 
         # Map audio-only qualities
         audio_formats = [
@@ -5804,37 +6025,49 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             if isinstance(f, dict) and f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
         ]
         if audio_formats:
-            audio_formats_sorted = sorted(audio_formats, key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
-            best_audio_url = audio_formats_sorted[0].get("url")
+            best_audio_fmt = _pick_yt_audio(audio_formats, clean_audio_lang) or sorted(
+                audio_formats, key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True
+            )[0]
+            best_audio_url = best_audio_fmt.get("url", "")
+            best_audio_summary = _yt_fmt_summary(best_audio_fmt)
             for a_lbl in ["Best Audio (320kbps)", "High Audio (256kbps)", "Standard Audio (192kbps)", "Compact Audio (128kbps)", "Audio Only"]:
                 quality_urls_map[a_lbl] = best_audio_url
+                quality_tracks_map[a_lbl] = {
+                    "url": best_audio_url,
+                    "video_url": "",
+                    "audio_url": best_audio_url,
+                    "fallback_url": "",
+                    "video_format": "",
+                    "audio_format": best_audio_summary,
+                    "fallback_format": "",
+                }
 
         audio_choices = []
         seen_langs = set()
-        for af in hls_audio_formats:
-            lang_code = str(af.get('language') or '').lower()
-            note = str(af.get('format_note') or '')
+        for af in (dash_audio_formats + hls_audio_formats):
+            lang_code = str(af.get("language") or "").lower()
+            note = str(af.get("format_note") or "")
             if lang_code:
-                if 'en' in lang_code: lang_display = 'English'
-                elif 'hi' in lang_code: lang_display = 'Hindi'
-                elif 'es' in lang_code: lang_display = 'Spanish'
-                elif 'fr' in lang_code: lang_display = 'French'
-                elif 'de' in lang_code: lang_display = 'German'
-                elif 'ja' in lang_code: lang_display = 'Japanese'
-                elif 'ko' in lang_code: lang_display = 'Korean'
-                elif 'pt' in lang_code: lang_display = 'Portuguese'
-                elif 'ru' in lang_code: lang_display = 'Russian'
-                elif 'zh' in lang_code: lang_display = 'Chinese'
-                elif 'ar' in lang_code: lang_display = 'Arabic'
-                elif 'ta' in lang_code: lang_display = 'Tamil'
-                elif 'te' in lang_code: lang_display = 'Telugu'
-                elif 'bn' in lang_code: lang_display = 'Bengali'
-                elif 'id' in lang_code: lang_display = 'Indonesian'
+                if "en" in lang_code: lang_display = "English"
+                elif "hi" in lang_code: lang_display = "Hindi"
+                elif "es" in lang_code: lang_display = "Spanish"
+                elif "fr" in lang_code: lang_display = "French"
+                elif "de" in lang_code: lang_display = "German"
+                elif "ja" in lang_code: lang_display = "Japanese"
+                elif "ko" in lang_code: lang_display = "Korean"
+                elif "pt" in lang_code: lang_display = "Portuguese"
+                elif "ru" in lang_code: lang_display = "Russian"
+                elif "zh" in lang_code: lang_display = "Chinese"
+                elif "ar" in lang_code: lang_display = "Arabic"
+                elif "ta" in lang_code: lang_display = "Tamil"
+                elif "te" in lang_code: lang_display = "Telugu"
+                elif "bn" in lang_code: lang_display = "Bengali"
+                elif "id" in lang_code: lang_display = "Indonesian"
                 else: lang_display = lang_code.upper()
-            elif 'default' in note.lower() or 'original' in note.lower():
-                lang_display = 'Original'
+            elif "default" in note.lower() or "original" in note.lower():
+                lang_display = "Original"
             else:
-                lang_display = note.strip().capitalize() or 'Audio'
+                lang_display = note.strip().capitalize() or "Audio"
 
             if lang_display in seen_langs:
                 continue
@@ -5859,47 +6092,63 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
 
         audio_choices.sort(key=get_audio_priority)
 
-        stream_url = None
-        if clean_quality in quality_urls_map:
-            stream_url = quality_urls_map[clean_quality]
+        selected_track = None
+        if clean_quality in quality_tracks_map:
+            selected_track = quality_tracks_map[clean_quality]
         else:
             clean_q_lower = clean_quality.lower()
-            for q_key, q_val in quality_urls_map.items():
+            for q_key, q_val in quality_tracks_map.items():
                 if clean_q_lower in q_key.lower() or \
                    (clean_q_lower.startswith("1080") and "1080" in q_key) or \
                    (clean_q_lower.startswith("720") and "720" in q_key) or \
                    (clean_q_lower.startswith("480") and "480" in q_key) or \
                    (clean_q_lower.startswith("360") and "360" in q_key):
-                    stream_url = q_val
+                    selected_track = q_val
                     break
+        if not selected_track:
+            selected_track = quality_tracks_map.get("Best Available") or {}
+
+        stream_url = selected_track.get("url") or quality_urls_map.get(clean_quality) or quality_urls_map.get("Best Available")
+        top_video_url = selected_track.get("video_url", "")
+        top_audio_url = selected_track.get("audio_url", "")
+        top_fallback_url = selected_track.get("fallback_url", "") or prog_fallback_url
+        top_video_format = selected_track.get("video_format", "")
+        top_audio_format = selected_track.get("audio_format", "")
+        top_fallback_format = selected_track.get("fallback_format", "") or prog_fallback_summary
+
+        # Never leave a split video_url without an audio track unless it's pure progressive/audio-only
+        if top_video_url and not top_audio_url:
+            top_video_url = ""
+            if prog_fallback_url:
+                stream_url = prog_fallback_url
+                top_video_format = prog_fallback_summary
+                top_audio_format = "muxed"
+
         if not stream_url:
-            if quality_urls_map.get("Best Available"):
-                stream_url = quality_urls_map["Best Available"]
-            elif progressive:
-                progressive_sorted = sorted(progressive, key=lambda f: f.get("height") or 0, reverse=True)
+            if progressive_sorted:
                 stream_url = progressive_sorted[0].get("url")
+                top_video_format = _yt_fmt_summary(progressive_sorted[0])
+                top_audio_format = "muxed"
             else:
-                v_fmts = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-                if v_fmts:
-                    v_sorted = sorted(v_fmts, key=lambda f: f.get("height") or 0, reverse=True)
-                    stream_url = v_sorted[0].get("url")
-                else:
-                    any_fmts = [f for f in formats if f.get("url")]
-                    if any_fmts:
-                        stream_url = any_fmts[0].get("url")
-                    else:
-                        raise Exception("No direct playable stream could be extracted from YouTube format manifest")
+                raise Exception("No direct playable muxed or merged stream could be extracted from YouTube format manifest")
 
         if not stream_url or stream_url == url or "youtube.com" in stream_url or "youtu.be" in stream_url:
             raise Exception("Failed to resolve direct playable stream URL for this YouTube video")
 
-        thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get('id') else "")
+        thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get("id") else "")
 
+        print(f"[FMT] Selected stream [{clean_quality}] video=({top_video_format or 'muxed'}) | audio=({top_audio_format or 'embedded'}) | fallback=({top_fallback_format or 'none'})")
         print(f"[OK] Stream resolved: {info.get('title', 'Video')}")
         return {
             "url": stream_url,
             "stream_url": stream_url,
             "direct_url": stream_url,
+            "video_url": top_video_url,
+            "audio_url": top_audio_url,
+            "fallback_url": top_fallback_url,
+            "video_format": top_video_format,
+            "audio_format": top_audio_format,
+            "fallback_format": top_fallback_format,
             "target_url": url,
             "title": info.get("title", "Resolved video"),
             "source": info.get("extractor_key", "YouTube"),
@@ -5907,6 +6156,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "quality": clean_quality,
             "qualities": real_qualities,
             "quality_urls": quality_urls_map,
+            "quality_tracks": quality_tracks_map,
             "audios": audio_choices,
             "audio_choices": audio_choices,
             "selected_audio_lang": (audio_lang or (audio_choices[0]["language"] if audio_choices else "")),

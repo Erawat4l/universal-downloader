@@ -318,17 +318,38 @@ class DownloadService : Service() {
         if (!prefs.getBoolean("notifications_enabled", true)) return
 
         try {
+            val selectedPlayerPkg = prefs.getString("streaming_player_package", "arc_player") ?: "arc_player"
+            val lowerPath = filePath.lowercase()
+            val isAudioFile = lowerPath.endsWith(".mp3") || lowerPath.endsWith(".m4a") ||
+                lowerPath.endsWith(".aac") || lowerPath.endsWith(".flac") ||
+                lowerPath.endsWith(".ogg") || lowerPath.endsWith(".wav")
+            val isVideoFile = lowerPath.endsWith(".mp4") || lowerPath.endsWith(".mkv") ||
+                lowerPath.endsWith(".webm") || lowerPath.endsWith(".mov") ||
+                lowerPath.endsWith(".avi") || lowerPath.endsWith(".ts") ||
+                lowerPath.endsWith(".m3u8")
+
             val pendingIntent = if (filePath.isNotBlank()) {
-                val file = File(filePath)
-                val uri: Uri = try {
-                    FileProvider.getUriForFile(this, "$packageName.provider", file)
-                } catch (_: Exception) {
-                    Uri.fromFile(file)
-                }
-                val openIntent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, if (filePath.endsWith(".mp3") || filePath.endsWith(".m4a")) "audio/*" else "video/*")
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val openIntent = if ((isAudioFile || isVideoFile) && selectedPlayerPkg == "arc_player") {
+                    Intent(this, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        putExtra("play_local_file", filePath)
+                        putExtra("play_local_title", title)
+                    }
+                } else {
+                    val file = File(filePath)
+                    val uri: Uri = try {
+                        FileProvider.getUriForFile(this, "$packageName.provider", file)
+                    } catch (_: Exception) {
+                        Uri.fromFile(file)
+                    }
+                    Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, if (isAudioFile) "audio/*" else "video/*")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        if (selectedPlayerPkg.isNotBlank() && selectedPlayerPkg != "system_chooser" && selectedPlayerPkg != "arc_player") {
+                            setPackage(selectedPlayerPkg)
+                        }
+                    }
                 }
                 PendingIntent.getActivity(
                     this,

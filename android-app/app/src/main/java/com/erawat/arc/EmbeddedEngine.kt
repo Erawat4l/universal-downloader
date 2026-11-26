@@ -29,6 +29,13 @@ object EmbeddedEngine {
             try { ariaFile.setExecutable(true, false) } catch (_: Exception) {}
         }
         val module = Python.getInstance().getModule("dl")
+        try {
+            module.callAttr(
+                "set_runtime_paths",
+                context.filesDir.absolutePath,
+                context.cacheDir.absolutePath
+            )
+        } catch (_: Exception) {}
         if (ariaFile.exists()) {
             try {
                 module.callAttr("set_aria2c_path", ariaFile.absolutePath)
