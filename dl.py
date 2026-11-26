@@ -3872,17 +3872,43 @@ def handle_video_stream_and_download(url):
 
 def get_ott_providers_for_title(title, m_type, year):
     """Fetch OTT platforms / networks hosting this title via TMDB API."""
-    clean_q = re.sub(r'\[.*?\]', '', title).strip()
-    cache_key = (clean_q.lower(), str(m_type), str(year or ""))
+    clean_q = re.sub(r'\[.*?\]|\(.*?\)', '', str(title or ''))
+    clean_q = re.sub(r'\s*[-–:]?\s*(?:Season\s*\d+|S\d+|Complete\s*Series|Part\s*\d+)\s*$', '', clean_q, flags=re.I).strip()
+    clean_q = re.sub(r'\s+', ' ', clean_q) or str(title or '').strip()
+    tmdb_type = 'tv' if str(m_type).lower() in ('tv', 'series', 'tv series') else 'movie'
+    cache_key = (clean_q.lower(), tmdb_type, str(year or ""))
     cached = _TMDB_OTT_CACHE.get(cache_key)
     if cached and (time.time() - cached[0]) < 600:
         return list(cached[1])
     api_key = 'c8dea14dc917687ac631a52620e4f7ad'
     tmdb_ok = False
+
+    def _norm_provider(pname):
+        pl = pname.lower()
+        if 'jiocinema' in pl: return 'JioCinema'
+        if 'hotstar' in pl or 'jiostar' in pl: return 'JioHotstar'
+        if 'mx player' in pl or 'amazon mx' in pl: return 'MX Player'
+        if 'disney' in pl: return 'Disney+'
+        if 'netflix' in pl: return 'Netflix'
+        if 'prime' in pl or 'amazon' in pl: return 'Prime Video'
+        if 'apple' in pl: return 'Apple TV+'
+        if 'zee' in pl: return 'Zee5'
+        if 'sony' in pl: return 'SonyLIV'
+        if 'peacock' in pl: return 'Peacock'
+        if 'paramount' in pl: return 'Paramount+'
+        if 'max' in pl or 'hbo' in pl: return 'Max'
+        if 'hulu' in pl: return 'Hulu'
+        if 'crunchyroll' in pl: return 'Crunchyroll'
+        if 'lionsgate' in pl: return 'Lionsgate Play'
+        if 'sun nxt' in pl: return 'Sun NXT'
+        if 'aha' in pl: return 'Aha'
+        if 'youtube' in pl: return 'YouTube'
+        return pname
+
     try:
         sr_resp = _TMDB_SESSION.get(
-            f'https://api.themoviedb.org/3/search/{m_type}?query={urllib.parse.quote(clean_q)}&api_key={api_key}',
-            timeout=2.5,
+            f'https://api.themoviedb.org/3/search/{tmdb_type}?query={urllib.parse.quote(clean_q)}&api_key={api_key}',
+            timeout=2.8,
         )
         if sr_resp.status_code == 200:
             tmdb_ok = True
@@ -3898,39 +3924,35 @@ def get_ott_providers_for_title(title, m_type, year):
             matched_id = hits[0]['id']
         if matched_id:
             ott_list = []
-            if m_type == 'tv':
-                try:
-                    s_r = _TMDB_SESSION.get(f'https://api.themoviedb.org/3/tv/{matched_id}?api_key={api_key}', timeout=2.5).json()
-                    for n in s_r.get('networks', []):
-                        ott_list.append(n['name'])
-                except Exception:
-                    pass
             try:
                 r_p_resp = _TMDB_SESSION.get(
-                    f'https://api.themoviedb.org/3/{m_type}/{matched_id}/watch/providers?api_key={api_key}',
-                    timeout=2.5,
+                    f'https://api.themoviedb.org/3/{tmdb_type}/{matched_id}/watch/providers?api_key={api_key}',
+                    timeout=2.8,
                 )
                 if r_p_resp.status_code != 200:
                     tmdb_ok = False
                 r_p = r_p_resp.json()
-                for c in ['IN', 'US']:
-                    for p in r_p.get('results', {}).get(c, {}).get('flatrate', []):
-                        pname = p['provider_name']
-                        if 'hotstar' in pname.lower(): pname = 'JioHotstar'
-                        elif 'disney' in pname.lower(): pname = 'Disney+'
-                        elif 'netflix' in pname.lower(): pname = 'Netflix'
-                        elif 'prime' in pname.lower(): pname = 'Prime Video'
-                        elif 'apple' in pname.lower(): pname = 'Apple TV+'
-                        elif 'zee' in pname.lower(): pname = 'Zee5'
-                        elif 'sony' in pname.lower(): pname = 'SonyLIV'
-                        elif 'peacock' in pname.lower(): pname = 'Peacock'
-                        elif 'paramount' in pname.lower(): pname = 'Paramount+'
-                        elif 'max' in pname.lower() or 'hbo' in pname.lower(): pname = 'Max'
-                        if pname not in ott_list:
-                            ott_list.append(pname)
+                results_map = r_p.get('results', {})
+                for tier in ('flatrate', 'ads', 'free', 'rent', 'buy'):
+                    for c in ('IN', 'US', 'GB'):
+                        for p in results_map.get(c, {}).get(tier, []):
+                            pname = _norm_provider(p['provider_name'])
+                            if pname not in ott_list:
+                                ott_list.append(pname)
+                    if ott_list:
+                        break
             except Exception:
                 tmdb_ok = False
-            res_otts = ott_list[:2]
+            if tmdb_type == 'tv' and not ott_list:
+                try:
+                    s_r = _TMDB_SESSION.get(f'https://api.themoviedb.org/3/tv/{matched_id}?api_key={api_key}', timeout=2.5).json()
+                    for n in s_r.get('networks', []):
+                        pname = _norm_provider(n['name'])
+                        if pname not in ott_list:
+                            ott_list.append(pname)
+                except Exception:
+                    pass
+            res_otts = ott_list[:1]
             if tmdb_ok or res_otts:
                 _TMDB_OTT_CACHE[cache_key] = (time.time(), res_otts)
             return res_otts
@@ -4056,16 +4078,16 @@ def group_and_deduplicate_results(results, query=None):
             }
         groups[key]['items'].append(it)
 
-    # Fetch OTT providers in parallel for top relevant groups within 2.5s budget
+    # Fetch OTT providers in parallel for top 10 relevant groups within 3.5s budget
     ranked_keys = sorted(
         groups.keys(),
         key=lambda k: compute_query_relevance(groups[k]['title'], query),
         reverse=True,
-    )[:8]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+    )[:10]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         f_map = {ex.submit(get_ott_providers_for_title, groups[k]['title'], groups[k]['type'].lower(), groups[k]['year']): k for k in ranked_keys}
         try:
-            for f in concurrent.futures.as_completed(f_map, timeout=2.5):
+            for f in concurrent.futures.as_completed(f_map, timeout=3.5):
                 k = f_map[f]
                 try:
                     groups[k]['otts'] = f.result() or []

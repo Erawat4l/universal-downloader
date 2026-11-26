@@ -236,12 +236,14 @@ import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.AspectRatioFrameLayout
 import android.app.Activity
@@ -1135,20 +1137,15 @@ private fun ArcApp(
     var showGoogleLoginDialog by rememberSaveable { mutableStateOf(false) }
     var showAboutDialog by rememberSaveable { mutableStateOf(false) }
     var isBatteryExempt by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
-    val hasSeenOnboarding = preferences.getBoolean("has_seen_onboarding_permissions", false)
-    val hasSeenStorageOnboarding = preferences.getBoolean("has_seen_storage_onboarding", false)
     fun needsNotificationGrant(): Boolean {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
     }
     fun nextOnboardingStepAfter(step: Int): Int {
-        if (step < 1 && !hasSeenOnboarding && needsNotificationGrant()) return 1
-        if (step < 2 && (!hasSeenOnboarding || !hasSeenStorageOnboarding) && !hasAllAppStoragePermissions(context)) return 2
-        if (step < 3 && !hasSeenOnboarding && !isIgnoringBatteryOptimizations(context)) return 3
-        preferences.edit()
-            .putBoolean("has_seen_onboarding_permissions", true)
-            .putBoolean("has_seen_storage_onboarding", true)
-            .apply()
+        if (step < 1 && !preferences.getBoolean("onboarding_perm_notif_v4", false) && needsNotificationGrant()) return 1
+        if (step < 2 && !preferences.getBoolean("onboarding_perm_storage_v4", false) && !hasAllAppStoragePermissions(context)) return 2
+        if (step < 3 && !preferences.getBoolean("onboarding_perm_battery_v4", false) && !isIgnoringBatteryOptimizations(context)) return 3
+        preferences.edit().putBoolean("has_seen_onboarding_permissions", true).apply()
         return 0
     }
     var onboardingStep by rememberSaveable { mutableIntStateOf(nextOnboardingStepAfter(0)) }
@@ -1159,7 +1156,7 @@ private fun ArcApp(
             isBatteryExempt = isIgnoringBatteryOptimizations(context)
             if (awaitingAllFilesReturn) {
                 awaitingAllFilesReturn = false
-                preferences.edit().putBoolean("has_seen_storage_onboarding", true).apply()
+                preferences.edit().putBoolean("onboarding_perm_storage_v4", true).apply()
                 onboardingStep = nextOnboardingStepAfter(2)
             }
         }
@@ -1218,7 +1215,7 @@ private fun ArcApp(
                 if (requestAllFilesAccess(context)) {
                     awaitingAllFilesReturn = true
                 } else {
-                    preferences.edit().putBoolean("has_seen_storage_onboarding", true).apply()
+                    preferences.edit().putBoolean("onboarding_perm_storage_v4", true).apply()
                     onboardingStep = nextOnboardingStepAfter(2)
                 }
                 return@rememberLauncherForActivityResult
@@ -2189,7 +2186,11 @@ private fun ArcApp(
             }
             onboardingStep != 0 -> {
                 val curStep = onboardingStep
-                if (curStep == 2) preferences.edit().putBoolean("has_seen_storage_onboarding", true).apply()
+                when (curStep) {
+                    1 -> preferences.edit().putBoolean("onboarding_perm_notif_v4", true).apply()
+                    2 -> preferences.edit().putBoolean("onboarding_perm_storage_v4", true).apply()
+                    3 -> preferences.edit().putBoolean("onboarding_perm_battery_v4", true).apply()
+                }
                 onboardingStep = nextOnboardingStepAfter(curStep)
             }
             showDeleteConfirmJobId != null -> showDeleteConfirmJobId = null
@@ -3368,7 +3369,10 @@ private fun ArcApp(
                     onAllow = {
                         onboardingStep = 0
                         notifications = true
-                        preferences.edit().putBoolean("notifications_enabled", true).apply()
+                        preferences.edit()
+                            .putBoolean("notifications_enabled", true)
+                            .putBoolean("onboarding_perm_notif_v4", true)
+                            .apply()
                         if (needsNotificationGrant()) {
                             awaitingNotifOnboarding = true
                             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -3377,6 +3381,7 @@ private fun ArcApp(
                         }
                     },
                     onCancel = {
+                        preferences.edit().putBoolean("onboarding_perm_notif_v4", true).apply()
                         onboardingStep = nextOnboardingStepAfter(1)
                     },
                 )
@@ -3385,18 +3390,18 @@ private fun ArcApp(
                     body = "Allow ARC to read and save videos, audio tracks, and torrent files directly on your device.",
                     onAllow = {
                         onboardingStep = 0
+                        preferences.edit().putBoolean("onboarding_perm_storage_v4", true).apply()
                         if (!hasLocalMediaPermission(context, false) || !hasLocalMediaPermission(context, true)) {
                             awaitingStorageOnboarding = true
                             mediaPermissionLauncher.launch(requiredLocalMediaPermissions(false))
                         } else if (requestAllFilesAccess(context)) {
                             awaitingAllFilesReturn = true
                         } else {
-                            preferences.edit().putBoolean("has_seen_storage_onboarding", true).apply()
                             onboardingStep = nextOnboardingStepAfter(2)
                         }
                     },
                     onCancel = {
-                        preferences.edit().putBoolean("has_seen_storage_onboarding", true).apply()
+                        preferences.edit().putBoolean("onboarding_perm_storage_v4", true).apply()
                         onboardingStep = nextOnboardingStepAfter(2)
                     },
                 )
@@ -3406,16 +3411,16 @@ private fun ArcApp(
                     onAllow = {
                         onboardingStep = 0
                         preferences.edit()
+                            .putBoolean("onboarding_perm_battery_v4", true)
                             .putBoolean("has_seen_onboarding_permissions", true)
-                            .putBoolean("has_seen_storage_onboarding", true)
                             .apply()
                         requestIgnoreBatteryOptimizations(context)
                     },
                     onCancel = {
                         onboardingStep = 0
                         preferences.edit()
+                            .putBoolean("onboarding_perm_battery_v4", true)
                             .putBoolean("has_seen_onboarding_permissions", true)
-                            .putBoolean("has_seen_storage_onboarding", true)
                             .apply()
                     },
                 )
@@ -5724,6 +5729,9 @@ private fun ArcPlayerScreen(
     var gestureHudIsSeek by remember { mutableStateOf(false) }
     var gestureHudSeekForward by remember { mutableStateOf(true) }
     var gestureHudClearSeq by remember { mutableIntStateOf(0) }
+    var manualQualitySelected by remember(streamTarget) { mutableStateOf(false) }
+    var qualityNoticeText by remember(streamTarget) { mutableStateOf<String?>(null) }
+    var qualityNoticeSeq by remember(streamTarget) { mutableIntStateOf(0) }
 
     val originalOrientation = remember(activity) {
         activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -5839,6 +5847,14 @@ private fun ArcPlayerScreen(
     }
 
     val exoPlayer = remember(context) {
+        val renderersFactory = DefaultRenderersFactory(context)
+            .setEnableDecoderFallback(true)
+        val trackSelector = DefaultTrackSelector(context).apply {
+            parameters = buildUponParameters()
+                .setExceedVideoConstraintsIfNecessary(true)
+                .setAllowVideoMixedMimeTypeAdaptiveness(true)
+                .build()
+        }
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 20_000, // minBufferMs
@@ -5848,25 +5864,27 @@ private fun ArcPlayerScreen(
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
-        ExoPlayer.Builder(context)
+        ExoPlayer.Builder(context, renderersFactory)
+            .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
             .build()
     }
 
     fun stepDownQualityOrFallback(): Boolean {
         if (currentTarget.isAudioOnlyStream) return false
-        val curHeight = if (selectedQuality.equals("Best Available", ignoreCase = true)) {
+        val failedQ = selectedQuality
+        val curHeight = if (failedQ.equals("Best Available", ignoreCase = true)) {
             selectableQualities
                 .filterNot { it.equals("Best Available", ignoreCase = true) }
                 .maxOfOrNull { q -> Regex("(\\d+)p").find(q)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0 }
                 ?: 2160
         } else {
-            Regex("(\\d+)p").find(selectedQuality)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+            Regex("(\\d+)p").find(failedQ)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
         }
         val nextQ = selectableQualities
             .filterNot {
                 it.equals("Best Available", ignoreCase = true) ||
-                    it.equals(selectedQuality, ignoreCase = true) ||
+                    it.equals(failedQ, ignoreCase = true) ||
                     it in failedQualities
             }
             .firstOrNull { q ->
@@ -5874,12 +5892,15 @@ private fun ArcPlayerScreen(
                 h > 0 && h < curHeight && (currentTarget.qualityTracks.containsKey(q) || currentTarget.qualityUrls.containsKey(q))
             }
         if (nextQ != null) {
-            failedQualities = failedQualities + selectedQuality
+            failedQualities = failedQualities + failedQ
             val curPos = exoPlayer.currentPosition.coerceAtLeast(0L)
             if (curPos > 0L) resumeSeekMs = curPos
             lazyProxyUrl = ""
             usingFallback = false
-            Log.w("ArcPlayer", "Stepping down quality '$selectedQuality' -> '$nextQ' while keeping audio='$selectedAudioLang'")
+            manualQualitySelected = false
+            qualityNoticeText = "$failedQ unavailable on device · Switched to $nextQ"
+            qualityNoticeSeq++
+            Log.w("ArcPlayer", "Stepping down quality '$failedQ' -> '$nextQ' while keeping audio='$selectedAudioLang'")
             selectedQuality = nextQ
             return true
         }
@@ -6078,8 +6099,8 @@ private fun ArcPlayerScreen(
     }
 
     // Startup stall watchdog: step down quality cleanly before falling back to muxed stream
-    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, retryCounter) {
-        if (!usingFallback && !currentTarget.isAudioOnlyStream && (effFallbackUrl.isNotBlank() || selectableQualities.size > 1)) {
+    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, manualQualitySelected, retryCounter) {
+        if (!manualQualitySelected && !usingFallback && !currentTarget.isAudioOnlyStream && (effFallbackUrl.isNotBlank() || selectableQualities.size > 1)) {
             val isUltraHd = selectedQuality.contains("2160") || selectedQuality.contains("1440") || selectedQuality.equals("Best Available", ignoreCase = true)
             delay(if (isUltraHd) 10_500L else 6_500L)
             if (playbackState == Player.STATE_BUFFERING && exoPlayer.currentPosition <= 0L && playerErrorText == null) {
@@ -6132,6 +6153,13 @@ private fun ArcPlayerScreen(
         if (gestureHudClearSeq > 0) {
             delay(850L)
             gestureHudLabel = null
+        }
+    }
+
+    LaunchedEffect(qualityNoticeSeq) {
+        if (qualityNoticeSeq > 0) {
+            delay(3000L)
+            qualityNoticeText = null
         }
     }
 
@@ -6386,7 +6414,26 @@ private fun ArcPlayerScreen(
             }
         }
 
-        // Brightness / Volume vertical swipe HUD
+        // Brightness / Volume / Seek swipe HUD or Quality Notice pill
+        if (gestureHudLabel == null && qualityNoticeText != null) {
+            Surface(
+                color = controlSurfaceColor,
+                shape = RoundedCornerShape(16.dp),
+                border = controlBorder,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 72.dp),
+            ) {
+                Text(
+                    text = qualityNoticeText.orEmpty(),
+                    color = ArcWhite,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
+        }
         if (gestureHudLabel != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = controlSurfaceColor),
@@ -6867,11 +6914,16 @@ private fun ArcPlayerScreen(
                                 FilterChip(
                                     selected = isSel,
                                     onClick = {
-                                        if (!isSel) {
-                                            resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-                                            lazyProxyUrl = ""
-                                            selectedQuality = qOpt
-                                        }
+                                        manualQualitySelected = true
+                                        failedQualities = failedQualities - qOpt
+                                        usingFallback = false
+                                        playerErrorText = null
+                                        resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                        lazyProxyUrl = ""
+                                        selectedQuality = qOpt
+                                        retryCounter++
+                                        qualityNoticeText = "Switching to $qOpt..."
+                                        qualityNoticeSeq++
                                         showSettingsSheet = false
                                         interactionTick++
                                     },
