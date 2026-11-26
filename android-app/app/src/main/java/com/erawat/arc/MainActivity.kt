@@ -5633,7 +5633,6 @@ private fun ArcPlayerScreen(
     var overrideAudioUrl by remember(streamTarget) { mutableStateOf("") }
     var overrideAudioFormat by remember(streamTarget) { mutableStateOf("") }
     var isSwitchingAudio by remember(streamTarget) { mutableStateOf(false) }
-    var failedQualities by remember(streamTarget) { mutableStateOf<Set<String>>(emptySet()) }
 
     val selectableQualities = remember(currentTarget) {
         val raw = currentTarget.availableQualities
@@ -5729,9 +5728,6 @@ private fun ArcPlayerScreen(
     var gestureHudIsSeek by remember { mutableStateOf(false) }
     var gestureHudSeekForward by remember { mutableStateOf(true) }
     var gestureHudClearSeq by remember { mutableIntStateOf(0) }
-    var manualQualitySelected by remember(streamTarget) { mutableStateOf(false) }
-    var qualityNoticeText by remember(streamTarget) { mutableStateOf<String?>(null) }
-    var qualityNoticeSeq by remember(streamTarget) { mutableIntStateOf(0) }
 
     val originalOrientation = remember(activity) {
         activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -5786,6 +5782,11 @@ private fun ArcPlayerScreen(
     }
 
     val primaryUrl = activeTrack.url.ifBlank { currentTarget.url }
+    val isYouTubeStream = remember(currentTarget, activeTrack, primaryUrl) {
+        currentTarget.targetUrl.contains("youtu", ignoreCase = true) ||
+            primaryUrl.contains("googlevideo.com", ignoreCase = true) ||
+            activeTrack.videoUrl.contains("googlevideo.com", ignoreCase = true)
+    }
     val isOkCdn = remember(activeTrack, primaryUrl) {
         primaryUrl.contains("okcdn", ignoreCase = true) ||
             activeTrack.videoUrl.contains("okcdn", ignoreCase = true) ||
@@ -5870,43 +5871,6 @@ private fun ArcPlayerScreen(
             .build()
     }
 
-    fun stepDownQualityOrFallback(): Boolean {
-        if (currentTarget.isAudioOnlyStream) return false
-        val failedQ = selectedQuality
-        val curHeight = if (failedQ.equals("Best Available", ignoreCase = true)) {
-            selectableQualities
-                .filterNot { it.equals("Best Available", ignoreCase = true) }
-                .maxOfOrNull { q -> Regex("(\\d+)p").find(q)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0 }
-                ?: 2160
-        } else {
-            Regex("(\\d+)p").find(failedQ)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        }
-        val nextQ = selectableQualities
-            .filterNot {
-                it.equals("Best Available", ignoreCase = true) ||
-                    it.equals(failedQ, ignoreCase = true) ||
-                    it in failedQualities
-            }
-            .firstOrNull { q ->
-                val h = Regex("(\\d+)p").find(q)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-                h > 0 && h < curHeight && (currentTarget.qualityTracks.containsKey(q) || currentTarget.qualityUrls.containsKey(q))
-            }
-        if (nextQ != null) {
-            failedQualities = failedQualities + failedQ
-            val curPos = exoPlayer.currentPosition.coerceAtLeast(0L)
-            if (curPos > 0L) resumeSeekMs = curPos
-            lazyProxyUrl = ""
-            usingFallback = false
-            manualQualitySelected = false
-            qualityNoticeText = "$failedQ unavailable on device · Switched to $nextQ"
-            qualityNoticeSeq++
-            Log.w("ArcPlayer", "Stepping down quality '$failedQ' -> '$nextQ' while keeping audio='$selectedAudioLang'")
-            selectedQuality = nextQ
-            return true
-        }
-        return false
-    }
-
     fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean): MediaSource {
         val uri = toPlayerMediaUri(rawUrl)
         val item = MediaItem.fromUri(uri)
@@ -5947,8 +5911,8 @@ private fun ArcPlayerScreen(
                 val expectVideo = !currentTarget.isAudioOnlyStream
                 val expectAudio = activeTrack.audioUrl.isNotBlank() || currentTarget.isAudioOnlyStream
                 val missingTrack = (expectVideo && !selectedVideo) || (expectAudio && !selectedAudio)
-                if (exoPlayer.playbackState == Player.STATE_READY && missingTrack) {
-                    if (!stepDownQualityOrFallback() && !usingFallback && effFallbackUrl.isNotBlank()) {
+                if (!isYouTubeStream && exoPlayer.playbackState == Player.STATE_READY && missingTrack) {
+                    if (!usingFallback && effFallbackUrl.isNotBlank()) {
                         Log.w(
                             "ArcPlayer",
                             "Missing expected track (video=$selectedVideo audio=$selectedAudio); switching to fallback '${activeTrack.fallbackFormat}'"
@@ -5979,6 +5943,9 @@ private fun ArcPlayerScreen(
             }
 
             override fun onPlaybackStateChanged(state: Int) {
+                if (isYouTubeStream && state == Player.STATE_IDLE && playWhenReadyState && playerErrorText == null) {
+                    return
+                }
                 playbackState = state
                 isPlaying = exoPlayer.isPlaying
                 playWhenReadyState = exoPlayer.playWhenReady
@@ -5993,6 +5960,11 @@ private fun ArcPlayerScreen(
 
             override fun onPlayerError(error: PlaybackException) {
                 Log.e("ArcPlayer", "ExoPlayer error (${error.errorCodeName}) usingFallback=$usingFallback quality='$selectedQuality'", error)
+                if (isYouTubeStream) {
+                    // Never auto-switch YouTube quality; keep spinner active until loaded or manually changed
+                    playbackState = Player.STATE_BUFFERING
+                    return
+                }
                 val needsProxyFallback = lazyProxyUrl.isBlank() &&
                     (primaryUrl.contains("hakunaymatata", ignoreCase = true) || primaryUrl.contains("mzfi.me", ignoreCase = true))
                 if (needsProxyFallback) {
@@ -6010,14 +5982,12 @@ private fun ArcPlayerScreen(
                             if (px.isNotBlank()) {
                                 lazyProxyUrl = px
                                 usingFallback = true
-                            } else if (!stepDownQualityOrFallback()) {
+                            } else {
                                 playerErrorText = error.errorCodeName.ifBlank { "Playback error" }
                                 showControls = true
                             }
                         }
                     }
-                } else if (stepDownQualityOrFallback()) {
-                    // Stepped down to lower quality preserving selected audio track
                 } else if (!usingFallback && effFallbackUrl.isNotBlank()) {
                     usingFallback = true
                 } else {
@@ -6061,13 +6031,13 @@ private fun ArcPlayerScreen(
             }
         }.onFailure { err ->
             Log.e("ArcPlayer", "Error preparing media source", err)
-            if (!stepDownQualityOrFallback()) {
-                if (!usingFallback && effFallbackUrl.isNotBlank()) {
-                    usingFallback = true
-                } else {
-                    playerErrorText = err.message ?: "Playback unavailable"
-                    showControls = true
-                }
+            if (isYouTubeStream) {
+                playbackState = Player.STATE_BUFFERING
+            } else if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                usingFallback = true
+            } else {
+                playerErrorText = err.message ?: "Playback unavailable"
+                showControls = true
             }
         }.getOrNull()
 
@@ -6086,28 +6056,25 @@ private fun ArcPlayerScreen(
                 exoPlayer.playWhenReady = true
             }.onFailure { err ->
                 Log.e("ArcPlayer", "ExoPlayer prepare failed", err)
-                if (!stepDownQualityOrFallback()) {
-                    if (!usingFallback && effFallbackUrl.isNotBlank()) {
-                        usingFallback = true
-                    } else {
-                        playerErrorText = err.message ?: "Playback error"
-                        showControls = true
-                    }
+                if (isYouTubeStream) {
+                    playbackState = Player.STATE_BUFFERING
+                } else if (!usingFallback && effFallbackUrl.isNotBlank()) {
+                    usingFallback = true
+                } else {
+                    playerErrorText = err.message ?: "Playback error"
+                    showControls = true
                 }
             }
         }
     }
 
-    // Startup stall watchdog: step down quality cleanly before falling back to muxed stream
-    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, manualQualitySelected, retryCounter) {
-        if (!manualQualitySelected && !usingFallback && !currentTarget.isAudioOnlyStream && (effFallbackUrl.isNotBlank() || selectableQualities.size > 1)) {
-            val isUltraHd = selectedQuality.contains("2160") || selectedQuality.contains("1440") || selectedQuality.equals("Best Available", ignoreCase = true)
-            delay(if (isUltraHd) 10_500L else 6_500L)
+    // Startup stall watchdog: non-YouTube fallback only (YouTube keeps chosen quality with spinner until changed)
+    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, isYouTubeStream, retryCounter) {
+        if (!isYouTubeStream && !usingFallback && !currentTarget.isAudioOnlyStream && effFallbackUrl.isNotBlank()) {
+            delay(6500L)
             if (playbackState == Player.STATE_BUFFERING && exoPlayer.currentPosition <= 0L && playerErrorText == null) {
-                Log.w("ArcPlayer", "Startup buffering stall on '$selectedQuality'; stepping down or switching to fallback")
-                if (!stepDownQualityOrFallback() && effFallbackUrl.isNotBlank()) {
-                    usingFallback = true
-                }
+                Log.w("ArcPlayer", "Startup buffering stall (>6.5s at 0:00); switching to fallback stream")
+                usingFallback = true
             }
         }
     }
@@ -6156,13 +6123,6 @@ private fun ArcPlayerScreen(
         }
     }
 
-    LaunchedEffect(qualityNoticeSeq) {
-        if (qualityNoticeSeq > 0) {
-            delay(3000L)
-            qualityNoticeText = null
-        }
-    }
-
     DisposableEffect(Unit) {
         onDispose {
             runCatching {
@@ -6182,7 +6142,7 @@ private fun ArcPlayerScreen(
 
     val controlSurfaceColor = ArcSurface.copy(alpha = 0.88f)
     val controlBorder = BorderStroke(1.dp, Color(0xFF2C2C2C))
-    val isActuallyBuffering = playbackState == Player.STATE_BUFFERING && playWhenReadyState && playerErrorText == null
+    val isActuallyBuffering = (playbackState == Player.STATE_BUFFERING || (isYouTubeStream && playbackState == Player.STATE_IDLE)) && playWhenReadyState && playerErrorText == null
     val displayPosMs = if (isScrubbing && durationMs > 0L) (scrubFraction * durationMs).toLong() else positionMs
     val sliderFraction = if (durationMs > 0L) {
         (if (isScrubbing) scrubFraction else (positionMs.toFloat() / durationMs.toFloat())).coerceIn(0f, 1f)
@@ -6414,26 +6374,7 @@ private fun ArcPlayerScreen(
             }
         }
 
-        // Brightness / Volume / Seek swipe HUD or Quality Notice pill
-        if (gestureHudLabel == null && qualityNoticeText != null) {
-            Surface(
-                color = controlSurfaceColor,
-                shape = RoundedCornerShape(16.dp),
-                border = controlBorder,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = 72.dp),
-            ) {
-                Text(
-                    text = qualityNoticeText.orEmpty(),
-                    color = ArcWhite,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                )
-            }
-        }
+        // Brightness / Volume / Seek swipe HUD
         if (gestureHudLabel != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = controlSurfaceColor),
@@ -6914,16 +6855,14 @@ private fun ArcPlayerScreen(
                                 FilterChip(
                                     selected = isSel,
                                     onClick = {
-                                        manualQualitySelected = true
-                                        failedQualities = failedQualities - qOpt
-                                        usingFallback = false
-                                        playerErrorText = null
-                                        resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-                                        lazyProxyUrl = ""
-                                        selectedQuality = qOpt
-                                        retryCounter++
-                                        qualityNoticeText = "Switching to $qOpt..."
-                                        qualityNoticeSeq++
+                                        if (!isSel) {
+                                            usingFallback = false
+                                            playerErrorText = null
+                                            resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                            lazyProxyUrl = ""
+                                            selectedQuality = qOpt
+                                            retryCounter++
+                                        }
                                         showSettingsSheet = false
                                         interactionTick++
                                     },
