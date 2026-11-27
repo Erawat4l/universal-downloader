@@ -6,6 +6,6 @@ or copies the engine, so a fix to dl.py improves the CLI, the APK and the .exe
 at the same time.
 """
 
-__version__ = "1.0.0"
-APP_NAME = "Arc"
-APP_LONG_NAME = "Arc - Universal Downloader"
+__version__ = "1.0.79"
+APP_NAME = "ARC"
+APP_LONG_NAME = "ARC - Universal Downloader"

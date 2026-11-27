@@ -6,6 +6,7 @@ engine. That split keeps this file free of threading and JSON handling.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import theme
+from ..models import prioritize_audio_choices
 from ..store import human_size
 from .widgets import (
     AsyncImage, ChipBar, EmptyState, JobCard, LibraryCard, SectionHeader,
@@ -70,6 +72,7 @@ class _ScrollPage(QScrollArea):
 # =====================================================================  HOME
 class HomePage(QWidget):
     analyze_requested = Signal(str)
+    pick_torrent_requested = Signal(str)
     library_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -123,6 +126,11 @@ class HomePage(QWidget):
 
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
+        self.torrent_button = QPushButton(".torrent")
+        self.torrent_button.setObjectName("Ghost")
+        self.torrent_button.setCursor(Qt.PointingHandCursor)
+        self.torrent_button.setToolTip("Open local .torrent file")
+        self.torrent_button.clicked.connect(self._pick_torrent)
         self.paste_button = QPushButton("Paste")
         self.paste_button.setObjectName("Ghost")
         self.paste_button.setCursor(Qt.PointingHandCursor)
@@ -131,6 +139,7 @@ class HomePage(QWidget):
         self.analyze_button.setObjectName("Primary")
         self.analyze_button.setCursor(Qt.PointingHandCursor)
         self.analyze_button.clicked.connect(self._submit)
+        button_row.addWidget(self.torrent_button)
         button_row.addWidget(self.paste_button)
         button_row.addWidget(self.analyze_button, 1)
         input_layout.addLayout(button_row)
@@ -163,6 +172,9 @@ class HomePage(QWidget):
         self.status_pill.set_text("Working..." if busy else "Ready",
                                   theme.ARC_WARNING if busy else theme.ARC_MUTED)
 
+    def set_status_pill(self, text: str, color: Optional[str] = None) -> None:
+        self.status_pill.set_text(text, color or theme.ARC_MUTED)
+
     def set_recent(self, entries: list[dict], on_open, on_folder, on_delete) -> None:
         for old in self._recent_cards:
             old.deleteLater()
@@ -190,6 +202,14 @@ class HomePage(QWidget):
         if clipboard:
             self.input_field.setText(clipboard)
             self.input_field.setFocus()
+
+    def _pick_torrent(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select .torrent file", "", "Torrent Files (*.torrent);;All Files (*)"
+        )
+        if path:
+            self.input_field.setText(path)
+            self.pick_torrent_requested.emit(path)
 
 
 def QApplication_clipboard() -> str:
@@ -281,18 +301,36 @@ class SearchPage(QWidget):
             name = QLabel(str(hit.get("title", "Untitled")))
             name.setStyleSheet("font-size: 14px; font-weight: 700;")
             name.setWordWrap(True)
-            meta_bits = [str(hit.get("source", "") or hit.get("type", "")).upper()]
-            if str(hit.get("year", "")).strip():
-                meta_bits.append(str(hit.get("year")))
-            providers = hit.get("providers") or []
-            if isinstance(providers, list):
-                providers_text = " \u00b7 ".join(str(p) for p in providers if str(p).strip())
+            hit_url = str(hit.get("url", "") or "").lower()
+            hit_src = str(hit.get("source", "") or "").strip()
+            hit_type = str(hit.get("type", "") or "").strip()
+            is_igl = (
+                hit_url.startswith("igl:")
+                or hit_src.lower() == "arc"
+                or "latent" in hit_src.lower()
+                or "latent" in str(hit.get("title", "")).lower()
+                or hit_type.upper() == "IGL"
+            )
+            if is_igl:
+                meta_text = "ARC"
             else:
-                providers_text = str(providers).strip()
-            if providers_text:
-                meta_bits.append(providers_text)
+                providers = hit.get("providers") or []
+                if isinstance(providers, list):
+                    prov_text = " \u00b7 ".join(str(p).strip() for p in providers if str(p).strip())
+                else:
+                    prov_text = str(providers).strip()
+                clean_src = prov_text or (
+                    hit_src if hit_src and hit_src.lower() not in ("netmirror", "movie", "tv series") else hit_type
+                )
+                meta_bits = []
+                if clean_src:
+                    meta_bits.append(clean_src)
+                yr = str(hit.get("year", "") or "").strip()
+                if yr and yr != "0":
+                    meta_bits.append(yr)
+                meta_text = "  \u00b7  ".join(meta_bits)
             column.addWidget(name)
-            column.addWidget(label("  \u00b7  ".join(b for b in meta_bits if b), "Meta"))
+            column.addWidget(label(meta_text, "Meta"))
             column.addStretch(1)
             row.addLayout(column, 1)
             arrow = QLabel("\u203A")
@@ -300,7 +338,7 @@ class SearchPage(QWidget):
             row.addWidget(arrow, 0, Qt.AlignVCenter)
             item_layout.addLayout(row)
 
-            audios = hit.get("audios") or []
+            audios = prioritize_audio_choices(list(hit.get("audios") or []))
             chips = ChipBar()
             if audios:
                 chips.set_items([str(a.get("language", "Default")) for a in audios])
@@ -532,14 +570,34 @@ class AnalysisPage(QWidget):
 
         season = int(target.get("selected_season") or 1)
         episode = int(target.get("selected_episode") or 1)
-        if is_series:
-            self.badge_label.setText(f"TV SERIES  \u00b7  S{season}E{episode}")
+        year_val = str(target.get("year") or "").strip()
+        year_badge = f"  \u00b7  {year_val}" if year_val and year_val != "0" else ""
+        providers_val = str(target.get("providers") or "").strip()
+        target_url_l = str(target.get("target_url") or target.get("url") or "").lower()
+        src_val = str(target.get("source") or "").strip()
+        is_igl = target_url_l.startswith("igl:") or "latent" in src_val.lower() or "igl" in src_val.lower()
+        is_yt = "youtube" in src_val.lower() or "youtu" in target_url_l
+        is_torrent = media_type == "torrent" or target_url_l.startswith("magnet:") or "torrent" in src_val.lower()
+
+        if is_igl:
+            self.badge_label.setText("IGL  \u00b7  ARC")
+        elif is_torrent:
+            self.badge_label.setText("TORRENT")
         elif is_file:
             self.badge_label.setText("FILE")
+        elif is_series:
+            base = providers_val.upper() if providers_val else f"TV SERIES  \u00b7  S{season}E{episode}"
+            self.badge_label.setText(f"{base}{year_badge}" if providers_val else base)
         elif is_playlist:
             self.badge_label.setText("PLAYLIST")
+        elif is_yt:
+            self.badge_label.setText("YOUTUBE")
+        elif providers_val:
+            self.badge_label.setText(f"{providers_val.upper()}{year_badge}")
+        elif src_val and src_val.lower() not in ("stream", "netmirror", "movie", "direct file"):
+            self.badge_label.setText(f"{src_val.upper()}{year_badge}")
         else:
-            self.badge_label.setText(str(target.get("source", "")).upper() or "MOVIE")
+            self.badge_label.setText(f"MOVIE{year_badge}")
 
         title = str(target.get("title", "")).strip()
         if is_series:
@@ -575,9 +633,9 @@ class AnalysisPage(QWidget):
             self.episode_header.set_title("Episode")
             self.episode_chips.set_items([f"E{n}" for n in range(1, count + 1)], f"E{episode}")
 
-        # audio language choices carried over from the search hit
+        # audio language choices carried over from search hit or resolve
         languages = target.get("audio_languages") or []
-        show_audio = len(languages) > 1
+        show_audio = bool(languages) and (len(languages) > 1 or bool(target.get("selected_audio_lang")))
         self.audio_header.setVisible(show_audio)
         self.audio_chips.setVisible(show_audio)
         if show_audio:
@@ -618,16 +676,19 @@ class AnalysisPage(QWidget):
 
         self.download_button.setText(
             f"Download Playlist \u00b7 {len(entries)} items" if is_playlist
-            else ("Download File" if is_file else f"Download {quality}")
+            else ("Download Torrent" if is_torrent
+                  else ("Download File" if is_file else f"Download {quality}"))
         )
         self.download_button.setEnabled(True)
-        self.stream_button.setVisible(not is_file)
-        self.copy_button.setVisible(not is_file)
-        self.stream_type_header.setVisible(not is_file)
-        self.video_chip.setVisible(not is_file)
-        self.audio_chip.setVisible(not is_file)
-        self.quality_header.setVisible(not is_file)
-        self.quality_combo.setVisible(not is_file)
+        can_play_stream = can_stream and media_type != "file" and not is_torrent
+        show_stream_type = can_play_stream and is_yt
+        self.stream_button.setVisible(can_play_stream)
+        self.copy_button.setVisible(can_play_stream)
+        self.stream_type_header.setVisible(show_stream_type)
+        self.video_chip.setVisible(show_stream_type)
+        self.audio_chip.setVisible(show_stream_type)
+        self.quality_header.setVisible(can_play_stream)
+        self.quality_combo.setVisible(can_play_stream)
         self.video_chip.setChecked(not audio_only)
         self.audio_chip.setChecked(audio_only)
 
@@ -697,6 +758,7 @@ class ActivityPage(QWidget):
     cancel_requested = Signal(str)
     dismiss_requested = Signal(str)
     open_requested = Signal(str)
+    copy_logs_requested = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -727,7 +789,7 @@ class ActivityPage(QWidget):
 
     def set_jobs(self, jobs: list[dict]) -> None:
         visible = [j for j in jobs if str(j.get("status")) in
-                   ("Downloading", "Queued", "Paused", "Failed", "Cancelled")]
+                   ("Downloading", "Muxing", "Queued", "Paused", "Failed", "Cancelled")]
         live_ids = {str(j.get("id")) for j in visible}
         for job_id in list(self._cards):
             if job_id not in live_ids:
@@ -747,6 +809,7 @@ class ActivityPage(QWidget):
                 card_widget.cancel_clicked.connect(lambda j: self.cancel_requested.emit(j))
                 card_widget.dismiss_clicked.connect(lambda j: self.dismiss_requested.emit(j))
                 card_widget.open_clicked.connect(lambda j: self.open_requested.emit(j))
+                card_widget.logs_clicked.connect(lambda j: self.copy_logs_requested.emit(j))
                 self.jobs_host.insertWidget(0, card_widget)
                 self._cards[job_id] = card_widget
             else:
@@ -835,8 +898,14 @@ class SettingsPage(QWidget):
     audio_quality_changed = Signal(str)
     notifications_changed = Signal(bool)
     prefer_vlc_changed = Signal(bool)
+    player_dialog_requested = Signal()
+    telegram_auth_requested = Signal()
+    telegram_logout_requested = Signal()
     telegram_test_requested = Signal(str, str, str)
     telegram_saved = Signal(str, str, str)
+    google_login_requested = Signal()
+    google_disconnect_requested = Signal()
+    about_requested = Signal()
     scan_requested = Signal()
     install_requested = Signal(str)
 
@@ -909,10 +978,24 @@ class SettingsPage(QWidget):
 
         # -------------------------------------------------------- preferences
         self._scroll.add(self._group("Preferences"))
+        player_card, player_layout = card("horizontal", 10, 14, "Card")
+        player_col = QVBoxLayout()
+        player_col.setSpacing(2)
+        player_col.addWidget(label("Streaming Player", "SectionHeader"))
+        self.streaming_player_label = label("ARC Player (Built-in)", "Meta")
+        player_col.addWidget(self.streaming_player_label)
+        player_layout.addLayout(player_col, 1)
+        self.player_change_btn = QPushButton("Change")
+        self.player_change_btn.setObjectName("Ghost")
+        self.player_change_btn.setCursor(Qt.PointingHandCursor)
+        self.player_change_btn.clicked.connect(lambda: self.player_dialog_requested.emit())
+        player_layout.addWidget(self.player_change_btn)
+        self._scroll.add(player_card)
+
         pref_card, pref_layout = card("vertical", 4, 14, "Card")
         self.notifications_check = QCheckBox("Notify me when a download finishes")
         self.notifications_check.toggled.connect(lambda v: self.notifications_changed.emit(v))
-        self.vlc_check = QCheckBox("Prefer VLC for streaming (falls back to the default player)")
+        self.vlc_check = QCheckBox("Prefer VLC when external streaming is selected")
         self.vlc_check.toggled.connect(lambda v: self.prefer_vlc_changed.emit(v))
         pref_layout.addWidget(self.notifications_check)
         pref_layout.addWidget(self.vlc_check)
@@ -920,9 +1003,50 @@ class SettingsPage(QWidget):
 
         # ------------------------------------------------------- integrations
         self._scroll.add(self._group("Integrations"))
+        google_card, google_layout = card("horizontal", 10, 14, "Card")
+        g_col = QVBoxLayout()
+        g_col.setSpacing(2)
+        self.google_title_lbl = label("Google Account (YouTube)", "SectionHeader")
+        self.google_sub_lbl = label("Optional \u00b7 YouTube authentication", "Meta")
+        g_col.addWidget(self.google_title_lbl)
+        g_col.addWidget(self.google_sub_lbl)
+        google_layout.addLayout(g_col, 1)
+        self.google_manage_btn = QPushButton("Configure")
+        self.google_manage_btn.setObjectName("Ghost")
+        self.google_manage_btn.setCursor(Qt.PointingHandCursor)
+        self.google_manage_btn.clicked.connect(lambda: self.google_login_requested.emit())
+        self.google_disc_btn = QPushButton("Disconnect")
+        self.google_disc_btn.setObjectName("Ghost")
+        self.google_disc_btn.setStyleSheet(f"color: {theme.ARC_ERROR};")
+        self.google_disc_btn.setCursor(Qt.PointingHandCursor)
+        self.google_disc_btn.setVisible(False)
+        self.google_disc_btn.clicked.connect(lambda: self.google_disconnect_requested.emit())
+        google_layout.addWidget(self.google_manage_btn)
+        google_layout.addWidget(self.google_disc_btn)
+        self._scroll.add(google_card)
+
         tg_card, tg_layout = card("vertical", 9, 14, "Card")
-        tg_layout.addWidget(label("Telegram Session (MTProto)", "SectionHeader"))
-        tg_layout.addWidget(label("Private channel access", "Meta"))
+        tg_head = QHBoxLayout()
+        tg_head_col = QVBoxLayout()
+        tg_head_col.setSpacing(2)
+        self.tg_head_lbl = label("Telegram Session (MTProto)", "SectionHeader")
+        self.tg_sub_lbl = label("Private channel access \u00b7 QR, Phone OTP or Session", "Meta")
+        tg_head_col.addWidget(self.tg_head_lbl)
+        tg_head_col.addWidget(self.tg_sub_lbl)
+        tg_head.addLayout(tg_head_col, 1)
+        self.tg_auth_btn = QPushButton("Login (QR / OTP)")
+        self.tg_auth_btn.setObjectName("Chip")
+        self.tg_auth_btn.setCursor(Qt.PointingHandCursor)
+        self.tg_auth_btn.clicked.connect(lambda: self.telegram_auth_requested.emit())
+        self.tg_logout_btn = QPushButton("Sign Out")
+        self.tg_logout_btn.setObjectName("Ghost")
+        self.tg_logout_btn.setStyleSheet(f"color: {theme.ARC_ERROR};")
+        self.tg_logout_btn.setVisible(False)
+        self.tg_logout_btn.clicked.connect(lambda: self.telegram_logout_requested.emit())
+        tg_head.addWidget(self.tg_auth_btn)
+        tg_head.addWidget(self.tg_logout_btn)
+        tg_layout.addLayout(tg_head)
+
         self.tg_id = QLineEdit()
         self.tg_id.setPlaceholderText("API ID (numeric)")
         self.tg_hash = QLineEdit()
@@ -953,6 +1077,21 @@ class SettingsPage(QWidget):
         tg_buttons.addStretch(1)
         tg_layout.addLayout(tg_buttons)
         self._scroll.add(tg_card)
+
+        # -------------------------------------------------------------- about
+        self._scroll.add(self._group("About"))
+        about_card, about_layout = card("horizontal", 10, 14, "Card")
+        about_col = QVBoxLayout()
+        about_col.setSpacing(2)
+        about_col.addWidget(label("About ARC Features", "SectionHeader"))
+        about_col.addWidget(label("What ARC Desktop can do", "Meta"))
+        about_layout.addLayout(about_col, 1)
+        self.about_btn = QPushButton("View")
+        self.about_btn.setObjectName("Ghost")
+        self.about_btn.setCursor(Qt.PointingHandCursor)
+        self.about_btn.clicked.connect(lambda: self.about_requested.emit())
+        about_layout.addWidget(self.about_btn)
+        self._scroll.add(about_card)
 
         self._scroll.add_stretch()
         self._accel_rows: list[QWidget] = []
@@ -1037,12 +1176,32 @@ class SettingsPage(QWidget):
                 f"color: {theme.ARC_ERROR if error else theme.ARC_WARNING}; font-size: 10px;"
             )
 
-    def set_telegram(self, api_id: str, api_hash: str, session: str) -> None:
+    def set_streaming_player_name(self, name: str) -> None:
+        self.streaming_player_label.setText(name or "ARC Player (Built-in)")
+
+    def set_google_account(self, email: str, has_cookies: bool) -> None:
+        if has_cookies:
+            self.google_title_lbl.setText(email or "Google Account")
+            self.google_sub_lbl.setText("Connected \u00b7 YouTube playback authenticated")
+            self.google_disc_btn.setVisible(True)
+        else:
+            self.google_title_lbl.setText("Google Account (YouTube)")
+            self.google_sub_lbl.setText("Optional \u00b7 YouTube authentication")
+            self.google_disc_btn.setVisible(False)
+
+    def set_telegram(self, api_id: str, api_hash: str, session: str, user: str = "", phone: str = "") -> None:
         self.tg_id.setText(api_id or "")
         self.tg_hash.setText(api_hash or "")
         self.tg_session.setText(session or "")
-        self.tg_status.setText("Saved on this PC." if session else "Not configured.")
-        self.tg_status.setStyleSheet(f"color: {theme.ARC_MUTED}; font-size: 11px;")
+        connected = bool((session or "").strip())
+        self.tg_logout_btn.setVisible(connected)
+        if connected:
+            who = user or phone or "Telegram User"
+            self.tg_status.setText(f"Connected as {who} (Saved on this PC).")
+            self.tg_status.setStyleSheet(f"color: {theme.ARC_SUCCESS}; font-size: 11px; font-weight: 600;")
+        else:
+            self.tg_status.setText("Not configured.")
+            self.tg_status.setStyleSheet(f"color: {theme.ARC_MUTED}; font-size: 11px;")
 
     def set_telegram_busy(self, busy: bool) -> None:
         self.tg_test_button.setEnabled(not busy)

@@ -35,28 +35,52 @@ hidden = [
     "requests", "urllib3", "bs4", "json", "hashlib", "signal",
     # Media extraction: yt-dlp discovers its extractors dynamically
     "yt_dlp", "yt_dlp.utils", "yt_dlp.extractor",
-    # Telegram
-    "pyrogram", "pyaes", "tgcrypto",
+    # Telegram & QR login
+    "pyrogram", "pyaes", "tgcrypto", "qrcode",
     # NetMirror AES-GCM stream decryption (either backend is enough)
     "Cryptodome", "Cryptodome.Cipher", "Cryptodome.Cipher.AES",
     "cryptography", "cryptography.hazmat.primitives.ciphers.aead",
-    # Qt: QtNetwork fetches posters, Svg is used by some Qt styles
+    # Qt: QtNetwork (posters), QtMultimedia/QtMultimediaWidgets (in-app ARC Player)
     "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "PySide6.QtNetwork",
+    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
 ]
-for package in ("yt_dlp", "pyrogram"):
+for package in ("yt_dlp", "pyrogram", "qrcode"):
     try:
         hidden += collect_submodules(package)
     except Exception:
         pass
 hidden = sorted(set(hidden))
 
+binaries = []
+if os.environ.get("ARC_BUNDLE_ARIA2", "") == "1":
+    import shutil
+    aria_candidates = []
+    which_aria = shutil.which("aria2c")
+    if which_aria:
+        aria_candidates.append(Path(which_aria))
+    choco_lib = Path(r"C:\ProgramData\chocolatey\lib\aria2")
+    if choco_lib.is_dir():
+        aria_candidates.extend(choco_lib.rglob("aria2c.exe"))
+    for cand in aria_candidates:
+        try:
+            real_cand = cand.resolve()
+            # Chocolatey bin/aria2c.exe shims are ~10KB; real aria2c.exe is several MB.
+            if real_cand.is_file() and real_cand.stat().st_size > 500_000:
+                binaries.append((str(real_cand), "bin"))
+                break
+        except Exception:
+            continue
+
 datas = list(ENGINE_DATA)
 font_path = HERE / "assets" / "Roboto-Variable.ttf"
 font_license = HERE / "assets" / "Roboto-OFL.txt"
+icon_data_path = HERE / "assets" / "arc.ico"
 if font_path.is_file():
     datas.append((str(font_path), "assets"))
 if font_license.is_file():
     datas.append((str(font_license), "assets"))
+if icon_data_path.is_file():
+    datas.append((str(icon_data_path), "assets"))
 for package in ("yt_dlp",):
     try:
         datas += collect_data_files(package)
@@ -69,7 +93,7 @@ excludes = [
     "IPython", "jupyter", "notebook", "pytest", "setuptools", "pip",
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
-    "PySide6.QtMultimedia", "PySide6.QtBluetooth", "PySide6.QtNfc",
+    "PySide6.QtBluetooth", "PySide6.QtNfc",
     "PySide6.QtPositioning", "PySide6.QtSensors", "PySide6.QtSerialPort",
     "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtCharts", "PySide6.QtDataVisualization",
     "PySide6.QtPdf", "PySide6.QtRemoteObjects", "PySide6.QtScxml", "PySide6.QtStateMachine",
@@ -89,7 +113,7 @@ a = Analysis(
     # imports at startup ("attempted relative import with no known parent package").
     [str(HERE / "launcher.py")],
     pathex=[str(HERE), str(REPO)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
@@ -108,7 +132,7 @@ exe = EXE(
     a.binaries if ONEFILE else [],
     a.datas if ONEFILE else [],
     [],
-    name="Arc",
+    name="ARC",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -133,5 +157,5 @@ if not ONEFILE:
         strip=False,
         upx=False,
         upx_exclude=[],
-        name="Arc",
+        name="ARC",
     )

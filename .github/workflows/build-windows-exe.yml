@@ -100,12 +100,14 @@ jobs:
 
       - name: Build
         working-directory: desktop-app
+        env:
+          ARC_BUNDLE_ARIA2: "1"
         run: python build_exe.py --skip-checks --onefile
 
       - name: Smoke-test the frozen exe
         working-directory: desktop-app
         run: |
-          $exe = "dist\Arc.exe"
+          $exe = "dist\ARC.exe"
           if (-not (Test-Path $exe)) { throw "Build produced no exe at $exe" }
           $size = (Get-Item $exe).Length / 1MB
           Write-Host ("{0} -> {1:N1} MB" -f $exe, $size)
@@ -118,23 +120,23 @@ jobs:
             Wait-Process -Id $proc.Id -Timeout 180 -ErrorAction Stop
           } catch {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            throw "Frozen Arc self-test timed out or failed to exit: $_"
+            throw "Frozen ARC self-test timed out or failed to exit: $_"
           }
           $proc.Refresh()
           if ($proc.ExitCode -ne 0) {
-            throw "Frozen Arc self-test exited with code $($proc.ExitCode)"
+            throw "Frozen ARC self-test exited with code $($proc.ExitCode)"
           }
-          Write-Host "Frozen Arc self-test passed (exit code 0)"
+          Write-Host "Frozen ARC self-test passed (exit code 0)"
 
       - name: Package
         working-directory: desktop-app
-        run: Copy-Item dist\Arc.exe Arc-windows-x64.exe
+        run: Copy-Item dist\ARC.exe ARC.exe -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: arc-desktop-onefile
-          path: desktop-app/Arc-windows-x64.exe
+          path: desktop-app/ARC.exe
           if-no-files-found: error
           retention-days: 30
 

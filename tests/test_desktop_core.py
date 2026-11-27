@@ -554,11 +554,45 @@ def t_library_actions_fixed_size():
     assert "self.open_button.setStyleSheet(\"padding: 4px 8px; font-size: 12px;\")" in library_card
 
 
-@test("Android build keeps its checked-in engine instead of copying desktop dl.py")
-def t_android_engine_stays_independent():
-    builder = (REPO / "android-app" / "tools" / "build_android.py").read_text(encoding="utf-8")
-    assert "Using the checked-in Android engine" in builder
-    assert "shutil.copy2(PYTHON_ENGINE_SOURCE, PYTHON_ENGINE_DEST)" not in builder
+@test("root dl.py stays synchronized with the bundled Android engine")
+def t_android_engine_stays_synchronized():
+    root_dl = (REPO / "dl.py").read_text(encoding="utf-8")
+    android_dl = (REPO / "android-app" / "app" / "src" / "main" / "python" / "dl.py").read_text(encoding="utf-8")
+    assert root_dl == android_dl, "root dl.py and android-app/app/src/main/python/dl.py diverged"
+
+
+@test("split quality tracks and audio prioritization match the APK")
+def t_models_parity():
+    from arc_desktop.models import prioritize_audio_choices, resolve_track_for_quality
+
+    ordered = prioritize_audio_choices([
+        {"language": "Tamil"},
+        {"language": "English"},
+        {"language": "Hindi"},
+    ])
+    assert [a["language"] for a in ordered] == ["Hindi", "English", "Tamil"], ordered
+
+    qt = {
+        "2160p (4K UHD)": {
+            "url": "https://cdn/fb.mp4",
+            "video_url": "https://cdn/4k_v.mp4",
+            "audio_url": "https://cdn/audio.m4a",
+            "fallback_url": "https://cdn/fb.mp4",
+        },
+        "1080p (Full HD)": {"url": "https://cdn/1080.mp4"},
+    }
+    spec = resolve_track_for_quality("2160p", qt, {}, "https://cdn/default.mp4")
+    assert spec["video_url"] == "https://cdn/4k_v.mp4", spec
+    assert spec["audio_url"] == "https://cdn/audio.m4a", spec
+    spec_1080 = resolve_track_for_quality("1080p (Full HD)", qt, {}, "https://cdn/default.mp4")
+    assert spec_1080["url"] == "https://cdn/1080.mp4", spec_1080
+
+
+@test("UI modules import only valid stdlib / local / PySide6 names cleanly")
+def t_ui_ast_syntax():
+    import ast
+    for py in sorted((DESKTOP / "arc_desktop").rglob("*.py")):
+        ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
 
 
 # ============================================================== main

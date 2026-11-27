@@ -24,21 +24,60 @@ IS_MACOS = sys.platform == "darwin"
 ACCELERATORS = ("aria2c", "ffmpeg", "yt-dlp", "ffprobe", "node")
 
 
+def bundled_bin_dirs() -> list[Path]:
+    """Candidate folders holding binaries shipped inside the frozen bundle."""
+    dirs: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass) / "bin")
+        dirs.append(Path(meipass))
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        dirs.append(exe_dir / "bin")
+        dirs.append(exe_dir)
+    return dirs
+
+
 def which(name: str) -> str | None:
-    """Locate an executable, also checking the usual Windows install spots."""
+    """Locate an executable across bundled bin/, PATH, and Windows install folders."""
+    exe = f"{name}.exe" if IS_WINDOWS and not name.lower().endswith(".exe") else name
+    for folder in bundled_bin_dirs():
+        cand = folder / exe
+        if cand.is_file():
+            return str(cand)
+
     found = shutil.which(name)
     if found:
         return found
     if not IS_WINDOWS:
         return None
-    exe = f"{name}.exe"
+
     local = os.environ.get("LOCALAPPDATA", "")
-    candidates = []
+    userprofile = os.environ.get("USERPROFILE", "")
+    programdata = os.environ.get("ProgramData", r"C:\ProgramData")
+    candidates: list[Path] = []
     if local:
         candidates += [
             Path(local) / "Microsoft" / "WinGet" / "Links" / exe,
             Path(local) / "Programs" / name / "bin" / exe,
+            Path(local) / "Programs" / name / exe,
         ]
+        winget_pkgs = Path(local) / "Microsoft" / "WinGet" / "Packages"
+        if winget_pkgs.is_dir():
+            for match in winget_pkgs.glob(f"**/{exe}"):
+                candidates.append(match)
+    if userprofile:
+        candidates += [
+            Path(userprofile) / "scoop" / "shims" / exe,
+            Path(userprofile) / "scoop" / "apps" / name / "current" / "bin" / exe,
+            Path(userprofile) / "scoop" / "apps" / name / "current" / exe,
+        ]
+    choco_lib = Path(programdata) / "chocolatey" / "lib"
+    if choco_lib.is_dir():
+        for match in choco_lib.glob(f"**/{exe}"):
+            candidates.append(match)
+    candidates.append(Path(programdata) / "chocolatey" / "bin" / exe)
+
     for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
                  os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
         if not base:
@@ -49,19 +88,41 @@ def which(name: str) -> str | None:
             Path(base) / "VideoLAN" / "VLC" / exe,
         ]
     for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 100_000:
+                return str(candidate)
+        except OSError:
+            continue
+    for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     return None
 
 
-def detect_accelerators() -> dict:
-    """Report which optional helpers are installed.
+def register_binary_paths_on_env() -> dict[str, str]:
+    """Ensure bundled or system aria2c/ffmpeg are discoverable via PATH & dl hooks."""
+    found: dict[str, str] = {}
+    extra_dirs: list[str] = []
+    for name in ("aria2c", "ffmpeg", "ffprobe", "yt-dlp", "node"):
+        path = which(name)
+        if path:
+            found[name] = path
+            parent = str(Path(path).resolve().parent)
+            if parent not in extra_dirs:
+                extra_dirs.append(parent)
+    if extra_dirs:
+        cur_path = os.environ.get("PATH", "")
+        cur_parts = cur_path.split(os.pathsep) if cur_path else []
+        missing = [d for d in extra_dirs if d not in cur_parts]
+        if missing:
+            os.environ["PATH"] = os.pathsep.join(missing + cur_parts)
+    if "aria2c" in found:
+        os.environ["ARIA2C_PATH"] = found["aria2c"]
+    return found
 
-    The APK bundles none of these, which is why every download there falls back
-    to the single-connection Python loop in download_file_stream(). On Windows,
-    aria2c switches the engine onto its 16-connection path and ffmpeg enables
-    real video+audio merging.
-    """
+
+def detect_accelerators() -> dict:
+    """Report which optional helpers are installed."""
     return {name: which(name) for name in ACCELERATORS}
 
 
@@ -140,21 +201,33 @@ def reveal_in_folder(path: str) -> bool:
         return False
 
 
-def play_stream(proxy_url: str, direct_url: str = "", title: str = "") -> tuple[bool, str]:
-    """Hand a stream to VLC when installed, otherwise the default player.
-
-    Always prefers the local proxy URL: the raw CDN link 403s for the hosts that
-    check Referer, which is the whole reason dl.py runs a proxy.
-    """
+def play_stream(
+    proxy_url: str,
+    direct_url: str = "",
+    title: str = "",
+    audio_url: str = "",
+    headers: dict | None = None,
+    prefer_vlc: bool = True,
+) -> tuple[bool, str]:
+    """Hand a stream to VLC when requested/installed, otherwise default handler."""
     target = proxy_url or direct_url
     if not target:
         return False, "No stream URL to play."
-    vlc = find_vlc()
+    vlc = find_vlc() if prefer_vlc else None
     try:
         if vlc:
             command = [vlc]
             if title:
                 command += [f"--meta-title={title}"]
+            if audio_url and audio_url != target:
+                command += [f"--input-slave={audio_url}"]
+            if headers and "127.0.0.1" not in target:
+                ua = headers.get("User-Agent") or headers.get("user-agent")
+                ref = headers.get("Referer") or headers.get("referer")
+                if ua:
+                    command += [f"--http-user-agent={ua}"]
+                if ref:
+                    command += [f"--http-referrer={ref}"]
             command.append(target)
             subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True, f"Streaming in VLC: {vlc}"
@@ -167,6 +240,36 @@ def play_stream(proxy_url: str, direct_url: str = "", title: str = "") -> tuple[
         return True, "Streaming in the default player."
     except Exception as error:
         return False, f"Could not launch a player: {error}"
+
+
+def extract_browser_youtube_cookies(browser: str) -> tuple[bool, str, str]:
+    """Read YouTube/Google cookies from a local browser in Netscape cookie text format."""
+    name = (browser or "").strip().lower()
+    if name not in ("chrome", "edge", "firefox", "brave", "opera"):
+        return False, "", f"Unsupported browser: {browser}"
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+        jar = extract_cookies_from_browser(name)
+        lines = ["# Netscape HTTP Cookie File"]
+        count = 0
+        for cookie in jar:
+            dom = str(getattr(cookie, "domain", "") or "")
+            if not any(h in dom.lower() for h in ("youtube.com", "google.com", "youtu.be", "ytimg.com")):
+                continue
+            include_sub = "TRUE" if dom.startswith(".") else "FALSE"
+            path = str(getattr(cookie, "path", "/") or "/")
+            secure = "TRUE" if getattr(cookie, "secure", False) else "FALSE"
+            expires = str(int(getattr(cookie, "expires", 0) or 0))
+            cname = str(getattr(cookie, "name", "") or "")
+            cval = str(getattr(cookie, "value", "") or "")
+            if cname:
+                lines.append("\t".join([dom, include_sub, path, secure, expires, cname, cval]))
+                count += 1
+        if count == 0:
+            return False, "", f"No YouTube/Google session cookies found in {name.title()}."
+        return True, "\n".join(lines), f"Imported {count} cookies from {name.title()}."
+    except Exception as error:
+        return False, "", f"Could not read {name.title()} cookies: {error}"
 
 
 def _ffmpeg_mux(video: str, audio: str, output: str) -> bool:
@@ -187,14 +290,7 @@ def _ffmpeg_mux(video: str, audio: str, output: str) -> bool:
 
 
 def install_desktop_muxer() -> bool:
-    """Register a desktop stand-in for the APK's com.erawat.arc.EmbeddedEngine.
-
-    dl.py's HD path does `from com.erawat.arc import EmbeddedEngine` and calls
-    `EmbeddedEngine.mux(video, audio, out)`. Inside the APK that is Kotlin and
-    MediaMuxer. On a desktop that import fails, and the engine then kept the
-    video track and silently discarded the audio. Providing the same module name
-    backed by ffmpeg lets the unmodified engine merge properly here.
-    """
+    """Register a desktop stand-in for the APK's com.erawat.arc.EmbeddedEngine."""
     if "com.erawat.arc" in sys.modules:
         return True
     try:
@@ -223,24 +319,25 @@ def install_desktop_muxer() -> bool:
 
 
 def apply(dl_module) -> dict:
-    """Patch Android-only side effects out of an imported dl.py.
-
-    Returns a report of what was changed, which the Settings tab shows so the
-    user can see exactly how this build differs from the APK.
-    """
+    """Patch Android-only side effects out of an imported dl.py."""
     applied: dict[str, str] = {}
 
-    # adb push to /sdcard/Download after every file: pointless off Android, and
-    # it spawned `adb devices` on each download.
+    found_bins = register_binary_paths_on_env()
+    if "aria2c" in found_bins:
+        try:
+            dl_module.set_aria2c_path(found_bins["aria2c"])
+            applied["aria2c"] = found_bins["aria2c"]
+        except Exception:
+            pass
+    if "ffmpeg" in found_bins:
+        applied["ffmpeg"] = found_bins["ffmpeg"]
+
     def _no_sync(file_path):
         return file_path
 
     dl_module.sync_to_sdcard_if_needed = _no_sync
     applied["sync_to_sdcard_if_needed"] = "disabled (Android /sdcard copy)"
 
-    # print_adm_link() starts an HTTP server on :8080 and hardlinks the finished
-    # file as v1.mp4/v2.mp4 next to it - a Termux-era ADM trick that would litter
-    # a Windows Downloads folder with duplicates.
     def _no_adm_link(file_path):
         return None
 
@@ -248,8 +345,24 @@ def apply(dl_module) -> dict:
     dl_module.start_local_http_server = lambda: None
     applied["print_adm_link"] = "disabled (no v1.mp4 hardlinks, no :8080 server)"
 
-    # launch_player() shells out to adb / Android `am start`. The desktop plays
-    # through VLC or the default handler instead.
+    # Fix Windows local drive paths (e.g. C:\...) in dl.py's stream proxy.
+    orig_start_proxy = getattr(dl_module, "start_local_stream_proxy", None)
+    if callable(orig_start_proxy):
+        import urllib.parse
+
+        def _desktop_start_proxy(target_url, custom_headers=None, port=8765):
+            raw = str(target_url or "").strip()
+            clean = raw[7:] if raw.startswith("file://") else raw
+            if clean and os.path.isabs(clean) and os.path.isfile(clean) and not clean.startswith("/"):
+                orig_start_proxy("")
+                active_port = getattr(dl_module, "LOCAL_PROXY_PORT", port) or port
+                sub_name = os.path.basename(clean) or "stream.mp4"
+                return f"http://127.0.0.1:{active_port}/local/{urllib.parse.quote(sub_name)}?path={urllib.parse.quote(clean)}"
+            return orig_start_proxy(target_url, custom_headers=custom_headers, port=port)
+
+        dl_module.start_local_stream_proxy = _desktop_start_proxy
+        applied["start_local_stream_proxy"] = "Windows drive-path local proxy enabled"
+
     def _desktop_launch(target_uri, player_choice="vlc", custom_headers=None, title=None):
         proxy = target_uri
         try:
@@ -262,7 +375,7 @@ def apply(dl_module) -> dict:
         return ok
 
     dl_module.launch_player = _desktop_launch
-    applied["launch_player"] = "desktop VLC / default player"
+    applied["launch_player"] = "desktop ARC Player / VLC / default player"
 
     if install_desktop_muxer():
         applied["com.erawat.arc.EmbeddedEngine"] = "ffmpeg muxer registered"

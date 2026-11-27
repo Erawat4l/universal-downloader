@@ -178,25 +178,30 @@ def report(onefile: bool) -> bool:
     log("")
     log("=" * 68)
     if onefile:
-        artifact = DIST / "Arc.exe"
+        artifact = DIST / "ARC.exe"
+        if not artifact.is_file():
+            artifact = DIST / "Arc.exe"
         if artifact.is_file():
             log(f"  BUILD OK   {artifact}")
             log(f"             {artifact.stat().st_size / (1024 * 1024):.1f} MB, single file,")
             log(f"             double-click to run. First launch unpacks to temp, so it")
             log(f"             starts a few seconds slower than the directory build.")
         else:
-            log("  BUILD FAILED: dist/Arc.exe was not produced.")
+            log("  BUILD FAILED: dist/ARC.exe was not produced.")
             return False
     else:
-        folder = DIST / "Arc"
-        artifact = folder / "Arc.exe"
+        folder = DIST / "ARC"
+        artifact = folder / "ARC.exe"
+        if not artifact.is_file():
+            folder = DIST / "Arc"
+            artifact = folder / "Arc.exe"
         if artifact.is_file():
             total = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
             log(f"  BUILD OK   {artifact}")
             log(f"             {total / (1024 * 1024):.1f} MB across {len(list(folder.rglob('*')))} entries.")
-            log(f"             Ship the whole Arc folder (zip it). Starts fastest.")
+            log(f"             Ship the whole ARC folder (zip it). Starts fastest.")
         else:
-            log("  BUILD FAILED: dist/Arc/Arc.exe was not produced.")
+            log("  BUILD FAILED: dist/ARC/ARC.exe was not produced.")
             return False
     log("=" * 68)
     log("")

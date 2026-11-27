@@ -43,12 +43,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "download_path": "",
     "default_video_quality": "Ask each time",
     "default_audio_quality": "Ask each time",
+    "streaming_player": "arc_player",
     "notifications": True,
     "prefer_vlc": True,
     "open_folder_when_done": False,
     "telegram_api_id": "",
     "telegram_api_hash": "",
     "telegram_session": "",
+    "telegram_user": "",
+    "telegram_phone": "",
+    "google_account_email": "",
+    "google_cookies": "",
     "max_history": 200,
 }
 

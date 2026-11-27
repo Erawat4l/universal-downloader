@@ -13,6 +13,8 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
+import re
 import sys
 import time
 import uuid
@@ -29,10 +31,15 @@ from PySide6.QtWidgets import (
 from .. import __version__, theme
 from ..engine_bridge import EngineBridge
 from ..store import Store, human_size
+from .dialogs import (
+    AboutFeaturesDialog, AudioSelectDialog, GoogleYouTubeDialog,
+    SeriesDownloadDialog, StreamingPlayerDialog, TelegramLoginDialog,
+)
 from .pages import (
     AUDIO_QUALITIES, ActivityPage, AnalysisPage, HomePage, LibraryPage,
-    SearchPage, SettingsPage, VIDEO_QUALITY_DEFAULTS,
+    SearchPage, SettingsPage, VIDEO_QUALITY_DEFAULTS, prioritize_audio_choices,
 )
+from .player import ArcPlayerDialog, resolve_track_for_quality
 from .widgets import Toast
 
 POLL_INTERVAL_MS = 400          # same cadence as the APK's LaunchedEffect(jobs)
@@ -119,6 +126,9 @@ class MainWindow(QMainWindow):
         self.download_scope: str = "episode"
         self._think_started_at: float = 0.0
         self._installer_processes: dict[str, tuple[QProcess, list[str], str]] = {}
+        self._search_cache: dict[str, list[dict]] = {}
+        self._target_cache: dict[str, dict] = {}
+        self._episode_cache: dict[str, dict] = {}
 
         self.signals = _WorkerSignals(self)
         self.signals.done.connect(self._on_engine_result)
@@ -226,6 +236,7 @@ class MainWindow(QMainWindow):
     def _wire_signals(self) -> None:
         home = self.home_page
         home.analyze_requested.connect(self.analyze_input)
+        home.pick_torrent_requested.connect(self.analyze_input)
         home.library_requested.connect(lambda: self._select_nav(2))
 
         search = self.search_page
@@ -252,6 +263,7 @@ class MainWindow(QMainWindow):
         activity.cancel_requested.connect(self.cancel_job)
         activity.dismiss_requested.connect(self.dismiss_job)
         activity.open_requested.connect(self.open_path)
+        activity.copy_logs_requested.connect(self.copy_job_logs)
 
         library = self.library_page
         library.open_requested.connect(self.open_path)
@@ -269,8 +281,14 @@ class MainWindow(QMainWindow):
             lambda value: self.store.set("notifications", value))
         settings.prefer_vlc_changed.connect(
             lambda value: self.store.set("prefer_vlc", value))
+        settings.player_dialog_requested.connect(self.open_player_dialog)
+        settings.telegram_auth_requested.connect(self.open_telegram_login)
+        settings.telegram_logout_requested.connect(self.logout_telegram)
         settings.telegram_saved.connect(self.save_telegram_credentials)
         settings.telegram_test_requested.connect(self.test_telegram)
+        settings.google_login_requested.connect(self.open_google_auth_dialog)
+        settings.google_disconnect_requested.connect(self.disconnect_google_account)
+        settings.about_requested.connect(self.open_about_dialog)
         settings.scan_requested.connect(self._refresh_library)
         settings.install_requested.connect(self.install_accelerator)
 
@@ -280,12 +298,18 @@ class MainWindow(QMainWindow):
             bool(self.store.get("notifications", True)),
             bool(self.store.get("prefer_vlc", True)),
         )
+        settings.set_streaming_player_name(self._player_display_name())
         settings.set_download_path(self.download_dir())
         settings.set_telegram(
             str(self.store.get("telegram_api_id", "")),
             str(self.store.get("telegram_api_hash", "")),
             str(self.store.get("telegram_session", "")),
+            str(self.store.get("telegram_user", "")),
+            str(self.store.get("telegram_phone", "")),
         )
+        g_email = str(self.store.get("google_account_email", "") or "")
+        g_cookies = str(self.store.get("google_cookies", "") or "")
+        settings.set_google_account(g_email, bool(g_cookies.strip()))
         settings.set_environment(self.bridge.environment())
 
     # -------------------------------------------------------------- shortcuts
@@ -362,17 +386,38 @@ class MainWindow(QMainWindow):
         self.toast.show_message(message)
         QTimer.singleShot(3400, self.toast.hide)
 
+    def _player_display_name(self) -> str:
+        key = str(self.store.get("streaming_player", "arc_player") or "arc_player")
+        return {
+            "arc_player": "ARC Player (Built-in)",
+            "vlc": "VLC Media Player",
+            "system_chooser": "System Default Handler",
+        }.get(key, "ARC Player (Built-in)")
+
+    def _sync_home_status(self) -> None:
+        running = sum(1 for j in self.jobs.values() if str(j.get("status")) in ("Downloading", "Muxing"))
+        if running > 0:
+            self.home_page.set_status_pill(f"Downloading {running}", theme.ARC_WARNING)
+            if len(self.nav_buttons) > 1:
+                self.nav_buttons[1].setText(f"Activity ({running})")
+        else:
+            self.home_page.set_status_pill("Ready", theme.ARC_SUCCESS)
+            if len(self.nav_buttons) > 1:
+                self.nav_buttons[1].setText("Activity")
+
     # ============================================================ ANALYZE FLOW
     def analyze_input(self, raw_input: str) -> None:
-        text = (raw_input or "").strip()
+        text = (raw_input or "").strip().strip('"')
         if not text:
             return
         lower = text.lower()
-        # Match the APK: plain text is always a catalogue search, even a
-        # one-word title or a dotted title. Only explicit link schemes resolve.
-        looks_like_link = lower.startswith(
-            ("http://", "https://", "magnet:", "ftp://", "t.me/",
-             "telegram.me/", "telegram.dog/", "igl:"))
+        looks_like_link = (
+            lower.startswith(
+                ("http://", "https://", "magnet:", "ftp://", "t.me/",
+                 "telegram.me/", "telegram.dog/", "igl:")
+            )
+            or (lower.endswith(".torrent") and os.path.isfile(text))
+        )
         if not looks_like_link:
             self.start_search(text)
             return
@@ -382,10 +427,17 @@ class MainWindow(QMainWindow):
     def start_search(self, query: str) -> None:
         self._home_context_page = self.search_page
         self.current_query = query
-        self.results = []
+        cached = self._search_cache.get(query.strip().lower())
         self.home_page.set_input(query)
         self._show_page(self.search_page)
+        if cached is not None:
+            self.results = list(cached)
+            self.search_page.set_results(query, self.results)
+            self.set_status(f"{len(self.results)} result(s) for \u201c{query}\u201d")
+            return
+        self.results = []
         self.search_page.set_query(query, True)
+        self.home_page.set_status_pill("Searching...", theme.ARC_WARNING)
         self.set_status(f"Searching \u201c{query}\u201d...")
         self._begin_thinking(self.search_page.thinking, "Searching media catalog")
         self._submit({"action": "search", "query": query, "platform": "netmirror"},
@@ -394,40 +446,79 @@ class MainWindow(QMainWindow):
     def start_analysis(self, url: str) -> None:
         self._home_context_page = self.analysis_page
         self.analysis_url = url
+        self.audio_only = False
+        cached = self._target_cache.get(f"{url}#{self.selected_audio_lang.lower()}") or self._target_cache.get(url)
+        if cached is not None:
+            self.target = dict(cached)
+            self._show_page(self.analysis_page)
+            self._apply_target(self.target)
+            self.set_status(f"Ready: {self.target.get('title', '')}")
+            return
         self.target = {}
         self._show_page(self.analysis_page)
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(url if len(url) < 90 else url[:87] + "\u2026")
         self.analysis_page.detail_label.setText("Resolving...")
+        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
         self.set_status("Resolving media...")
         self._begin_thinking(self.analysis_page.thinking, "Resolving media stream")
         self._submit(self._resolve_payload(url, self._default_quality()), "Resolve media")
 
     def _resolve_payload(self, url: str, quality: str) -> dict:
-        payload = {"action": "resolve", "url": url, "quality": quality}
+        payload: dict = {"action": "resolve", "url": url, "quality": quality}
         season, episode = self._season_episode_from_text(url)
         if season:
             payload["season"] = season
         if episode:
             payload["episode"] = episode
+        if self.selected_audio_lang:
+            payload["audio_lang"] = self.selected_audio_lang
+        g_cookies = str(self.store.get("google_cookies", "") or "").strip()
+        if g_cookies:
+            payload["cookie"] = g_cookies
+        telegram = self._telegram_config()
+        if telegram:
+            payload["telegram"] = telegram
         return payload
 
     def on_search_hit(self, hit: dict, url: str, language: str) -> None:
-        self.audio_languages = [str(a.get("language", "")) for a in (hit.get("audios") or [])]
+        sorted_audios = prioritize_audio_choices(list(hit.get("audios") or []))
+        self.audio_languages = [str(a.get("language", "")) for a in sorted_audios if str(a.get("language", ""))]
         self.audio_urls = {str(a.get("language", "")): str(a.get("url", ""))
-                           for a in (hit.get("audios") or [])}
-        self.selected_audio_lang = language
-        chosen = url or str(hit.get("url", ""))
+                           for a in sorted_audios if str(a.get("language", ""))}
+        self.selected_audio_lang = language or (self.audio_languages[0] if self.audio_languages else "")
+        chosen = url or self.audio_urls.get(self.selected_audio_lang, "") or str(hit.get("url", ""))
         if not chosen:
             self.notify("That result has no playable link.")
             return
         self._home_context_page = self.analysis_page
         self.analysis_url = chosen
-        self.target = {}
+        self.audio_only = False
+        prov_list = hit.get("providers") or []
+        prov_str = " \u00b7 ".join(str(p).strip() for p in prov_list if str(p).strip()) if isinstance(prov_list, list) else str(prov_list or "")
+        yr_str = str(hit.get("year") or "").strip()
+        self.target = {
+            "target_url": chosen,
+            "title": str(hit.get("title", "")),
+            "poster": str(hit.get("poster", "")),
+            "year": "" if yr_str == "0" else yr_str,
+            "providers": prov_str,
+            "source": str(hit.get("source") or hit.get("type") or ""),
+            "audio_languages": list(self.audio_languages),
+            "selected_audio_lang": self.selected_audio_lang,
+        }
+        cache_key = f"{chosen}#{self.selected_audio_lang.lower()}"
+        cached = self._target_cache.get(cache_key) or self._target_cache.get(chosen)
         self._show_page(self.analysis_page)
+        if cached is not None:
+            self.target = dict(cached)
+            self._apply_target(self.target)
+            self.set_status(f"Ready: {self.target.get('title', '')}")
+            return
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(str(hit.get("title", "Resolving...")))
         self.analysis_page.poster.set_url(str(hit.get("poster", "")))
+        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
         self.set_status(f"Resolving \u201c{hit.get('title', '')}\u201d...")
         self._begin_thinking(self.analysis_page.thinking, "Resolving media stream")
         self._submit(self._resolve_payload(chosen, self._default_quality()), "Resolve media")
@@ -475,7 +566,10 @@ class MainWindow(QMainWindow):
             hits = self._search_hits(response)
             self.results = hits
             self.search_page.set_results(self.current_query, hits)
+            self._sync_home_status()
             if ok:
+                if self.current_query.strip():
+                    self._search_cache[self.current_query.strip().lower()] = list(hits)
                 self.set_status(f"{len(hits)} result(s) for \u201c{self.current_query}\u201d")
             else:
                 self.set_status(error)
@@ -483,6 +577,7 @@ class MainWindow(QMainWindow):
             return
 
         if action == "resolve" or action_label == "Resolve media":
+            self._sync_home_status()
             if not ok:
                 self._finish_thinking(
                     self.analysis_page.thinking, action_label, duration, logs,
@@ -496,6 +591,14 @@ class MainWindow(QMainWindow):
             target = self._normalize_target(dict(response.get("result") or {}))
             self.target = target
             self._apply_target(target)
+            t_key = str(target.get("target_url") or self.analysis_url).strip()
+            if t_key:
+                lang_key = str(target.get("selected_audio_lang") or "").lower().strip()
+                if lang_key:
+                    self._target_cache[f"{t_key}#{lang_key}"] = dict(target)
+                self._target_cache[t_key] = dict(target)
+                ep_key = f"{t_key}_S{target.get('selected_season', 1)}_E{target.get('selected_episode', 1)}"
+                self._episode_cache[ep_key] = dict(target)
             self._finish_thinking(
                 self.analysis_page.thinking, action_label, duration, logs,
                 self._steps_for("resolve", True, "",
@@ -597,6 +700,54 @@ class MainWindow(QMainWindow):
         media_type = str(data.get("media_type", "video" if can_stream else "file"))
 
         previous = self.target or {}
+        raw_qt = data.get("quality_tracks") or {}
+        quality_tracks: dict[str, dict] = {}
+        if isinstance(raw_qt, dict):
+            for k, v in raw_qt.items():
+                if isinstance(v, dict):
+                    quality_tracks[str(k)] = dict(v)
+
+        audio_choices_raw = data.get("audio_choices") or data.get("audios") or []
+        audio_tracks_list: list[dict] = []
+        seen_langs: set[str] = set()
+        if isinstance(audio_choices_raw, list):
+            for a_item in audio_choices_raw:
+                if not isinstance(a_item, dict):
+                    continue
+                lang = str(a_item.get("language") or "").strip()
+                if lang and lang.lower() not in seen_langs:
+                    seen_langs.add(lang.lower())
+                    u = str(a_item.get("url") or previous.get("target_url") or "")
+                    audio_tracks_list.append({"language": lang, "url": u})
+                    if u:
+                        self.audio_urls[lang] = u
+        for lang in (self.audio_languages or []):
+            if lang and lang.lower() not in seen_langs:
+                seen_langs.add(lang.lower())
+                audio_tracks_list.append({"language": lang, "url": self.audio_urls.get(lang, "")})
+        sorted_audio = prioritize_audio_choices(audio_tracks_list)
+        audio_langs = [str(a["language"]) for a in sorted_audio]
+        audio_track_urls = {str(k): str(v) for k, v in (data.get("audio_track_urls") or {}).items()} if isinstance(data.get("audio_track_urls"), dict) else {}
+        audio_track_formats = {str(k): str(v) for k, v in (data.get("audio_track_formats") or {}).items()} if isinstance(data.get("audio_track_formats"), dict) else {}
+
+        eff_audio_lang = (
+            self.selected_audio_lang
+            or str(data.get("selected_audio_lang") or "")
+            or (audio_langs[0] if audio_langs else "")
+        )
+        self.audio_languages = audio_langs
+        if eff_audio_lang:
+            self.selected_audio_lang = eff_audio_lang
+
+        prov_raw = data.get("providers")
+        if isinstance(prov_raw, list):
+            prov_str = " \u00b7 ".join(str(p).strip() for p in prov_raw if str(p).strip())
+        else:
+            prov_str = str(prov_raw or previous.get("providers") or "").strip()
+        year_val = str(data.get("year") or previous.get("year") or "").strip()
+        if year_val == "0":
+            year_val = ""
+
         return {
             "url": str(data.get("target_url", "") or previous.get("target_url", "") or direct_url),
             "target_url": str(data.get("target_url", "") or previous.get("target_url", "")),
@@ -609,22 +760,34 @@ class MainWindow(QMainWindow):
             "poster": str(data.get("poster", "") or previous.get("poster", "")),
             "available_qualities": qualities,
             "quality_urls": quality_urls,
+            "quality_tracks": quality_tracks,
+            "video_url": str(data.get("video_url", "") or ""),
+            "audio_url": str(data.get("audio_url", "") or ""),
+            "fallback_url": str(data.get("fallback_url", "") or ""),
+            "video_format": str(data.get("video_format", "") or ""),
+            "audio_format": str(data.get("audio_format", "") or ""),
+            "fallback_format": str(data.get("fallback_format", "") or ""),
             "stream_headers": {str(k): str(v) for k, v in headers.items()},
             "is_series": is_series,
             "is_playlist": is_playlist,
             "seasons": seasons,
-            "selected_season": int(data.get("selected_season")
+            "selected_season": int(data.get("season") or data.get("selected_season")
                                    or previous.get("selected_season") or 1),
-            "selected_episode": int(data.get("selected_episode")
+            "selected_episode": int(data.get("episode") or data.get("selected_episode")
                                     or previous.get("selected_episode") or 1),
             "entries": entries,
             "total_count": int(data.get("total_count") or len(entries) or 0),
             "can_stream": can_stream,
             "media_type": media_type,
-            "audio_languages": list(self.audio_languages or []),
-            "selected_audio_lang": self.selected_audio_lang,
+            "audio_tracks": sorted_audio,
+            "audio_languages": audio_langs,
+            "audio_track_urls": audio_track_urls or dict(previous.get("audio_track_urls") or {}),
+            "audio_track_formats": audio_track_formats or dict(previous.get("audio_track_formats") or {}),
+            "selected_audio_lang": eff_audio_lang,
             "torrent_sources": data.get("torrent_sources") or {},
             "quality": str(data.get("quality", "")),
+            "year": year_val,
+            "providers": prov_str,
         }
 
     def _sort_qualities(self, qualities: list[str]) -> list[str]:
@@ -638,6 +801,19 @@ class MainWindow(QMainWindow):
         requested = self._default_quality()
         preferred = self._pick_quality(requested, target)
         self.selected_quality = preferred
+        spec = resolve_track_for_quality(
+            preferred,
+            target.get("quality_tracks") or {},
+            target.get("quality_urls") or {},
+            str(target.get("direct_stream_url") or ""),
+            target,
+        )
+        if spec.get("url"):
+            target["direct_stream_url"] = spec["url"]
+            if not target.get("proxy_url"):
+                target["stream_url"] = spec["url"]
+        for k in ("video_url", "audio_url", "fallback_url", "video_format", "audio_format", "fallback_format"):
+            target[k] = spec.get(k, "") or target.get(k, "")
         self.analysis_page.set_busy(False)
         self.analysis_page.set_target(target, preferred, self.audio_only)
         self._update_location_hint()
@@ -671,11 +847,18 @@ class MainWindow(QMainWindow):
             return
         self.selected_quality = quality
         self.target["selected_quality"] = quality
-        mapped = str((self.target.get("quality_urls") or {}).get(quality, ""))
-        if mapped:
-            self.target["direct_stream_url"] = mapped
+        spec = resolve_track_for_quality(
+            quality,
+            self.target.get("quality_tracks") or {},
+            self.target.get("quality_urls") or {},
+            str(self.target.get("direct_stream_url") or ""),
+        )
+        if spec.get("url"):
+            self.target["direct_stream_url"] = spec["url"]
             if not self.target.get("proxy_url"):
-                self.target["stream_url"] = mapped
+                self.target["stream_url"] = spec["url"]
+        for k in ("video_url", "audio_url", "fallback_url", "video_format", "audio_format", "fallback_format"):
+            self.target[k] = spec.get(k, "")
         self.analysis_page.set_target(self.target, quality, self.audio_only)
         self._update_location_hint()
 
@@ -686,29 +869,70 @@ class MainWindow(QMainWindow):
         self.analysis_page.set_audio_only(audio_only)
         preferred = self._default_quality()
         self.selected_quality = preferred
+        spec = resolve_track_for_quality(
+            preferred,
+            self.target.get("quality_tracks") or {},
+            self.target.get("quality_urls") or {},
+            str(self.target.get("direct_stream_url") or ""),
+        )
+        if spec.get("url"):
+            self.target["direct_stream_url"] = spec["url"]
+            if not self.target.get("proxy_url"):
+                self.target["stream_url"] = spec["url"]
+        for k in ("video_url", "audio_url", "fallback_url", "video_format", "audio_format", "fallback_format"):
+            self.target[k] = spec.get(k, "")
         self.analysis_page.set_target(self.target, preferred, audio_only)
         self._update_location_hint()
 
     def on_season_selected(self, season: int) -> None:
         self.target["selected_season"] = season
         self.target["selected_episode"] = 1
+        t_url = str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
+        cached = self._episode_cache.get(f"{t_url}_S{season}_E1")
+        if cached is not None:
+            self.target = dict(cached)
+            self._apply_target(self.target)
+            return
         self._re_resolve("season", season)
 
     def on_episode_selected(self, episode: int) -> None:
+        season = int(self.target.get("selected_season") or 1)
         self.target["selected_episode"] = episode
+        t_url = str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
+        cached = self._episode_cache.get(f"{t_url}_S{season}_E{episode}")
+        if cached is not None:
+            self.target = dict(cached)
+            self._apply_target(self.target)
+            return
         self._re_resolve("episode", episode)
 
     def on_audio_track_selected(self, language: str) -> None:
-        url = self.audio_urls.get(language, "")
+        if not language:
+            return
         self.selected_audio_lang = language
         self.target["selected_audio_lang"] = language
-        if url:
-            self.target["stream_url"] = url
-            self.target["direct_stream_url"] = url
-        self.target["title"] = _with_language_suffix(self.target.get("title", ""), language)
-        self.analysis_page.set_target(self.target, self.selected_quality, self.audio_only)
-        self._update_location_hint()
-        self.notify(f"Audio: {language}")
+        mapped_audio_url = str((self.target.get("audio_track_urls") or {}).get(language) or "")
+        if mapped_audio_url and self.target.get("video_url"):
+            self.target["audio_url"] = mapped_audio_url
+            self.target["title"] = _with_language_suffix(_clean_language_suffix(self.target.get("title", "")), language)
+            self.analysis_page.set_target(self.target, self.selected_quality, self.audio_only)
+            self._update_location_hint()
+            self.notify(f"Audio: {language}")
+            return
+
+        new_url = self.audio_urls.get(language) or str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
+        if not new_url:
+            return
+        self.analysis_page.set_busy(True)
+        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
+        self.set_status(f"Switching audio to {language}...")
+        self._begin_thinking(self.analysis_page.thinking, f"Resolving {language} audio")
+        payload = self._resolve_payload(new_url, self.selected_quality)
+        payload["audio_lang"] = language
+        if self.target.get("is_series"):
+            payload["season"] = int(self.target.get("selected_season") or 1)
+            payload["episode"] = int(self.target.get("selected_episode") or 1)
+        self._submit(payload, "Resolve media")
 
     def _re_resolve(self, scope: str, value: int) -> None:
         url = str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
@@ -739,6 +963,27 @@ class MainWindow(QMainWindow):
         if not self.target:
             self.notify("Nothing to download yet.")
             return
+        if self.target.get("is_series"):
+            dlg = SeriesDownloadDialog(
+                _clean_show_title(str(self.target.get("title") or "TV Series")),
+                int(self.target.get("selected_season") or 1),
+                int(self.target.get("selected_episode") or 1),
+                self,
+            )
+            if dlg.exec() != SeriesDownloadDialog.Accepted or not dlg.chosen_scope:
+                return
+            self.download_scope = dlg.chosen_scope
+        else:
+            self.download_scope = "episode"
+
+        tracks = self.target.get("audio_tracks") or []
+        if len(tracks) > 1 and not self.selected_audio_lang:
+            adlg = AudioSelectDialog(tracks, self.selected_audio_lang, self)
+            if adlg.exec() != AudioSelectDialog.Accepted or not adlg.selected_track:
+                return
+            self.on_audio_track_selected(str(adlg.selected_track.get("language") or ""))
+            return
+
         payload = self._download_payload()
         job = self._create_job(payload)
         self.jobs[job["id"]] = job
@@ -752,25 +997,37 @@ class MainWindow(QMainWindow):
     def _download_payload(self) -> dict:
         target = self.target
         is_audio = self.audio_only
-        engine_url = str(target.get("url") or target.get("target_url") or self.analysis_url)
+        engine_url = str(target.get("target_url") or target.get("url") or self.analysis_url)
         quality = "audio" if is_audio else (
             "Best" if "ask" in self.selected_quality.lower() else self.selected_quality)
+
+        custom_title = None
+        if target.get("is_series"):
+            s_num = int(target.get("selected_season") or 1)
+            base_show = _clean_show_title(str(target.get("title") or "Series"))
+            if self.download_scope == "season":
+                custom_title = f"{base_show} Season {s_num}"
+            elif self.download_scope == "series":
+                custom_title = f"{base_show} Complete Series"
 
         payload: dict = {
             "action": "download",
             "url": engine_url,
             "scope": self.download_scope,
-            "title": _final_title(target, is_audio, self.selected_audio_lang),
+            "title": custom_title or _final_title(target, is_audio, self.selected_audio_lang),
             "quality": quality,
             "audio_only": is_audio,
             "target_dir": self.download_dir(),
             "cache_dir": self.cache_dir(),
         }
+        if self.selected_audio_lang:
+            payload["audio_lang"] = self.selected_audio_lang
 
         is_batch = self.download_scope in ("season", "series")
         if not is_batch and "youtube" not in engine_url.lower() and "youtu.be" not in engine_url.lower():
-            direct = str(target.get("direct_stream_url") or engine_url)
-            if direct and "127.0.0.1" not in direct and direct != engine_url:
+            q_mapped = str((target.get("quality_urls") or {}).get(self.selected_quality) or "")
+            direct = q_mapped or str(target.get("direct_stream_url") or engine_url)
+            if direct and "127.0.0.1" not in direct and direct != engine_url and "googlevideo.com" not in direct:
                 payload["stream_url"] = direct
 
         headers = dict(target.get("stream_headers") or {})
@@ -779,6 +1036,10 @@ class MainWindow(QMainWindow):
         if target.get("is_series"):
             payload["season"] = int(target.get("selected_season") or 1)
             payload["episode"] = int(target.get("selected_episode") or 1)
+
+        g_cookies = str(self.store.get("google_cookies", "") or "").strip()
+        if g_cookies:
+            payload["cookie"] = g_cookies
 
         telegram = self._telegram_config()
         if telegram:
@@ -823,6 +1084,7 @@ class MainWindow(QMainWindow):
         if not ok:
             job["status"] = "Failed"
             job["detail"] = error
+            job["error_log"] = logs or error
             job["speed"] = "--"
             self.notify(f"Failed: {job['title']}")
             self.set_status(error)
@@ -857,21 +1119,83 @@ class MainWindow(QMainWindow):
         self._refresh_library()
 
     def start_stream(self) -> None:
-        url = str(self.target.get("proxy_url") or self.target.get("stream_url") or "")
-        if not url:
+        if not self.target:
             self.notify("No stream link to play.")
             return
-        if "127.0.0.1" in url:
-            self._launch_player(url, str(self.target.get("title", "")), "")
+        spec = resolve_track_for_quality(
+            self.selected_quality,
+            self.target.get("quality_tracks") or {},
+            self.target.get("quality_urls") or {},
+            str(self.target.get("direct_stream_url") or self.target.get("stream_url") or self.target.get("proxy_url") or ""),
+            self.target,
+        )
+        eff_url = str(spec.get("url") or self.target.get("proxy_url") or self.target.get("stream_url") or "")
+        if not eff_url and not (spec.get("video_url") and spec.get("audio_url")):
+            self.notify("No stream link to play.")
             return
+
+        display_title = (
+            f"{_clean_show_title(str(self.target.get('title') or 'Stream'))} "
+            f"S{self.target.get('selected_season', 1)}E{self.target.get('selected_episode', 1)}"
+            if self.target.get("is_series")
+            else str(self.target.get("title") or "Stream")
+        )
+        player_key = str(self.store.get("streaming_player", "arc_player") or "arc_player")
+        if player_key == "arc_player":
+            player_target = {
+                "url": eff_url,
+                "headers": dict(self.target.get("stream_headers") or {}),
+                "title": display_title,
+                "video_url": spec.get("video_url", ""),
+                "audio_url": spec.get("audio_url", ""),
+                "fallback_url": spec.get("fallback_url", ""),
+                "video_format": spec.get("video_format", ""),
+                "audio_format": spec.get("audio_format", ""),
+                "fallback_format": spec.get("fallback_format", ""),
+                "is_audio_only": self.audio_only,
+                "current_quality": self.selected_quality,
+                "available_qualities": list(self.target.get("available_qualities") or []),
+                "quality_tracks": dict(self.target.get("quality_tracks") or {}),
+                "quality_urls": dict(self.target.get("quality_urls") or {}),
+                "target_url": str(self.target.get("target_url") or self.analysis_url),
+                "audio_tracks": list(self.target.get("audio_tracks") or []),
+                "audio_track_urls": dict(self.target.get("audio_track_urls") or {}),
+                "audio_track_formats": dict(self.target.get("audio_track_formats") or {}),
+                "selected_audio_lang": self.selected_audio_lang,
+                "is_series": bool(self.target.get("is_series")),
+                "selected_season": int(self.target.get("selected_season") or 1),
+                "selected_episode": int(self.target.get("selected_episode") or 1),
+            }
+            dlg = ArcPlayerDialog(self.bridge, player_target, self)
+            dlg.exec()
+            return
+
+        if "127.0.0.1" in eff_url or (spec.get("video_url") and spec.get("audio_url")):
+            from ..platform_adapter import play_stream
+            v_target = str(spec.get("video_url") or eff_url)
+            a_target = str(spec.get("audio_url") or "")
+            ok, msg = play_stream(
+                v_target,
+                v_target,
+                display_title,
+                audio_url=a_target,
+                headers=self.target.get("stream_headers") or {},
+                prefer_vlc=(player_key == "vlc"),
+            )
+            self.set_status(msg)
+            self.notify(msg)
+            return
+
         self.set_status("Starting local stream proxy...")
         self._begin_thinking(self.analysis_page.thinking, "Starting local proxy")
-        self._submit({"action": "stream_proxy", "url": url,
+        self._submit({"action": "stream_proxy", "url": eff_url,
                       "headers": self.target.get("stream_headers") or {}}, "Stream")
 
     def _launch_player(self, url: str, title: str, logs: str = "") -> None:
         from ..platform_adapter import play_stream
-        ok, message = play_stream(url, url, title)
+        player_key = str(self.store.get("streaming_player", "arc_player") or "arc_player")
+        prefer_vlc = bool(self.store.get("prefer_vlc", True)) or player_key == "vlc"
+        ok, message = play_stream(url, url, title, prefer_vlc=prefer_vlc)
         self._finish_thinking(
             self.analysis_page.thinking, "Stream", self._elapsed(), logs,
             self._steps_for("stream_proxy", ok, message, ["Player launched"], []), not ok)
@@ -916,9 +1240,17 @@ class MainWindow(QMainWindow):
     def _render_jobs(self) -> None:
         ordered = sorted(self.jobs.values(), key=lambda j: j.get("started_at", 0), reverse=True)
         self.activity_page.set_jobs(ordered)
+        self._sync_home_status()
         entries = self._library_entries()
         self.library_page.set_entries(entries, self.download_dir())
         self.home_page.set_recent(entries, self.open_path, self.reveal_path, self.delete_file)
+
+    def copy_job_logs(self, job_id: str) -> None:
+        job = self.jobs.get(job_id) or {}
+        text = str(job.get("error_log") or job.get("detail") or "")
+        if text:
+            QApplication.clipboard().setText(text)
+            self.notify("Error logs copied")
 
     def _library_entries(self) -> list[dict]:
         entries = self.store.history()
@@ -933,10 +1265,28 @@ class MainWindow(QMainWindow):
         if not path:
             return
         from ..platform_adapter import open_path as open_with_os
-        if not Path(path).exists():
+        p = Path(path)
+        if not p.exists():
             self.notify("That file is no longer on disk.")
             self.store.remove_history(path)
             self._refresh_library()
+            return
+        ext = p.suffix.lower()
+        is_audio = ext in {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".opus"}
+        is_media = is_audio or ext in VIDEO_EXTENSIONS
+        player_key = str(self.store.get("streaming_player", "arc_player") or "arc_player")
+        if is_media and player_key == "arc_player":
+            dlg = ArcPlayerDialog(
+                self.bridge,
+                {
+                    "url": str(p),
+                    "title": p.stem,
+                    "is_audio_only": is_audio,
+                    "download_file_path": str(p),
+                },
+                self,
+            )
+            dlg.exec()
             return
         if not open_with_os(path):
             self.notify("Could not open that file.")
@@ -1044,10 +1394,90 @@ class MainWindow(QMainWindow):
         process.deleteLater()
 
     def save_telegram_credentials(self, api_id: str, api_hash: str, session: str) -> None:
+        padded = _pad_base64(session) if session else ""
         self.store.update({"telegram_api_id": api_id, "telegram_api_hash": api_hash,
-                           "telegram_session": _pad_base64(session) if session else ""})
-        self.settings_page.set_telegram(api_id, api_hash, session)
+                           "telegram_session": padded})
+        self.settings_page.set_telegram(
+            api_id, api_hash, session,
+            str(self.store.get("telegram_user", "")),
+            str(self.store.get("telegram_phone", "")),
+        )
         self.notify("Telegram credentials saved")
+
+    def open_player_dialog(self) -> None:
+        from ..platform_adapter import find_vlc
+        cur = str(self.store.get("streaming_player", "arc_player") or "arc_player")
+        dlg = StreamingPlayerDialog(cur, find_vlc() or "", self)
+        if dlg.exec() == StreamingPlayerDialog.Accepted:
+            self.store.set("streaming_player", dlg.chosen_key)
+            self.store.set("prefer_vlc", dlg.chosen_key == "vlc")
+            self.settings_page.set_streaming_player_name(self._player_display_name())
+            self.notify(f"Streaming player: {self._player_display_name()}")
+
+    def open_telegram_login(self) -> None:
+        dlg = TelegramLoginDialog(
+            self.bridge,
+            str(self.store.get("telegram_api_id", "")),
+            str(self.store.get("telegram_api_hash", "")),
+            str(self.store.get("telegram_session", "")),
+            self,
+        )
+        if dlg.exec() == TelegramLoginDialog.Accepted and dlg.result_creds:
+            c = dlg.result_creds
+            self.store.update({
+                "telegram_api_id": c.get("api_id", ""),
+                "telegram_api_hash": c.get("api_hash", ""),
+                "telegram_session": _pad_base64(c.get("session", "")),
+                "telegram_user": c.get("user", ""),
+                "telegram_phone": c.get("phone", ""),
+            })
+            self.settings_page.set_telegram(
+                c.get("api_id", ""),
+                c.get("api_hash", ""),
+                c.get("session", ""),
+                c.get("user", ""),
+                c.get("phone", ""),
+            )
+            self.notify(f"Telegram connected: {c.get('user') or 'Account'}")
+
+    def logout_telegram(self) -> None:
+        api_id = str(self.store.get("telegram_api_id", ""))
+        api_hash = str(self.store.get("telegram_api_hash", ""))
+        sess = str(self.store.get("telegram_session", ""))
+        self.bridge.submit(
+            {"action": "telegram_logout", "api_id": api_id, "api_hash": api_hash, "session": sess},
+            lambda _res: None,
+        )
+        self.store.update({
+            "telegram_session": "",
+            "telegram_user": "",
+            "telegram_phone": "",
+        })
+        self.settings_page.set_telegram(api_id, api_hash, "", "", "")
+        self.notify("Telegram signed out")
+
+    def open_google_auth_dialog(self) -> None:
+        dlg = GoogleYouTubeDialog(
+            str(self.store.get("google_account_email", "")),
+            str(self.store.get("google_cookies", "")),
+            self,
+        )
+        if dlg.exec() == GoogleYouTubeDialog.Accepted:
+            self.store.update({
+                "google_account_email": dlg.result_email,
+                "google_cookies": dlg.result_cookies,
+            })
+            has_c = bool(dlg.result_cookies.strip())
+            self.settings_page.set_google_account(dlg.result_email, has_c)
+            self.notify("YouTube cookies updated" if has_c else "YouTube cookies cleared")
+
+    def disconnect_google_account(self) -> None:
+        self.store.update({"google_account_email": "", "google_cookies": ""})
+        self.settings_page.set_google_account("", False)
+        self.notify("Google account disconnected")
+
+    def open_about_dialog(self) -> None:
+        AboutFeaturesDialog(__version__, self).exec()
 
     def test_telegram(self, api_id: str, api_hash: str, session: str) -> None:
         if not (api_id and api_hash and session):
@@ -1073,7 +1503,7 @@ class MainWindow(QMainWindow):
 
     def _active_jobs(self) -> list[str]:
         return [job_id for job_id, job in self.jobs.items()
-                if str(job.get("status")) in ("Downloading", "Queued", "Paused")]
+                if str(job.get("status")) in ("Downloading", "Muxing", "Queued", "Paused")]
 
     def _poll_progress(self) -> None:
         active = self._active_jobs()
@@ -1185,6 +1615,10 @@ def _clean_show_title(raw: str) -> str:
     text = re.sub(r"[\s\-_]+Season\s*\d+(-S\d+)?.*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[\s\-_]+Complete\s*Series.*", "", text, flags=re.IGNORECASE)
     return text.strip() or (raw or "")
+
+
+def _clean_language_suffix(raw: str) -> str:
+    return re.sub(r"\s+\[[A-Za-z0-9 _-]+\]$", "", str(raw or "")).strip()
 
 
 def _with_language_suffix(title: str, language: str) -> str:

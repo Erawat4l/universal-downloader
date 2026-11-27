@@ -1,21 +1,15 @@
 """In-process bridge to the repository's dl.py engine.
 
-This is the desktop twin of `android-app/.../EmbeddedEngine.kt`: it loads the
-same engine module, calls the same `run_app_json_request` machine interface, and
-polls the same `get_download_progress_json` for live progress.
-
-Two deliberate differences from the APK:
-
-* Every engine call is serialised behind a lock. `dl.run_app_json_request` uses
-  `contextlib.redirect_stdout`, which is process-global, so two concurrent
-  actions would capture each other's logs. The APK does not guard this.
-* The module is Qt-free. The UI layer subscribes with plain callbacks, which
-  keeps the engine testable headless and on CI without a display.
+Loads the single-source-of-truth dl.py engine, applies desktop adaptations,
+isolates per-thread stdout/stderr log capture so active downloads do not block
+searching/resolving/streaming, and exposes pause/resume/cancel/progress hooks.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -31,11 +25,120 @@ from . import platform_adapter
 ENGINE_MODULE_NAME = "dl"
 
 
+class _NullStream(io.TextIOBase):
+    def write(self, s: str) -> int:
+        return len(s)
+
+    def flush(self) -> None:
+        return None
+
+
+class _ThreadLocalStream(io.TextIOBase):
+    """Routes writes to the calling thread's active buffer, falling back cleanly."""
+
+    def __init__(self, fallback: Any) -> None:
+        self._fallback = fallback if fallback is not None else _NullStream()
+        self._local = threading.local()
+
+    def _target(self) -> Any:
+        stack = getattr(self._local, "stack", None)
+        if stack:
+            return stack[-1]
+        return self._fallback
+
+    def push(self, buf: Any) -> None:
+        stack = getattr(self._local, "stack", None)
+        if stack is None:
+            stack = []
+            self._local.stack = stack
+        stack.append(buf)
+
+    def pop(self) -> None:
+        stack = getattr(self._local, "stack", None)
+        if stack:
+            stack.pop()
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        return getattr(self._target(), "encoding", "utf-8")
+
+    def write(self, s: str) -> int:
+        try:
+            return int(self._target().write(s))
+        except Exception:
+            return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._target().flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+_STDOUT_ROUTER: Optional[_ThreadLocalStream] = None
+_STDERR_ROUTER: Optional[_ThreadLocalStream] = None
+_ROUTER_LOCK = threading.Lock()
+
+
+def _install_thread_local_stdio(dl_module: Any) -> None:
+    global _STDOUT_ROUTER, _STDERR_ROUTER
+    with _ROUTER_LOCK:
+        if _STDOUT_ROUTER is None:
+            _STDOUT_ROUTER = _ThreadLocalStream(sys.stdout)
+            sys.stdout = _STDOUT_ROUTER
+        elif sys.stdout is not _STDOUT_ROUTER:
+            sys.stdout = _STDOUT_ROUTER
+
+        if _STDERR_ROUTER is None:
+            _STDERR_ROUTER = _ThreadLocalStream(sys.stderr)
+            sys.stderr = _STDERR_ROUTER
+        elif sys.stderr is not _STDERR_ROUTER:
+            sys.stderr = _STDERR_ROUTER
+
+        stdout_router = _STDOUT_ROUTER
+        stderr_router = _STDERR_ROUTER
+
+        @contextlib.contextmanager
+        def _tls_redirect_stdout(buf):
+            stdout_router.push(buf)
+            try:
+                yield buf
+            finally:
+                stdout_router.pop()
+
+        @contextlib.contextmanager
+        def _tls_redirect_stderr(buf):
+            stderr_router.push(buf)
+            try:
+                yield buf
+            finally:
+                stderr_router.pop()
+
+        # Replace only dl_module.contextlib namespace so stdlib contextlib stays untouched.
+        proxy_ctx = types_module_copy(contextlib)
+        proxy_ctx.redirect_stdout = _tls_redirect_stdout  # type: ignore[attr-defined]
+        proxy_ctx.redirect_stderr = _tls_redirect_stderr  # type: ignore[attr-defined]
+        dl_module.contextlib = proxy_ctx
+
+
+def types_module_copy(mod: Any) -> Any:
+    import types
+    clone = types.ModuleType(getattr(mod, "__name__", "contextlib"))
+    for attr in dir(mod):
+        try:
+            setattr(clone, attr, getattr(mod, attr))
+        except Exception:
+            pass
+    return clone
+
+
 def _candidate_engine_paths() -> list[Path]:
     """Every place dl.py can legitimately live, best first (auto-discovery)."""
     candidates: list[Path] = []
 
-    # PyInstaller onefile/onedir unpacks bundled data under sys._MEIPASS.
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         base = Path(meipass)
@@ -47,7 +150,6 @@ def _candidate_engine_paths() -> list[Path]:
                        exe_dir.parent / "dl.py", exe_dir.parent / "engine" / "dl.py"]
 
     here = Path(__file__).resolve()
-    # .../desktop-app/arc_desktop/engine_bridge.py -> parents[2] is the repo root
     candidates += [
         here.parent / "engine" / "dl.py",
         here.parent.parent / "engine" / "dl.py",
@@ -70,12 +172,6 @@ def _candidate_engine_paths() -> list[Path]:
 
 
 def find_engine() -> Optional[Path]:
-    """Locate dl.py.
-
-    ARC_ENGINE_PATH is authoritative: if it is set but wrong, that is an error
-    worth reporting. Silently falling back to auto-discovery would hide a typo
-    and freeze the wrong engine into a build.
-    """
     override = (os.environ.get("ARC_ENGINE_PATH") or "").strip()
     if override:
         candidate = Path(override).expanduser()
@@ -123,7 +219,6 @@ class EngineBridge:
                 raise EngineError(self.load_error)
 
             self.path = path
-            # dl.py resolves `import igl` from its own directory.
             engine_dir = str(path.parent)
             if engine_dir not in sys.path:
                 sys.path.insert(0, engine_dir)
@@ -142,8 +237,6 @@ class EngineBridge:
                 self.load_error = f"dl.py failed to import: {error}\n{traceback.format_exc()}"
                 raise EngineError(self.load_error) from error
 
-            # Windows has no /sdcard, so point the engine at a real folder before
-            # any handler reads DEFAULT_DIR.
             download_dir = platform_adapter.default_download_dir()
             try:
                 module.DEFAULT_DIR = download_dir
@@ -151,6 +244,7 @@ class EngineBridge:
                 pass
 
             self.adapter_report = platform_adapter.apply(module)
+            _install_thread_local_stdio(module)
             self.dl = module
             self._loaded_at = time.time() - started
             self.load_error = ""
@@ -165,32 +259,27 @@ class EngineBridge:
 
     # --------------------------------------------------------------- requests
     def request(self, payload: dict) -> dict:
-        """Run one engine action and return its raw response dict.
-
-        Never raises for engine-side failures: dl.py already converts them into
-        {"ok": False, "error": ..., "logs": ...} so the UI can show the real
-        message instead of a generic one.
-        """
+        """Run one engine action safely with isolated per-thread stdio capture."""
         if self.dl is None:
             return {"ok": False, "error": self.load_error or "Engine is not loaded."}
-        # redirect_stdout inside run_app_json_request is process-global.
-        with self._call_lock:
-            try:
+        action = str(payload.get("action", "")).lower().strip()
+        try:
+            # Quick actions serialize on _call_lock so search/resolve stay ordered;
+            # long-running downloads never starve interactive UI calls thanks to TLS stdio.
+            if action == "download":
                 result = self.dl.run_app_json_request(payload)
-                if isinstance(result, dict):
-                    return result
-                return {"ok": False, "error": f"Engine returned {type(result).__name__}, expected dict."}
-            except Exception as error:
-                return {"ok": False, "error": f"{type(error).__name__}: {error}",
-                        "logs": traceback.format_exc(limit=6)}
+            else:
+                with self._call_lock:
+                    result = self.dl.run_app_json_request(payload)
+            if isinstance(result, dict):
+                return result
+            return {"ok": False, "error": f"Engine returned {type(result).__name__}, expected dict."}
+        except Exception as error:
+            return {"ok": False, "error": f"{type(error).__name__}: {error}",
+                    "logs": traceback.format_exc(limit=6)}
 
     def submit(self, payload: dict, on_done: Callable[[dict], None],
                job_id: Optional[str] = None) -> str:
-        """Run an action on a worker thread; on_done fires with the response.
-
-        The callback is invoked on the worker thread. Qt callers must hop back to
-        the GUI thread themselves (the UI layer does this with a signal).
-        """
         job_id = job_id or str(uuid.uuid4())
         payload = dict(payload)
         payload.setdefault("job_id", job_id)
@@ -217,13 +306,27 @@ class EngineBridge:
     def search(self, query: str, platform: str = "netmirror") -> dict:
         return self.request({"action": "search", "query": query, "platform": platform})
 
-    def resolve(self, url: str, quality: str = "best",
-                season: Optional[int] = None, episode: Optional[int] = None) -> dict:
+    def resolve(
+        self,
+        url: str,
+        quality: str = "best",
+        season: Optional[int] = None,
+        episode: Optional[int] = None,
+        cookie: Optional[str] = None,
+        audio_lang: Optional[str] = None,
+        telegram: Optional[dict] = None,
+    ) -> dict:
         payload: dict[str, Any] = {"action": "resolve", "url": url, "quality": quality}
         if season is not None:
             payload["season"] = season
         if episode is not None:
             payload["episode"] = episode
+        if cookie:
+            payload["cookie"] = cookie
+        if audio_lang:
+            payload["audio_lang"] = audio_lang
+        if telegram:
+            payload["telegram"] = telegram
         return self.request(payload)
 
     def download(self, payload: dict) -> dict:
@@ -244,8 +347,39 @@ class EngineBridge:
         return self.request({"action": "telegram_check", "api_id": api_id,
                              "api_hash": api_hash, "session": session})
 
+    def telegram_send_code(self, api_id: str, api_hash: str, phone: str) -> dict:
+        return self.request({"action": "telegram_send_code", "api_id": api_id,
+                             "api_hash": api_hash, "phone": phone})
+
+    def telegram_sign_in(self, phone: str, code: str, phone_code_hash: str = "") -> dict:
+        return self.request({"action": "telegram_sign_in", "phone": phone,
+                             "code": code, "phone_code_hash": phone_code_hash})
+
+    def telegram_password(self, password: str, session_key: str = "", phone: str = "") -> dict:
+        return self.request({"action": "telegram_password", "password": password,
+                             "session_key": session_key, "phone": phone})
+
+    def telegram_qr_init(self, api_id: str = "", api_hash: str = "") -> dict:
+        return self.request({"action": "telegram_qr_init", "api_id": api_id, "api_hash": api_hash})
+
+    def telegram_qr_check(self, session_key: str) -> dict:
+        return self.request({"action": "telegram_qr_check", "session_key": session_key})
+
+    def telegram_logout(self, api_id: str = "", api_hash: str = "", session: str = "") -> dict:
+        return self.request({"action": "telegram_logout", "api_id": api_id,
+                             "api_hash": api_hash, "session": session})
+
     def igl_catalog(self) -> dict:
         return self.request({"action": "igl"})
+
+    def igl_resolve(self, target_id: str, quality: str = "best",
+                    season: Optional[int] = None, episode: Optional[int] = None) -> dict:
+        payload: dict[str, Any] = {"action": "igl_resolve", "url": target_id, "quality": quality}
+        if season is not None:
+            payload["season"] = season
+        if episode is not None:
+            payload["episode"] = episode
+        return self.request(payload)
 
     # ----------------------------------------------------------- job control
     def progress(self, job_id: Optional[str] = None) -> dict:
@@ -278,7 +412,6 @@ class EngineBridge:
 
     # ----------------------------------------------------------- diagnostics
     def environment(self) -> dict:
-        """What this runtime can actually do - shown in Settings."""
         accelerators = platform_adapter.detect_accelerators()
         engine_version = ""
         if self.dl is not None:

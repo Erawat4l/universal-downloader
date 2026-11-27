@@ -497,6 +497,7 @@ class JobCard(QFrame):
     cancel_clicked = Signal(str)
     dismiss_clicked = Signal(str)
     open_clicked = Signal(str)
+    logs_clicked = Signal(str)
 
     def __init__(self, job: dict, parent=None) -> None:
         super().__init__(parent)
@@ -547,11 +548,12 @@ class JobCard(QFrame):
         actions.setSpacing(8)
         actions.addStretch(1)
         self.open_button = self._button("Open", self.open_clicked)
+        self.logs_button = self._button("Copy Logs", self.logs_clicked)
         self.pause_button = self._button("Pause", self.pause_clicked)
         self.resume_button = self._button("Resume", self.resume_clicked)
         self.cancel_button = self._button("Cancel", self.cancel_clicked)
         self.dismiss_button = self._button("Dismiss", self.dismiss_clicked)
-        for button in (self.open_button, self.pause_button, self.resume_button,
+        for button in (self.open_button, self.logs_button, self.pause_button, self.resume_button,
                        self.cancel_button, self.dismiss_button):
             actions.addWidget(button)
         root.addLayout(actions)
@@ -584,12 +586,13 @@ class JobCard(QFrame):
         self.title_label.setText(str(job.get("title", "Download")))
         detail = str(job.get("detail", ""))
         source = str(job.get("source", ""))
-        if source and source.lower() not in ("netmirror", "stream", "catalog"):
+        if source and source.lower() not in ("netmirror", "stream", "catalog", "direct file", "arc"):
             detail = f"{detail} \u00b7 {source}" if detail else source
         self.detail_label.setText(detail)
 
-        self.status_pill.set_text("Fetching" if connecting else status,
-                                  theme.ARC_ERROR if status == "Failed" else theme.ARC_MUTED)
+        pill_label = "Muxing" if status == "Muxing" else ("Fetching" if connecting else status)
+        pill_color = theme.ARC_ERROR if status == "Failed" else (theme.ARC_WARNING if status == "Muxing" else theme.ARC_MUTED)
+        self.status_pill.set_text(pill_label, pill_color)
         self.progress.setObjectName("Failed" if status == "Failed" else "Progress")
         if connecting:
             self.progress.setRange(0, 0)
@@ -602,16 +605,21 @@ class JobCard(QFrame):
         if connecting:
             self.percent_label.setText("Connecting & resolving stream...")
             self.speed_label.setText("Resolving...")
+        elif status == "Muxing":
+            self.percent_label.setText(f"Merging video & audio ({percent:.0f}%)...")
+            self.speed_label.setText(speed if speed != "--" else "Muxing")
         else:
             size_text = downloaded if total in ("--", "", "Done") else f"{downloaded} / {total}"
             self.percent_label.setText(f"{percent:.1f}%  \u00b7  {size_text}")
             self.speed_label.setText(speed if eta in ("--", "") else f"{speed}  \u00b7  ETA {eta}")
 
         done = status == "Complete" and str(job.get("path", "")).strip() != ""
+        has_err = status == "Failed" and bool(str(job.get("error_log") or job.get("detail") or "").strip())
         self.open_button.setVisible(done)
+        self.logs_button.setVisible(has_err)
         self.pause_button.setVisible(status == "Downloading")
         self.resume_button.setVisible(status == "Paused")
-        self.cancel_button.setVisible(status in ("Downloading", "Paused"))
+        self.cancel_button.setVisible(status in ("Downloading", "Paused", "Muxing"))
         self.dismiss_button.setVisible(status in ("Failed", "Cancelled", "Complete"))
 
 
@@ -684,6 +692,9 @@ class LibraryCard(QFrame):
         detail = str(entry.get("detail", ""))
         self.meta_label.setText(f"{detail} \u00b7 {size}" if size != "--" else detail)
         self.title_label.setText(str(entry.get("title", "File")))
+        p = str(entry.get("path", self.path) or "").lower()
+        is_media = p.endswith((".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".m3u8", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".opus"))
+        self.open_button.setText("Play" if is_media or not p else "Open")
 
 
 class Toast(QWidget):

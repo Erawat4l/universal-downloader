@@ -180,6 +180,16 @@ def run_selftest(args: argparse.Namespace) -> int:
             "title": "Selftest Show S01E02", "source": "Test", "is_series": True,
             "qualities": ["1080p (Full HD)", "480p (SD)", "2160p (4K UHD)", "Best Available"],
             "quality_urls": {"1080p (Full HD)": "https://example.invalid/1080"},
+            "quality_tracks": {
+                "2160p (4K UHD)": {
+                    "url": "https://example.invalid/720",
+                    "video_url": "https://example.invalid/4k_v",
+                    "audio_url": "https://example.invalid/aac_a",
+                    "fallback_url": "https://example.invalid/720",
+                },
+                "1080p (Full HD)": {"url": "https://example.invalid/1080"},
+            },
+            "audio_choices": [{"language": "English", "url": ""}, {"language": "Hindi", "url": ""}],
             "seasons": [{"season": 1, "episodes": 4}, {"season": 2, "episodes": 2}],
             "url": "https://example.invalid/tv/2", "stream_url": "https://example.invalid/s",
             "can_stream": True, "media_type": "video", "stream_headers": {"Referer": "x"},
@@ -190,6 +200,19 @@ def run_selftest(args: argparse.Namespace) -> int:
         qualities = window.target.get("available_qualities") or []
         if qualities and qualities[0] != "2160p (4K UHD)":
             problems.append(f"quality ranking wrong: {qualities}")
+        if (window.target.get("audio_languages") or [None])[0] != "Hindi":
+            problems.append(f"audio priority wrong: {window.target.get('audio_languages')}")
+        if window.target.get("video_url") != "https://example.invalid/4k_v":
+            problems.append("split 4K track spec did not apply for Best Available")
+
+        # Exercise offline dialogs cleanly (do not call exec()).
+        from .ui.dialogs import AboutFeaturesDialog, StreamingPlayerDialog, SeriesDownloadDialog
+        _d1 = SeriesDownloadDialog("Selftest Show", 1, 2, window)
+        _d2 = StreamingPlayerDialog("arc_player", "", window)
+        _d3 = AboutFeaturesDialog(__version__, window)
+        _d1.close()
+        _d2.close()
+        _d3.close()
 
         payload = window._download_payload()
         for key in ("action", "url", "quality", "audio_only", "target_dir", "cache_dir", "title"):

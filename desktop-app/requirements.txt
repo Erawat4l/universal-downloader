@@ -7,7 +7,8 @@
 # pycryptodomex mirrors android-app/app/build.gradle.kts's pip{} block.
 
 # --- GUI -------------------------------------------------------------------
-PySide6>=6.6,<6.9          # Qt for Python: widgets, network (posters), SVG
+PySide6>=6.6,<6.9          # Qt for Python: widgets, network, SVG, QtMultimedia player
+qrcode>=7.4                # pure-Python QR rendering for Telegram login
 
 # --- engine: core ----------------------------------------------------------
 requests>=2.31
