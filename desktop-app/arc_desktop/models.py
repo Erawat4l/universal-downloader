@@ -2,7 +2,67 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
+
+
+def sort_quality_labels(raw_list: list[str]) -> list[str]:
+    """Port of MainActivity.kt's sortQualitiesDescending()."""
+    cleaned = [str(q).strip() for q in (raw_list or []) if str(q).strip()]
+    if not cleaned:
+        return ["Best Available"]
+    order = {
+        "4k": 4000,
+        "2160p": 2160,
+        "1440p": 1440,
+        "1080p": 1080,
+        "720p": 720,
+        "480p": 480,
+        "360p": 360,
+        "240p": 240,
+        "auto": 50,
+        "best": 10,
+    }
+
+    def rank(q: str) -> int:
+        low = q.lower()
+        m = re.search(r"\b(\d{3,4})(?:p|kbps)?\b", low) or re.search(r"(\d{3,4})p", low)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        for k, v in order.items():
+            if k in low:
+                return v
+        return 0
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in sorted(cleaned, key=rank, reverse=True):
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def match_quality_key(requested: str, available: list[str]) -> Optional[str]:
+    """Find best matching quality label in available options."""
+    if not requested or not available:
+        return None
+    req_low = requested.strip().lower()
+    for opt in available:
+        if opt.lower() == req_low:
+            return opt
+    m = re.search(r"(\d{3,4})", req_low)
+    if m:
+        digits = m.group(1)
+        for opt in available:
+            if digits in opt:
+                return opt
+    if "best" in req_low:
+        return available[0]
+    return None
 
 
 def prioritize_audio_choices(audios: list[dict]) -> list[dict]:

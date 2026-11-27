@@ -563,7 +563,14 @@ def t_android_engine_stays_synchronized():
 
 @test("split quality tracks and audio prioritization match the APK")
 def t_models_parity():
-    from arc_desktop.models import prioritize_audio_choices, resolve_track_for_quality
+    from arc_desktop.models import (
+        match_quality_key, prioritize_audio_choices, resolve_track_for_quality, sort_quality_labels,
+    )
+
+    ranked = sort_quality_labels(["1080p (Full HD)", "480p (SD)", "2160p (4K UHD)", "Best Available"])
+    assert ranked == ["2160p (4K UHD)", "1080p (Full HD)", "480p (SD)", "Best Available"], ranked
+    assert match_quality_key("1080p", ranked) == "1080p (Full HD)"
+    assert match_quality_key("Best Available", ranked) == "Best Available"
 
     ordered = prioritize_audio_choices([
         {"language": "Tamil"},

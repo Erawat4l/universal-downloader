@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, theme
 from ..engine_bridge import EngineBridge
+from ..models import match_quality_key, resolve_track_for_quality, sort_quality_labels
 from ..store import Store, human_size
 from .dialogs import (
     AboutFeaturesDialog, AudioSelectDialog, GoogleYouTubeDialog,
@@ -39,7 +40,7 @@ from .pages import (
     AUDIO_QUALITIES, ActivityPage, AnalysisPage, HomePage, LibraryPage,
     SearchPage, SettingsPage, VIDEO_QUALITY_DEFAULTS, prioritize_audio_choices,
 )
-from .player import ArcPlayerDialog, resolve_track_for_quality
+from .player import ArcPlayerDialog
 from .widgets import Toast
 
 POLL_INTERVAL_MS = 400          # same cadence as the APK's LaunchedEffect(jobs)
@@ -791,11 +792,8 @@ class MainWindow(QMainWindow):
         }
 
     def _sort_qualities(self, qualities: list[str]) -> list[str]:
-        """Use the engine's ranking so the .exe and the APK order identically."""
-        try:
-            return list(self.bridge.dl.sort_quality_labels(qualities))
-        except Exception:
-            return list(qualities)
+        """Rank quality options descending just like MainActivity.kt."""
+        return sort_quality_labels(qualities)
 
     def _apply_target(self, target: dict) -> None:
         requested = self._default_quality()
@@ -823,10 +821,7 @@ class MainWindow(QMainWindow):
         if not keys:
             return requested if requested != "Ask each time" else "Best Available"
         if requested and requested != "Ask each time":
-            try:
-                match = self.bridge.dl.match_quality_key(requested, keys)
-            except Exception:
-                match = None
+            match = match_quality_key(requested, keys)
             if match:
                 return str(match)
         return keys[0]
