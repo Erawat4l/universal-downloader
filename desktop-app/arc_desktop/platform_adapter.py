@@ -55,27 +55,29 @@ def which(name: str) -> str | None:
     local = os.environ.get("LOCALAPPDATA", "")
     userprofile = os.environ.get("USERPROFILE", "")
     programdata = os.environ.get("ProgramData", r"C:\ProgramData")
+    base_name = name.lower().removesuffix(".exe")
     candidates: list[Path] = []
     if local:
         candidates += [
             Path(local) / "Microsoft" / "WinGet" / "Links" / exe,
-            Path(local) / "Programs" / name / "bin" / exe,
-            Path(local) / "Programs" / name / exe,
+            Path(local) / "Programs" / base_name / "bin" / exe,
+            Path(local) / "Programs" / base_name / exe,
         ]
-        winget_pkgs = Path(local) / "Microsoft" / "WinGet" / "Packages"
-        if winget_pkgs.is_dir():
-            for match in winget_pkgs.glob(f"**/{exe}"):
-                candidates.append(match)
     if userprofile:
         candidates += [
             Path(userprofile) / "scoop" / "shims" / exe,
-            Path(userprofile) / "scoop" / "apps" / name / "current" / "bin" / exe,
-            Path(userprofile) / "scoop" / "apps" / name / "current" / exe,
+            Path(userprofile) / "scoop" / "apps" / base_name / "current" / "bin" / exe,
+            Path(userprofile) / "scoop" / "apps" / base_name / "current" / exe,
         ]
-    choco_lib = Path(programdata) / "chocolatey" / "lib"
-    if choco_lib.is_dir():
-        for match in choco_lib.glob(f"**/{exe}"):
-            candidates.append(match)
+    choco_pkg_names = {
+        "aria2c": ("aria2", "aria2c"),
+        "ffprobe": ("ffmpeg", "ffprobe"),
+    }.get(base_name, (base_name,))
+    for choco_name in choco_pkg_names:
+        choco_pkg = Path(programdata) / "chocolatey" / "lib" / choco_name
+        if choco_pkg.is_dir():
+            for match in choco_pkg.glob(f"**/{exe}"):
+                candidates.append(match)
     candidates.append(Path(programdata) / "chocolatey" / "bin" / exe)
 
     for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),

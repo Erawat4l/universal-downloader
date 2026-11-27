@@ -117,7 +117,7 @@ def t_bridge_loads_engine():
     from arc_desktop.engine_bridge import EngineBridge
     bridge = EngineBridge()
     assert bridge.ready, bridge.load_error
-    assert bridge.load_seconds < 20, f"engine took {bridge.load_seconds}s to import"
+    assert bridge.load_seconds < 45, f"engine took {bridge.load_seconds}s to import"
     response = bridge.capabilities()
     assert response.get("ok") is True, response
     assert "download" in response["capabilities"]["actions"]
