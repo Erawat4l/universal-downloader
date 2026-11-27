@@ -117,32 +117,42 @@ class HomePage(QWidget):
         hero.addWidget(label("Download and stream media directly on your PC", "ScreenSubtitle"))
         scroll.add_layout(hero)
 
-        input_card, input_layout = card("vertical", 10)
+        input_card, input_layout = card("vertical", 12)
+        input_shell = QFrame()
+        input_shell.setObjectName("InputShell")
+        shell_row = QHBoxLayout(input_shell)
+        shell_row.setContentsMargins(12, 6, 8, 6)
+        shell_row.setSpacing(6)
+
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Link or search")
+        self.input_field.setPlaceholderText("Paste link, YouTube URL, or search movies/shows")
+        self.input_field.setStyleSheet(
+            "background: transparent; border: none; padding: 6px 4px; font-size: 13px;"
+        )
         self.input_field.setClearButtonEnabled(True)
         self.input_field.returnPressed.connect(self._submit)
-        input_layout.addWidget(self.input_field)
+        shell_row.addWidget(self.input_field, 1)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
         self.torrent_button = QPushButton(".torrent")
-        self.torrent_button.setObjectName("Ghost")
+        self.torrent_button.setObjectName("InputTag")
         self.torrent_button.setCursor(Qt.PointingHandCursor)
         self.torrent_button.setToolTip("Open local .torrent file")
         self.torrent_button.clicked.connect(self._pick_torrent)
+        shell_row.addWidget(self.torrent_button)
+
         self.paste_button = QPushButton("Paste")
-        self.paste_button.setObjectName("Ghost")
+        self.paste_button.setObjectName("InputTag")
         self.paste_button.setCursor(Qt.PointingHandCursor)
         self.paste_button.clicked.connect(self._paste)
+        shell_row.addWidget(self.paste_button)
+        input_layout.addWidget(input_shell)
+
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.setObjectName("Primary")
+        self.analyze_button.setFixedHeight(48)
         self.analyze_button.setCursor(Qt.PointingHandCursor)
         self.analyze_button.clicked.connect(self._submit)
-        button_row.addWidget(self.torrent_button)
-        button_row.addWidget(self.paste_button)
-        button_row.addWidget(self.analyze_button, 1)
-        input_layout.addLayout(button_row)
+        input_layout.addWidget(self.analyze_button)
 
         scroll.add(input_card)
 
@@ -169,14 +179,15 @@ class HomePage(QWidget):
     def set_busy(self, busy: bool) -> None:
         self.analyze_button.setEnabled(not busy)
         self.input_field.setEnabled(not busy)
-        self.status_pill.set_text("Working..." if busy else "Ready",
-                                  theme.ARC_WARNING if busy else theme.ARC_MUTED)
+        self.status_pill.set_text("Analyzing..." if busy else "Ready",
+                                  theme.ARC_WHITE if busy else theme.ARC_MUTED)
 
     def set_status_pill(self, text: str, color: Optional[str] = None) -> None:
         self.status_pill.set_text(text, color or theme.ARC_MUTED)
 
     def set_recent(self, entries: list[dict], on_open, on_folder, on_delete) -> None:
         for old in self._recent_cards:
+            old.setParent(None)
             old.deleteLater()
         self._recent_cards.clear()
         for entry in entries[:3]:
@@ -225,6 +236,7 @@ class SearchPage(QWidget):
     hit_selected = Signal(dict, str, str)
     back_requested = Signal()
     copy_logs = Signal()
+    retry_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -255,6 +267,7 @@ class SearchPage(QWidget):
 
         self.thinking = ThinkingCard()
         self.thinking.copy_logs.connect(lambda: self.copy_logs.emit())
+        self.thinking.retry_clicked.connect(lambda: self.retry_requested.emit())
         self._scroll.add(self.thinking)
 
         self.results_host = QVBoxLayout()
@@ -289,7 +302,7 @@ class SearchPage(QWidget):
             return
 
         for hit in hits:
-            item, item_layout = card("vertical", 9)
+            item, item_layout = card("vertical", 9, object_name="CardClickable")
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(11)
@@ -383,12 +396,14 @@ class AnalysisPage(QWidget):
     stream_requested = Signal()
     copy_link_requested = Signal()
     back_requested = Signal()
+    retry_requested = Signal()
     copy_logs = Signal()
     quality_changed = Signal(str)
     audio_only_changed = Signal(bool)
     season_selected = Signal(int)
     episode_selected = Signal(int)
     audio_track_selected = Signal(str)
+    subtitle_selected = Signal(str)
     playlist_item_selected = Signal(dict)
 
     def __init__(self, parent=None) -> None:
@@ -420,7 +435,35 @@ class AnalysisPage(QWidget):
 
         self.thinking = ThinkingCard()
         self.thinking.copy_logs.connect(lambda: self.copy_logs.emit())
+        self.thinking.retry_clicked.connect(lambda: self.retry_requested.emit())
         self._scroll.add(self.thinking)
+
+        self.error_banner, err_layout = card("vertical", 10, 14, "ErrorBanner")
+        self.error_label = label("", "ErrorText")
+        self.error_label.setWordWrap(True)
+        err_layout.addWidget(self.error_label)
+        err_btns = QHBoxLayout()
+        err_btns.setSpacing(8)
+        self.err_retry_btn = QPushButton("Retry")
+        self.err_retry_btn.setObjectName("Primary")
+        self.err_retry_btn.setFixedHeight(36)
+        self.err_retry_btn.setCursor(Qt.PointingHandCursor)
+        self.err_retry_btn.clicked.connect(lambda: self.retry_requested.emit())
+        self.err_back_btn = QPushButton("Back")
+        self.err_back_btn.setObjectName("Ghost")
+        self.err_back_btn.setCursor(Qt.PointingHandCursor)
+        self.err_back_btn.clicked.connect(lambda: self.back_requested.emit())
+        self.err_logs_btn = QPushButton("Copy Logs")
+        self.err_logs_btn.setObjectName("Ghost")
+        self.err_logs_btn.setCursor(Qt.PointingHandCursor)
+        self.err_logs_btn.clicked.connect(lambda: self.copy_logs.emit())
+        err_btns.addWidget(self.err_retry_btn)
+        err_btns.addWidget(self.err_back_btn)
+        err_btns.addWidget(self.err_logs_btn)
+        err_btns.addStretch(1)
+        err_layout.addLayout(err_btns)
+        self.error_banner.setVisible(False)
+        self._scroll.add(self.error_banner)
 
         # -------------------------------------------------------- media header
         self.media_card, media_layout = card("horizontal", 14)
@@ -465,6 +508,15 @@ class AnalysisPage(QWidget):
         self.audio_chips.setVisible(False)
         self._scroll.add(self.audio_header)
         self._scroll.add(self.audio_chips)
+
+        # ---------------------------------------------------------- subtitles
+        self.sub_header = SectionHeader("Subtitles", "")
+        self.sub_chips = ChipBar()
+        self.sub_chips.selected.connect(lambda sub: self.subtitle_selected.emit(sub))
+        self.sub_header.setVisible(False)
+        self.sub_chips.setVisible(False)
+        self._scroll.add(self.sub_header)
+        self._scroll.add(self.sub_chips)
 
         # ----------------------------------------------------------- playlist
         self.playlist_header = SectionHeader("Playlist Items", "")
@@ -523,36 +575,42 @@ class AnalysisPage(QWidget):
         self.download_button.setCursor(Qt.PointingHandCursor)
         self.download_button.setFixedHeight(50)
         self.download_button.clicked.connect(lambda: self.download_requested.emit())
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
         self.stream_button = QPushButton("\u25B6   Stream")
+        self.stream_button.setObjectName("Outlined")
         self.stream_button.setCursor(Qt.PointingHandCursor)
-        self.stream_button.setFixedHeight(46)
+        self.stream_button.setFixedHeight(48)
         self.stream_button.clicked.connect(lambda: self.stream_requested.emit())
         self.copy_button = QPushButton("Copy direct link")
+        self.copy_button.setObjectName("Ghost")
         self.copy_button.setCursor(Qt.PointingHandCursor)
-        self.copy_button.setFixedHeight(46)
+        self.copy_button.setFixedHeight(34)
         self.copy_button.clicked.connect(lambda: self.copy_link_requested.emit())
-        action_row.addWidget(self.stream_button, 1)
-        action_row.addWidget(self.copy_button, 1)
         self._scroll.add(self.download_button)
-        self._scroll.add_layout(action_row)
+        self._scroll.add(self.stream_button)
+        self._scroll.add(self.copy_button)
         self._scroll.add_stretch()
         self._playlist_cards: list[QWidget] = []
 
     # ------------------------------------------------------------------ slots
     def set_loading(self, loading: bool) -> None:
+        self.error_banner.setVisible(False)
         self.title_label.setText("Analyzing" if loading else "Review")
         self.subtitle_label.setText("Processing media details..." if loading
                                     else "Choose quality and action.")
         if loading:
             self._qualities = []
-            self.thinking.start("Resolve media", "Resolving media stream")
+            self.media_card.setVisible(True)
+            self.badge_label.setText("RESOLVING")
+            self.name_label.setText("Resolving link...")
+            self.detail_label.setText("Fetching streams and formats...")
+            self.poster.set_url("")
+            self.thinking.start("Resolve media", "Resolving stream")
             self.download_button.setEnabled(False)
             self.stream_button.setEnabled(False)
             self.copy_button.setEnabled(False)
             for widget in (self.season_header, self.season_chips, self.episode_header,
                            self.episode_chips, self.audio_header, self.audio_chips,
+                           self.sub_header, self.sub_chips,
                            self.playlist_header, self.playlist_frame):
                 widget.setVisible(False)
         else:
@@ -560,7 +618,25 @@ class AnalysisPage(QWidget):
             self.stream_button.setEnabled(True)
             self.copy_button.setEnabled(True)
 
+    def set_error(self, message: str) -> None:
+        self.title_label.setText("Resolve Failed")
+        self.subtitle_label.setText("Check the link or view execution logs.")
+        self.media_card.setVisible(False)
+        self.error_label.setText(message or "Could not resolve this media link.")
+        self.error_banner.setVisible(True)
+        for widget in (self.season_header, self.season_chips, self.episode_header,
+                       self.episode_chips, self.audio_header, self.audio_chips,
+                       self.sub_header, self.sub_chips, self.stream_type_header,
+                       self.video_chip, self.audio_chip, self.quality_header,
+                       self.quality_combo, self.quality_size_hint,
+                       self.playlist_header, self.playlist_frame,
+                       self.stream_button, self.copy_button):
+            widget.setVisible(False)
+        self.download_button.setEnabled(False)
+
     def set_target(self, target: dict, quality: str, audio_only: bool) -> None:
+        self.error_banner.setVisible(False)
+        self.media_card.setVisible(True)
         self.poster.set_url(str(target.get("poster", "")))
         is_series = bool(target.get("is_series"))
         can_stream = bool(target.get("can_stream", True))
@@ -642,6 +718,27 @@ class AnalysisPage(QWidget):
             current_lang = str(target.get("selected_audio_lang") or languages[0])
             self.audio_header.set_title("Audio Language")
             self.audio_chips.set_items([str(l) for l in languages], current_lang)
+
+        # uploaded subtitles only (never auto-generated)
+        sub_tracks = [t for t in (target.get("subtitle_tracks") or []) if not t.get("auto")]
+        show_subs = bool(sub_tracks) and (not audio_only)
+        self.sub_header.setVisible(show_subs)
+        self.sub_chips.setVisible(show_subs)
+        if show_subs:
+            selected_sub = str(target.get("selected_sub_lang") or "").strip() or "Off"
+            labels = ["Off"]
+            for t in sub_tracks:
+                lbl = str(t.get("label") or t.get("lang") or "Sub").strip()
+                if lbl and lbl not in labels:
+                    labels.append(lbl)
+            current_sub_label = "Off"
+            if selected_sub.lower() != "off":
+                for t in sub_tracks:
+                    if str(t.get("lang") or "").lower() == selected_sub.lower() or str(t.get("label") or "").lower() == selected_sub.lower():
+                        current_sub_label = str(t.get("label") or t.get("lang") or "Off").strip()
+                        break
+            self.sub_header.set_title("Subtitles")
+            self.sub_chips.set_items(labels, current_sub_label)
 
         # playlist
         entries = target.get("entries") or []
@@ -759,6 +856,7 @@ class ActivityPage(QWidget):
     dismiss_requested = Signal(str)
     open_requested = Signal(str)
     copy_logs_requested = Signal(str)
+    retry_requested = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -788,12 +886,13 @@ class ActivityPage(QWidget):
         self._empty.setVisible(True)
 
     def set_jobs(self, jobs: list[dict]) -> None:
-        visible = [j for j in jobs if str(j.get("status")) in
-                   ("Downloading", "Muxing", "Queued", "Paused", "Failed", "Cancelled")]
+        visible = [j for j in jobs if str(j.get("status", "")) != "Complete"]
         live_ids = {str(j.get("id")) for j in visible}
         for job_id in list(self._cards):
             if job_id not in live_ids:
-                self._cards.pop(job_id).deleteLater()
+                card_old = self._cards.pop(job_id)
+                card_old.setParent(None)
+                card_old.deleteLater()
         if not visible:
             self._show_empty()
             return
@@ -810,6 +909,7 @@ class ActivityPage(QWidget):
                 card_widget.dismiss_clicked.connect(lambda j: self.dismiss_requested.emit(j))
                 card_widget.open_clicked.connect(lambda j: self.open_requested.emit(j))
                 card_widget.logs_clicked.connect(lambda j: self.copy_logs_requested.emit(j))
+                card_widget.retry_clicked.connect(lambda j: self.retry_requested.emit(j))
                 self.jobs_host.insertWidget(0, card_widget)
                 self._cards[job_id] = card_widget
             else:
@@ -871,6 +971,7 @@ class LibraryPage(QWidget):
     def _refilter(self) -> None:
         needle = self.filter_field.text().strip().lower()
         for old in self._cards:
+            old.setParent(None)
             old.deleteLater()
         self._cards.clear()
         shown = [e for e in self._entries if not needle or needle in str(e.get("title", "")).lower()]

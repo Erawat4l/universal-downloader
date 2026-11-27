@@ -20,6 +20,7 @@ ARC_WHITE = "#F7F7F7"
 ARC_MUTED = "#B0B0B0"
 ARC_SUBTLE = "#777777"
 ARC_BORDER = "#222222"
+ARC_BORDER_SUBTLE = "#2A2A2A"
 ARC_BORDER_STRONG = "#2C2C2C"
 ARC_ERROR = "#FF5252"
 ARC_SUCCESS = "#4CAF50"
@@ -120,8 +121,21 @@ QFrame#CardSelected {{
 }}
 QFrame#LogBox {{
     background-color: #070707;
-    border: 1px solid {ARC_BORDER};
-    border-radius: 12px;
+    border: 1px solid {ARC_BORDER_SUBTLE};
+    border-radius: 14px;
+}}
+QFrame#ErrorBanner {{
+    background-color: #161010;
+    border: 1px solid #4A2424;
+    border-radius: 16px;
+}}
+QFrame#InputShell {{
+    background-color: {ARC_RAISED};
+    border: 1px solid {ARC_BORDER_SUBTLE};
+    border-radius: 14px;
+}}
+QFrame#InputShell:focus-within {{
+    border: 1px solid #4A4A4A;
 }}
 QFrame#Divider {{
     background-color: {ARC_BORDER};
@@ -250,6 +264,30 @@ QPushButton#Primary {{
 QPushButton#Primary:hover {{ background-color: #FFFFFF; }}
 QPushButton#Primary:pressed {{ background-color: #DDDDDD; }}
 QPushButton#Primary:disabled {{ background-color: #2A2A2A; color: {ARC_SUBTLE}; }}
+
+QPushButton#Outlined {{
+    background-color: transparent;
+    color: {ARC_WHITE};
+    border: 1px solid {ARC_BORDER_SUBTLE};
+    border-radius: 15px;
+    padding: 13px 18px;
+    font-size: 14px;
+    font-weight: 700;
+}}
+QPushButton#Outlined:hover {{ background-color: #151515; border-color: #3E3E3E; }}
+QPushButton#Outlined:pressed {{ background-color: #1E1E1E; }}
+QPushButton#Outlined:disabled {{ color: {ARC_SUBTLE}; border-color: #1B1B1B; background-color: transparent; }}
+
+QPushButton#InputTag {{
+    background-color: #222222;
+    color: {ARC_MUTED};
+    border: 1px solid #303030;
+    border-radius: 9px;
+    padding: 5px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton#InputTag:hover {{ color: {ARC_WHITE}; background-color: #2B2B2B; border-color: #424242; }}
 
 QPushButton#Ghost {{
     background-color: transparent;

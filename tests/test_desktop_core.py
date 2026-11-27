@@ -602,6 +602,58 @@ def t_ui_ast_syntax():
         ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
 
 
+@test("subtitles exclude auto-generated captions and preserve uploaded tracks")
+def t_subtitles_no_auto():
+    sys.path.insert(0, str(REPO))
+    import dl
+    info = {
+        "subtitles": {
+            "en": [{"ext": "srt", "url": "https://cdn/en.srt", "name": "English"}],
+            "hi": [{"ext": "vtt", "url": "https://cdn/hi.vtt"}],
+        },
+        "automatic_captions": {
+            "es": [{"ext": "vtt", "url": "https://cdn/auto_es.vtt"}],
+            "en": [{"ext": "vtt", "url": "https://cdn/auto_en.vtt"}],
+        },
+    }
+    tracks = dl._yt_extract_subtitles(info)
+    langs = {t["lang"] for t in tracks}
+    assert langs == {"en", "hi"}, tracks
+    assert all(not t.get("auto") for t in tracks), tracks
+    filtered = dl._normalize_subtitle_tracks(
+        tracks + [{"lang": "fr", "label": "French (Auto)", "url": "https://cdn/auto_fr.vtt", "auto": True}]
+    )
+    assert all(t["lang"] != "fr" for t in filtered), filtered
+
+
+@test("Activity and APK keep Muxing/Mixing media jobs visible and 30s backbuffer configured")
+def t_muxing_and_buffer_parity():
+    pages = (DESKTOP / "arc_desktop" / "ui" / "pages.py").read_text(encoding="utf-8")
+    mw = (DESKTOP / "arc_desktop" / "ui" / "main_window.py").read_text(encoding="utf-8")
+    kt = (REPO / "android-app" / "app" / "src" / "main" / "java" / "com" / "erawat" / "arc" / "MainActivity.kt").read_text(encoding="utf-8")
+    assert 'status, "")) != "Complete"' in pages or "!= \"Complete\"" in pages
+    assert '"Finalizing"' in mw
+    assert "Mixing media" in kt and "Muxing" in kt
+    assert "setBackBuffer(30_000, true)" in kt
+
+
+@test("store.scan_folder ignores .arc-cache and staging temp files")
+def t_store_scan_ignores_staging():
+    from arc_desktop.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        cache_dir = root / ".arc-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "temp_stream.mp4").write_bytes(b"123")
+        (root / ".temp_video.mp4").write_bytes(b"123")
+        (root / "video.temp.mp4").write_bytes(b"123")
+        (root / "Final Movie (2025).mp4").write_bytes(b"real video")
+        store = Store(path=root / "settings.json")
+        scanned = store.scan_folder(str(root))
+        names = [Path(e["path"]).name for e in scanned]
+        assert names == ["Final Movie (2025).mp4"], names
+
+
 # ============================================================== main
 def main() -> int:
     print("")

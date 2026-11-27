@@ -13,6 +13,11 @@ Mirrors MainActivity.kt's ArcPlayerScreen:
 
 from __future__ import annotations
 
+import bisect
+import html
+import re
+import threading
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -21,12 +26,57 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QSlider,
+    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QPushButton, QSlider,
     QVBoxLayout, QWidget,
 )
 
 from .. import theme
 from ..models import resolve_track_for_quality
+
+
+_TIMECODE_RE = re.compile(
+    r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[,.](\d{1,3})\s*-->\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[,.](\d{1,3})"
+)
+_TAG_RE = re.compile(r"<[^>]+>|\{\\[^}]+\}")
+
+
+def _to_ms(h: Optional[str], m: str, s: str, ms: str) -> int:
+    hours = int(h or 0)
+    minutes = int(m)
+    seconds = int(s)
+    millis = int(ms.ljust(3, "0")[:3])
+    return ((hours * 3600) + (minutes * 60) + seconds) * 1000 + millis
+
+
+def _parse_subtitles_text(raw: str) -> list[tuple[int, int, str]]:
+    """Parse SRT or WebVTT content into sorted (start_ms, end_ms, text) cues."""
+    if not raw:
+        return []
+    text = raw.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    cues: list[tuple[int, int, str]] = []
+    blocks = re.split(r"\n{2,}", text.strip())
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        match = None
+        body_start = 0
+        for idx, line in enumerate(lines[:3]):
+            m = _TIMECODE_RE.search(line)
+            if m:
+                match = m
+                body_start = idx + 1
+                break
+        if not match or body_start >= len(lines):
+            continue
+        start_ms = _to_ms(match.group(1), match.group(2), match.group(3), match.group(4))
+        end_ms = _to_ms(match.group(5), match.group(6), match.group(7), match.group(8))
+        cue_body = "\n".join(lines[body_start:])
+        cue_body = html.unescape(_TAG_RE.sub("", cue_body)).strip()
+        if cue_body and end_ms >= start_ms:
+            cues.append((start_ms, end_ms, cue_body))
+    cues.sort(key=lambda c: (c[0], c[1]))
+    return cues
 
 
 def _format_ms(ms: int) -> str:
@@ -44,6 +94,7 @@ def _format_ms(ms: int) -> str:
 class _PlayerSignals(QWidget):
     proxy_ready = Signal(int, str)
     audio_resolved = Signal(int, dict, str)
+    subtitles_loaded = Signal(int, str, object)
 
 
 class ArcPlayerDialog(QDialog):
@@ -61,22 +112,29 @@ class ArcPlayerDialog(QDialog):
         self._signals = _PlayerSignals(self)
         self._signals.proxy_ready.connect(self._on_proxy_ready)
         self._signals.audio_resolved.connect(self._on_audio_resolved)
+        self._signals.subtitles_loaded.connect(self._on_subtitles_loaded)
 
         self._selected_quality = str(self.target.get("current_quality") or "Best Available")
         self._selected_audio_lang = str(self.target.get("selected_audio_lang") or "")
+        self._selected_sub_lang = str(self.target.get("selected_sub_lang") or "")
         self._override_audio_url = ""
         self._using_fallback = False
         self._lazy_proxy_url = ""
         self._load_generation = 0
+        self._sub_generation = 0
         self._resume_seek_ms = 0
         self._user_scrubbing = False
         self._duration_ms = 0
         self._has_audio_slave = False
         self._speed = 1.0
         self._closing = False
+        self._sub_cues: list[tuple[int, int, str]] = []
+        self._sub_starts: list[int] = []
+        self._last_cue_text = ""
 
         self._selectable_qualities = self._compute_qualities()
         self._audio_options = self._compute_audio_options()
+        self._subtitle_options = self._compute_subtitle_options()
         if not self._selected_audio_lang and self._audio_options:
             self._selected_audio_lang = self._audio_options[0]["language"]
 
@@ -108,6 +166,47 @@ class ArcPlayerDialog(QDialog):
         self._stall_timer.timeout.connect(self._on_stall_timeout)
 
         self._load_active_source()
+        if self._selected_sub_lang and self._selected_sub_lang.lower() != "off":
+            self._activate_subtitle_by_key(self._selected_sub_lang)
+
+    def _compute_subtitle_options(self) -> list[dict]:
+        """Collect uploaded/manual subtitle tracks and sibling local .srt/.vtt files.
+
+        Never exposes auto-generated captions (auto=True) because they fail to load.
+        """
+        tracks: list[dict] = []
+        seen_urls: set[str] = set()
+        for t in (self.target.get("subtitle_tracks") or []):
+            if not isinstance(t, dict) or t.get("auto"):
+                continue
+            url = str(t.get("url") or "").strip()
+            lang = str(t.get("lang") or "").strip()
+            label = str(t.get("label") or lang or "Subtitles").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            tracks.append({"lang": lang or label, "label": label, "url": url, "is_local": False})
+
+        local_path = str(self.target.get("download_file_path") or "").strip()
+        if local_path:
+            lp = Path(local_path)
+            if lp.parent.is_dir():
+                stem = lp.stem
+                for cand in sorted(lp.parent.iterdir()):
+                    if not cand.is_file():
+                        continue
+                    if cand.suffix.lower() not in (".srt", ".vtt"):
+                        continue
+                    if not cand.stem.startswith(stem):
+                        continue
+                    curl = str(cand)
+                    if curl in seen_urls:
+                        continue
+                    seen_urls.add(curl)
+                    suffix_part = cand.stem[len(stem):].lstrip(".-_ ")
+                    lbl = f"Local ({suffix_part.upper()})" if suffix_part else f"Local {cand.suffix.upper().lstrip('.')}"
+                    tracks.append({"lang": suffix_part or "local", "label": lbl, "url": curl, "is_local": True})
+        return tracks
 
     def _compute_qualities(self) -> list[str]:
         raw = [str(q) for q in (self.target.get("available_qualities") or []) if str(q).strip()]
@@ -181,6 +280,29 @@ class ArcPlayerDialog(QDialog):
         self.video_widget = QVideoWidget()
         self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
         vp_layout.addWidget(self.video_widget, 1)
+
+        if self.target.get("is_audio_only"):
+            audio_banner = QLabel(f"Audio Stream\n{self.target.get('title') or 'Playing audio'}")
+            audio_banner.setAlignment(Qt.AlignCenter)
+            audio_banner.setWordWrap(True)
+            audio_banner.setStyleSheet(
+                f"color: {theme.ARC_WHITE}; background-color: #080808;"
+                f" font-size: 16px; font-weight: 700; padding: 24px;"
+            )
+            vp_layout.addWidget(audio_banner, 1)
+            self.video_widget.setVisible(False)
+
+        self.sub_overlay = QLabel(viewport)
+        self.sub_overlay.setAlignment(Qt.AlignCenter)
+        self.sub_overlay.setWordWrap(True)
+        self.sub_overlay.setVisible(False)
+        self.sub_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.sub_overlay.setStyleSheet(
+            f"background-color: rgba(5, 5, 5, 200); color: {theme.ARC_WHITE};"
+            f" border: 1px solid {theme.ARC_BORDER_SUBTLE}; border-radius: 10px;"
+            f" padding: 6px 14px; font-size: 16px; font-weight: 700;"
+        )
+        self._viewport = viewport
 
         self.error_banner = QWidget()
         self.error_banner.setVisible(False)
@@ -294,6 +416,13 @@ class ArcPlayerDialog(QDialog):
         self.audio_combo.setVisible(len(a_items) > 1)
         self.audio_combo.currentTextChanged.connect(self._on_audio_changed)
         bar.addWidget(self.audio_combo)
+
+        # Subtitles selector (uploaded/manual + local .srt/.vtt)
+        self.sub_combo = QComboBox()
+        self._populate_sub_combo()
+        self.sub_combo.setVisible(not bool(self.target.get("is_audio_only")))
+        self.sub_combo.currentIndexChanged.connect(self._on_sub_index_changed)
+        bar.addWidget(self.sub_combo)
 
         ctrl_root.addLayout(bar)
         root.addWidget(controls)
@@ -464,6 +593,7 @@ class ArcPlayerDialog(QDialog):
         if not self._user_scrubbing:
             self.seek_slider.setValue(pos)
             self.pos_label.setText(_format_ms(pos))
+        self._update_subtitle_cue(pos)
 
     def _on_duration_changed(self, dur: int) -> None:
         self._duration_ms = max(0, dur)
@@ -668,6 +798,152 @@ class ArcPlayerDialog(QDialog):
         self.error_label.setText(msg)
         self.error_banner.setVisible(True)
         self.status_badge.setText("Error")
+
+    # -------------------------------------------------------- subtitles
+    def _populate_sub_combo(self, select_label: str = "") -> None:
+        self.sub_combo.blockSignals(True)
+        self.sub_combo.clear()
+        self.sub_combo.addItem("CC: Off", "")
+        target_idx = 0
+        for opt in self._subtitle_options:
+            lbl = opt["label"]
+            self.sub_combo.addItem(f"CC: {lbl}", opt["url"])
+            if select_label and (
+                lbl.lower() == select_label.lower()
+                or opt["lang"].lower() == select_label.lower()
+            ):
+                target_idx = self.sub_combo.count() - 1
+        self.sub_combo.addItem("Load .srt/.vtt...", "__pick_file__")
+        self.sub_combo.setCurrentIndex(target_idx)
+        self.sub_combo.blockSignals(False)
+
+    def _activate_subtitle_by_key(self, key: str) -> None:
+        for idx, opt in enumerate(self._subtitle_options, start=1):
+            if opt["label"].lower() == key.lower() or opt["lang"].lower() == key.lower():
+                self.sub_combo.blockSignals(True)
+                self.sub_combo.setCurrentIndex(idx)
+                self.sub_combo.blockSignals(False)
+                self._load_subtitle_source(opt["url"], opt["label"])
+                return
+
+    def _on_sub_index_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        data = str(self.sub_combo.itemData(index) or "")
+        if not data:
+            self._sub_generation += 1
+            self._sub_cues = []
+            self._sub_starts = []
+            self._last_cue_text = ""
+            self.sub_overlay.setVisible(False)
+            return
+        if data == "__pick_file__":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load Subtitle File", "", "Subtitle Files (*.srt *.vtt);;All Files (*)"
+            )
+            if path:
+                lbl = Path(path).name
+                self._subtitle_options.append(
+                    {"lang": "local", "label": lbl, "url": path, "is_local": True}
+                )
+                self._populate_sub_combo(select_label=lbl)
+                self._load_subtitle_source(path, lbl)
+            else:
+                self.sub_combo.blockSignals(True)
+                self.sub_combo.setCurrentIndex(0)
+                self.sub_combo.blockSignals(False)
+            return
+        lbl = self.sub_combo.itemText(index).removeprefix("CC: ").strip()
+        self._load_subtitle_source(data, lbl)
+
+    def _load_subtitle_source(self, source_url: str, label: str) -> None:
+        self._sub_generation += 1
+        gen = self._sub_generation
+        p = Path(source_url)
+        if p.is_file():
+            try:
+                raw = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            self._on_subtitles_loaded(gen, label, _parse_subtitles_text(raw))
+            return
+
+        headers = dict(self.target.get("headers") or {})
+        self.status_badge.setText(f"Loading CC: {label}...")
+
+        def _worker() -> None:
+            cues: list[tuple[int, int, str]] = []
+            try:
+                req = urllib.request.Request(
+                    source_url,
+                    headers={"User-Agent": headers.get("User-Agent", "Mozilla/5.0"), **headers},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                cues = _parse_subtitles_text(raw)
+            except Exception:
+                cues = []
+            self._signals.subtitles_loaded.emit(gen, label, cues)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_subtitles_loaded(self, gen: int, label: str, cues_obj: object) -> None:
+        if self._closing or gen != self._sub_generation:
+            return
+        cues = list(cues_obj) if isinstance(cues_obj, list) else []
+        self._sub_cues = cues
+        self._sub_starts = [c[0] for c in cues]
+        self._last_cue_text = ""
+        if cues:
+            self.status_badge.setText(f"{self._selected_quality.split(' (')[0]} · CC: {label}")
+            self._update_subtitle_cue(self._player.position())
+        else:
+            self.sub_overlay.setVisible(False)
+            self.status_badge.setText("Subtitle unavailable")
+
+    def _update_subtitle_cue(self, pos_ms: int) -> None:
+        if not self._sub_cues:
+            if self.sub_overlay.isVisible():
+                self.sub_overlay.setVisible(False)
+            return
+        idx = bisect.bisect_right(self._sub_starts, pos_ms) - 1
+        cue_text = ""
+        while idx >= 0:
+            start_ms, end_ms, txt = self._sub_cues[idx]
+            if start_ms <= pos_ms <= end_ms:
+                cue_text = txt
+                break
+            if pos_ms - start_ms > 15_000:
+                break
+            idx -= 1
+        if cue_text == self._last_cue_text and self.sub_overlay.isVisible() == bool(cue_text):
+            return
+        self._last_cue_text = cue_text
+        if not cue_text:
+            self.sub_overlay.setVisible(False)
+            return
+        self.sub_overlay.setText(cue_text)
+        self._reposition_subtitle_overlay()
+        self.sub_overlay.setVisible(True)
+        self.sub_overlay.raise_()
+
+    def _reposition_subtitle_overlay(self) -> None:
+        vp = getattr(self, "_viewport", None)
+        if vp is None or not self.sub_overlay.text():
+            return
+        max_w = max(240, int(vp.width() * 0.78))
+        self.sub_overlay.setMaximumWidth(max_w)
+        self.sub_overlay.adjustSize()
+        w = min(max_w, self.sub_overlay.sizeHint().width() + 8)
+        h = self.sub_overlay.sizeHint().height()
+        x = max(12, (vp.width() - w) // 2)
+        y = max(12, vp.height() - h - 22)
+        self.sub_overlay.setGeometry(x, y, w, h)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.sub_overlay.isVisible():
+            self._reposition_subtitle_overlay()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key_Escape and self.isFullScreen():

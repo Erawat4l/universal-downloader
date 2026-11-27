@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self.analysis_url: str = ""
         self.selected_quality: str = "Best Available"
         self.selected_audio_lang: str = ""
+        self.selected_sub_lang: str = ""
         self.audio_languages: list[str] = []
         self.audio_urls: dict[str, str] = {}
         self.audio_only: bool = False
@@ -130,6 +131,10 @@ class MainWindow(QMainWindow):
         self._search_cache: dict[str, list[dict]] = {}
         self._target_cache: dict[str, dict] = {}
         self._episode_cache: dict[str, dict] = {}
+        self._active_search_job_id: str = ""
+        self._active_resolve_job_id: str = ""
+        self._cancelled_request_ids: set[str] = set()
+        self._last_resolve_payload: dict = {}
 
         self.signals = _WorkerSignals(self)
         self.signals.done.connect(self._on_engine_result)
@@ -242,20 +247,23 @@ class MainWindow(QMainWindow):
 
         search = self.search_page
         search.hit_selected.connect(self.on_search_hit)
-        search.back_requested.connect(lambda: self._select_nav(0))
+        search.back_requested.connect(self._back_from_search)
         search.copy_logs.connect(self._copy_logs)
+        search.retry_requested.connect(self._retry_search)
 
         analysis = self.analysis_page
         analysis.download_requested.connect(self.start_download)
         analysis.stream_requested.connect(self.start_stream)
         analysis.copy_link_requested.connect(self.copy_direct_link)
         analysis.back_requested.connect(self._back_from_analysis)
+        analysis.retry_requested.connect(self._retry_analysis)
         analysis.copy_logs.connect(self._copy_logs)
         analysis.quality_changed.connect(self.on_quality_changed)
         analysis.audio_only_changed.connect(self.on_audio_only_changed)
         analysis.season_selected.connect(self.on_season_selected)
         analysis.episode_selected.connect(self.on_episode_selected)
         analysis.audio_track_selected.connect(self.on_audio_track_selected)
+        analysis.subtitle_selected.connect(self.on_subtitle_selected)
         analysis.playlist_item_selected.connect(self.on_playlist_item_selected)
 
         activity = self.activity_page
@@ -265,6 +273,7 @@ class MainWindow(QMainWindow):
         activity.dismiss_requested.connect(self.dismiss_job)
         activity.open_requested.connect(self.open_path)
         activity.copy_logs_requested.connect(self.copy_job_logs)
+        activity.retry_requested.connect(self.retry_job)
 
         library = self.library_page
         library.open_requested.connect(self.open_path)
@@ -374,11 +383,42 @@ class MainWindow(QMainWindow):
             self._show_page(self.settings_page)
             self.settings_page.set_environment(self.bridge.environment())
 
+    def _back_from_search(self) -> None:
+        if self._active_search_job_id:
+            self._cancelled_request_ids.add(self._active_search_job_id)
+            self._active_search_job_id = ""
+        self._think_started_at = 0.0
+        self.search_page.thinking._running = False
+        self._home_context_page = self.home_page
+        self._sync_home_status()
+        self._select_nav(0)
+
     def _back_from_analysis(self) -> None:
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
+            self._active_resolve_job_id = ""
+        self._think_started_at = 0.0
+        self.analysis_page.thinking._running = False
+        self._sync_home_status()
         if self.results:
+            self._home_context_page = self.search_page
             self._show_page(self.search_page)
         else:
+            self._home_context_page = self.home_page
             self._select_nav(0)
+
+    def _retry_search(self) -> None:
+        if not self.current_query.strip():
+            return
+        self._search_cache.pop(self.current_query.strip().lower(), None)
+        self.start_search(self.current_query)
+
+    def _retry_analysis(self) -> None:
+        if self.analysis_url:
+            for k in list(self._target_cache):
+                if k == self.analysis_url or k.startswith(f"{self.analysis_url}#"):
+                    self._target_cache.pop(k, None)
+            self.start_analysis(self.analysis_url)
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -396,13 +436,24 @@ class MainWindow(QMainWindow):
         }.get(key, "ARC Player (Built-in)")
 
     def _sync_home_status(self) -> None:
-        running = sum(1 for j in self.jobs.values() if str(j.get("status")) in ("Downloading", "Muxing"))
+        running = sum(
+            1 for j in self.jobs.values()
+            if str(j.get("status")) not in ("Complete", "Failed", "Cancelled", "Paused")
+        )
         if running > 0:
-            self.home_page.set_status_pill(f"Downloading {running}", theme.ARC_WARNING)
+            self.home_page.set_status_pill(f"Downloading {running}", theme.ARC_WHITE)
             if len(self.nav_buttons) > 1:
                 self.nav_buttons[1].setText(f"Activity ({running})")
+        elif self._active_resolve_job_id:
+            self.home_page.set_status_pill("Analyzing...", theme.ARC_WHITE)
+            if len(self.nav_buttons) > 1:
+                self.nav_buttons[1].setText("Activity")
+        elif self._active_search_job_id:
+            self.home_page.set_status_pill("Searching...", theme.ARC_WHITE)
+            if len(self.nav_buttons) > 1:
+                self.nav_buttons[1].setText("Activity")
         else:
-            self.home_page.set_status_pill("Ready", theme.ARC_SUCCESS)
+            self.home_page.set_status_pill("Ready", theme.ARC_MUTED)
             if len(self.nav_buttons) > 1:
                 self.nav_buttons[1].setText("Activity")
 
@@ -426,44 +477,63 @@ class MainWindow(QMainWindow):
         self.start_analysis(text)
 
     def start_search(self, query: str) -> None:
+        if self._active_search_job_id:
+            self._cancelled_request_ids.add(self._active_search_job_id)
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
+            self._active_resolve_job_id = ""
         self._home_context_page = self.search_page
         self.current_query = query
         cached = self._search_cache.get(query.strip().lower())
         self.home_page.set_input(query)
         self._show_page(self.search_page)
         if cached is not None:
+            self._active_search_job_id = ""
             self.results = list(cached)
             self.search_page.set_results(query, self.results)
             self.set_status(f"{len(self.results)} result(s) for \u201c{query}\u201d")
+            self._sync_home_status()
             return
         self.results = []
         self.search_page.set_query(query, True)
-        self.home_page.set_status_pill("Searching...", theme.ARC_WARNING)
         self.set_status(f"Searching \u201c{query}\u201d...")
-        self._begin_thinking(self.search_page.thinking, "Searching media catalog")
-        self._submit({"action": "search", "query": query, "platform": "netmirror"},
-                     f"Search: \u201c{query}\u201d")
+        self._begin_thinking(self.search_page.thinking, "Searching catalog")
+        self._active_search_job_id = self._submit(
+            {"action": "search", "query": query, "platform": "netmirror"},
+            f"Search: \u201c{query}\u201d",
+        )
+        self._sync_home_status()
 
     def start_analysis(self, url: str) -> None:
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
         self._home_context_page = self.analysis_page
         self.analysis_url = url
         self.audio_only = False
+        self.selected_sub_lang = ""
         cached = self._target_cache.get(f"{url}#{self.selected_audio_lang.lower()}") or self._target_cache.get(url)
         if cached is not None:
+            self._active_resolve_job_id = ""
             self.target = dict(cached)
             self._show_page(self.analysis_page)
             self._apply_target(self.target)
             self.set_status(f"Ready: {self.target.get('title', '')}")
+            self._sync_home_status()
             return
         self.target = {}
+        self.audio_languages = []
+        self.audio_urls = {}
+        self.selected_audio_lang = ""
         self._show_page(self.analysis_page)
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(url if len(url) < 90 else url[:87] + "\u2026")
         self.analysis_page.detail_label.setText("Resolving...")
-        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
         self.set_status("Resolving media...")
-        self._begin_thinking(self.analysis_page.thinking, "Resolving media stream")
-        self._submit(self._resolve_payload(url, self._default_quality()), "Resolve media")
+        self._begin_thinking(self.analysis_page.thinking, "Resolving stream")
+        payload = self._resolve_payload(url, self._default_quality())
+        self._last_resolve_payload = dict(payload)
+        self._active_resolve_job_id = self._submit(payload, "Resolve media")
+        self._sync_home_status()
 
     def _resolve_payload(self, url: str, quality: str) -> dict:
         eff_q = "Best" if "ask" in (quality or "").lower() else quality
@@ -493,9 +563,12 @@ class MainWindow(QMainWindow):
         if not chosen:
             self.notify("That result has no playable link.")
             return
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
         self._home_context_page = self.analysis_page
         self.analysis_url = chosen
         self.audio_only = False
+        self.selected_sub_lang = ""
         prov_list = hit.get("providers") or []
         prov_str = " \u00b7 ".join(str(p).strip() for p in prov_list if str(p).strip()) if isinstance(prov_list, list) else str(prov_list or "")
         yr_str = str(hit.get("year") or "").strip()
@@ -508,22 +581,27 @@ class MainWindow(QMainWindow):
             "source": str(hit.get("source") or hit.get("type") or ""),
             "audio_languages": list(self.audio_languages),
             "selected_audio_lang": self.selected_audio_lang,
+            "selected_sub_lang": "",
         }
         cache_key = f"{chosen}#{self.selected_audio_lang.lower()}"
         cached = self._target_cache.get(cache_key) or self._target_cache.get(chosen)
         self._show_page(self.analysis_page)
         if cached is not None:
+            self._active_resolve_job_id = ""
             self.target = dict(cached)
             self._apply_target(self.target)
             self.set_status(f"Ready: {self.target.get('title', '')}")
+            self._sync_home_status()
             return
         self.analysis_page.set_loading(True)
         self.analysis_page.name_label.setText(str(hit.get("title", "Resolving...")))
         self.analysis_page.poster.set_url(str(hit.get("poster", "")))
-        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
         self.set_status(f"Resolving \u201c{hit.get('title', '')}\u201d...")
-        self._begin_thinking(self.analysis_page.thinking, "Resolving media stream")
-        self._submit(self._resolve_payload(chosen, self._default_quality()), "Resolve media")
+        self._begin_thinking(self.analysis_page.thinking, "Resolving stream")
+        payload = self._resolve_payload(chosen, self._default_quality())
+        self._last_resolve_payload = dict(payload)
+        self._active_resolve_job_id = self._submit(payload, "Resolve media")
+        self._sync_home_status()
 
     # --------------------------------------------------------- engine plumbing
     def _submit(self, payload: dict, action_label: str, job_id: Optional[str] = None) -> str:
@@ -557,6 +635,12 @@ class MainWindow(QMainWindow):
                 return
 
         if action == "search" or action_label.startswith("Search"):
+            if job_id in self._cancelled_request_ids or (
+                self._active_search_job_id and job_id != self._active_search_job_id
+            ):
+                self._cancelled_request_ids.discard(job_id)
+                return
+            self._active_search_job_id = ""
             self._finish_thinking(
                 self.search_page.thinking, action_label, duration, logs,
                 self._steps_for("search", ok, error,
@@ -579,14 +663,20 @@ class MainWindow(QMainWindow):
             return
 
         if action == "resolve" or action_label == "Resolve media":
+            if job_id in self._cancelled_request_ids or (
+                self._active_resolve_job_id and job_id != self._active_resolve_job_id
+            ):
+                self._cancelled_request_ids.discard(job_id)
+                return
+            self._active_resolve_job_id = ""
             self._sync_home_status()
             if not ok:
                 self._finish_thinking(
                     self.analysis_page.thinking, action_label, duration, logs,
                     self._steps_for("resolve", False, error, [], []), True)
                 self.analysis_page.set_busy(False)
-                self.analysis_page.name_label.setText("Could not resolve link")
-                self.analysis_page.detail_label.setText(error)
+                self.analysis_page.set_error(error)
+                self._home_context_page = self.search_page if self.results else self.home_page
                 self.set_status(error)
                 self.notify(error)
                 return
@@ -749,6 +839,12 @@ class MainWindow(QMainWindow):
         year_val = str(data.get("year") or previous.get("year") or "").strip()
         if year_val == "0":
             year_val = ""
+        sub_tracks = [
+            dict(t) for t in (data.get("subtitle_tracks") or [])
+            if isinstance(t, dict) and not t.get("auto")
+        ]
+        if not sub_tracks and previous.get("subtitle_tracks"):
+            sub_tracks = [dict(t) for t in previous.get("subtitle_tracks", []) if not t.get("auto")]
 
         return {
             "url": str(data.get("target_url", "") or previous.get("target_url", "") or direct_url),
@@ -786,6 +882,8 @@ class MainWindow(QMainWindow):
             "audio_track_urls": audio_track_urls or dict(previous.get("audio_track_urls") or {}),
             "audio_track_formats": audio_track_formats or dict(previous.get("audio_track_formats") or {}),
             "selected_audio_lang": eff_audio_lang,
+            "subtitle_tracks": sub_tracks,
+            "selected_sub_lang": self.selected_sub_lang,
             "torrent_sources": data.get("torrent_sources") or {},
             "quality": str(data.get("quality", "")),
             "year": year_val,
@@ -929,8 +1027,9 @@ class MainWindow(QMainWindow):
         new_url = self.audio_urls.get(language) or str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
         if not new_url:
             return
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
         self.analysis_page.set_busy(True)
-        self.home_page.set_status_pill("Analyzing...", theme.ARC_WARNING)
         self.set_status(f"Switching audio to {language}...")
         self._begin_thinking(self.analysis_page.thinking, f"Resolving {language} audio")
         payload = self._resolve_payload(new_url, self.selected_quality)
@@ -938,12 +1037,34 @@ class MainWindow(QMainWindow):
         if self.target.get("is_series"):
             payload["season"] = int(self.target.get("selected_season") or 1)
             payload["episode"] = int(self.target.get("selected_episode") or 1)
-        self._submit(payload, "Resolve media")
+        self._active_resolve_job_id = self._submit(payload, "Resolve media")
+        self._sync_home_status()
+
+    def on_subtitle_selected(self, label_choice: str) -> None:
+        if not self.target:
+            return
+        if not label_choice or label_choice.lower() == "off":
+            self.selected_sub_lang = ""
+            self.target["selected_sub_lang"] = ""
+            return
+        matched = next(
+            (t for t in (self.target.get("subtitle_tracks") or [])
+             if not t.get("auto") and (
+                 str(t.get("label") or "").lower() == label_choice.lower()
+                 or str(t.get("lang") or "").lower() == label_choice.lower()
+             )),
+            None,
+        )
+        lang_code = str((matched or {}).get("lang") or label_choice)
+        self.selected_sub_lang = lang_code
+        self.target["selected_sub_lang"] = lang_code
 
     def _re_resolve(self, scope: str, value: int) -> None:
         url = str(self.target.get("target_url") or self.target.get("url") or self.analysis_url)
         if not url:
             return
+        if self._active_resolve_job_id:
+            self._cancelled_request_ids.add(self._active_resolve_job_id)
         self.analysis_page.set_busy(True)
         self.set_status(f"Switching {scope} to {value}...")
         self._begin_thinking(self.analysis_page.thinking, f"Fetching {scope} {value}")
@@ -952,7 +1073,8 @@ class MainWindow(QMainWindow):
             current = self.target.get(f"selected_{other}")
             if current and other != scope:
                 payload[other] = int(current)
-        self._submit(payload, "Resolve media")
+        self._active_resolve_job_id = self._submit(payload, "Resolve media")
+        self._sync_home_status()
 
     def on_playlist_item_selected(self, entry: dict) -> None:
         url = str(entry.get("url", ""))
@@ -992,6 +1114,7 @@ class MainWindow(QMainWindow):
 
         payload = self._download_payload()
         job = self._create_job(payload)
+        job["payload"] = dict(payload)
         self.jobs[job["id"]] = job
         payload["job_id"] = job["id"]
         self._render_jobs()
@@ -1003,6 +1126,12 @@ class MainWindow(QMainWindow):
     def _download_payload(self) -> dict:
         target = self.target
         is_audio = self.audio_only
+        out_dir = self.download_dir()
+        if self.bridge and self.bridge.dl is not None:
+            try:
+                self.bridge.dl.DEFAULT_DIR = out_dir
+            except Exception:
+                pass
         engine_url = str(target.get("target_url") or target.get("url") or self.analysis_url)
         quality = "audio" if is_audio else (
             "Best" if "ask" in self.selected_quality.lower() else self.selected_quality)
@@ -1023,11 +1152,24 @@ class MainWindow(QMainWindow):
             "title": custom_title or _final_title(target, is_audio, self.selected_audio_lang),
             "quality": quality,
             "audio_only": is_audio,
-            "target_dir": self.download_dir(),
+            "target_dir": out_dir,
             "cache_dir": self.cache_dir(),
         }
         if self.selected_audio_lang:
             payload["audio_lang"] = self.selected_audio_lang
+        if not is_audio and self.selected_sub_lang and self.selected_sub_lang.lower() != "off":
+            sub_match = next(
+                (t for t in (target.get("subtitle_tracks") or [])
+                 if not t.get("auto") and (
+                     str(t.get("lang") or "").lower() == self.selected_sub_lang.lower()
+                     or str(t.get("label") or "").lower() == self.selected_sub_lang.lower()
+                 )),
+                None,
+            )
+            if sub_match and sub_match.get("url"):
+                payload["subtitle_lang"] = str(sub_match.get("lang") or self.selected_sub_lang)
+                payload["subtitle_url"] = str(sub_match.get("url") or "")
+                payload["subtitle_ext"] = str(sub_match.get("ext") or "srt")
 
         is_batch = self.download_scope in ("season", "series")
         if not is_batch and "youtube" not in engine_url.lower() and "youtu.be" not in engine_url.lower():
@@ -1086,7 +1228,13 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         result = dict(response.get("result") or {})
-        cancelled = bool(result.get("cancelled"))
+        cancelled = bool(result.get("cancelled")) or job.get("status") == "Cancelled"
+        if cancelled:
+            job["status"] = "Cancelled"
+            job["speed"] = "--"
+            self.notify(f"Cancelled: {job['title']}")
+            self._render_jobs()
+            return
         if not ok:
             job["status"] = "Failed"
             job["detail"] = error
@@ -1094,35 +1242,68 @@ class MainWindow(QMainWindow):
             job["speed"] = "--"
             self.notify(f"Failed: {job['title']}")
             self.set_status(error)
-        elif cancelled:
-            job["status"] = "Cancelled"
+            self._render_jobs()
+            return
+
+        raw_path = str(result.get("path") or job.get("path") or "").strip()
+        started_at = float(job.get("started_at") or 0.0)
+        verified_paths: list[str] = []
+        if raw_path:
+            rp = Path(raw_path)
+            if rp.is_file() and rp.stat().st_size > 0:
+                verified_paths.append(str(rp))
+            elif rp.is_dir():
+                scanned = self.store.scan_folder(str(rp), limit=200)
+                recent = [e["path"] for e in scanned if (e.get("finished_at") or 0) >= started_at - 15]
+                verified_paths.extend(recent or [e["path"] for e in scanned])
+
+        if not verified_paths:
+            # Fallback scan in download_dir for files created/modified during this job
+            scanned_root = self.store.scan_folder(self.download_dir(), limit=50)
+            for entry in scanned_root:
+                ep = str(entry.get("path") or "")
+                mtime = float(entry.get("finished_at") or 0)
+                if ep and mtime >= max(0.0, started_at - 5.0):
+                    verified_paths.append(ep)
+                    break
+
+        if not verified_paths:
+            err_detail = error if error != "The media engine encountered an issue." else ""
+            msg = err_detail or "Download finished without creating an output file."
+            job["status"] = "Failed"
+            job["detail"] = msg
+            job["error_log"] = logs or msg
             job["speed"] = "--"
-            self.notify(f"Cancelled: {job['title']}")
-        else:
-            job["status"] = "Complete"
-            job["path"] = str(result.get("path", ""))
-            job["progress"] = 100.0
-            job["speed"] = "Done"
-            job["eta"] = "--"
-            job["downloaded"] = "Done"
-            job["total"] = "Done"
-            job["quality"] = str(result.get("quality", job.get("detail", "")))
+            self.notify(f"Output file missing: {job['title']}")
+            self.set_status(msg)
+            self._render_jobs()
+            return
+
+        primary_path = verified_paths[0]
+        job["status"] = "Complete"
+        job["path"] = primary_path
+        job["progress"] = 100.0
+        job["speed"] = "Done"
+        job["eta"] = "--"
+        job["downloaded"] = "Done"
+        job["total"] = "Done"
+        job["quality"] = str(result.get("quality", job.get("detail", "")))
+        for vp in verified_paths:
+            p_obj = Path(vp)
             self.store.add_history({
-                "title": job.get("title", "Download"),
-                "path": job["path"],
+                "title": job.get("title", p_obj.stem) if len(verified_paths) == 1 else p_obj.stem,
+                "path": vp,
                 "source": job.get("source", ""),
                 "detail": job.get("detail", ""),
                 "poster": job.get("poster", ""),
             })
-            if self.store.get("notifications", True):
-                self.notify(f"Downloaded: {Path(job['path']).name}" if job["path"]
-                            else f"Downloaded: {job['title']}")
-            if self.store.get("open_folder_when_done", False) and job["path"]:
-                from ..platform_adapter import reveal_in_folder
-                reveal_in_folder(job["path"])
-            self.set_status(f"Saved {Path(job['path']).name}" if job["path"] else "Download complete")
-        self._render_jobs()
-        self._refresh_library()
+        if self.store.get("notifications", True):
+            self.notify(f"Downloaded: {Path(primary_path).name}")
+        if self.store.get("open_folder_when_done", False) and primary_path:
+            from ..platform_adapter import reveal_in_folder
+            reveal_in_folder(primary_path)
+        self.set_status(f"Saved {Path(primary_path).name}")
+        self._render_jobs(refresh_library=True)
 
     def start_stream(self) -> None:
         if not self.target:
@@ -1168,6 +1349,8 @@ class MainWindow(QMainWindow):
                 "audio_track_urls": dict(self.target.get("audio_track_urls") or {}),
                 "audio_track_formats": dict(self.target.get("audio_track_formats") or {}),
                 "selected_audio_lang": self.selected_audio_lang,
+                "subtitle_tracks": list(self.target.get("subtitle_tracks") or []),
+                "selected_sub_lang": self.selected_sub_lang,
                 "is_series": bool(self.target.get("is_series")),
                 "selected_season": int(self.target.get("selected_season") or 1),
                 "selected_episode": int(self.target.get("selected_episode") or 1),
@@ -1236,6 +1419,26 @@ class MainWindow(QMainWindow):
         self.jobs.pop(job_id, None)
         self._render_jobs()
 
+    def retry_job(self, job_id: str) -> None:
+        job = self.jobs.get(job_id)
+        if not job or not job.get("payload"):
+            return
+        payload = dict(job["payload"])
+        new_id = str(uuid.uuid4())
+        payload["job_id"] = new_id
+        job["id"] = new_id
+        job["status"] = "Downloading"
+        job["progress"] = 0.0
+        job["speed"] = "Connecting..."
+        job["downloaded"] = "Starting..."
+        job["error_log"] = ""
+        job["started_at"] = time.time()
+        self.jobs.pop(job_id, None)
+        self.jobs[new_id] = job
+        self._render_jobs()
+        self._submit(payload, f"Download: {job['title']}", job_id=new_id)
+        self.notify(f"Retrying: {job['title']}")
+
     def _set_job_status(self, job_id: str, status: str) -> None:
         job = self.jobs.get(job_id)
         if job:
@@ -1243,13 +1446,12 @@ class MainWindow(QMainWindow):
             job["speed"] = "--" if status in ("Paused", "Cancelled") else job.get("speed", "--")
             self._render_jobs()
 
-    def _render_jobs(self) -> None:
+    def _render_jobs(self, refresh_library: bool = False) -> None:
         ordered = sorted(self.jobs.values(), key=lambda j: j.get("started_at", 0), reverse=True)
         self.activity_page.set_jobs(ordered)
         self._sync_home_status()
-        entries = self._library_entries()
-        self.library_page.set_entries(entries, self.download_dir())
-        self.home_page.set_recent(entries, self.open_path, self.reveal_path, self.delete_file)
+        if refresh_library:
+            self._refresh_library()
 
     def copy_job_logs(self, job_id: str) -> None:
         job = self.jobs.get(job_id) or {}
@@ -1509,7 +1711,7 @@ class MainWindow(QMainWindow):
 
     def _active_jobs(self) -> list[str]:
         return [job_id for job_id, job in self.jobs.items()
-                if str(job.get("status")) in ("Downloading", "Muxing", "Queued", "Paused")]
+                if str(job.get("status")) not in ("Complete", "Failed", "Cancelled")]
 
     def _poll_progress(self) -> None:
         active = self._active_jobs()
@@ -1533,9 +1735,12 @@ class MainWindow(QMainWindow):
                 percent = float(snapshot.get("percent", 0.0) or 0.0)
             except (TypeError, ValueError):
                 percent = 0.0
-            status = str(snapshot.get("status", "") or "")
+            raw_status = str(snapshot.get("status", "") or "").strip()
+            # Never flip to Complete inside the poll loop before _handle_download_result
+            # verifies the output file on disk and records it into Library history.
+            status = "Finalizing" if raw_status == "Complete" else raw_status
             values = {
-                "progress": percent,
+                "progress": 100.0 if status == "Finalizing" else percent,
                 "speed": str(snapshot.get("speed", "--") or "--"),
                 "eta": str(snapshot.get("eta", "--") or "--"),
                 "downloaded": str(snapshot.get("downloaded_str", "--") or "--"),
@@ -1548,12 +1753,14 @@ class MainWindow(QMainWindow):
             if current != values:
                 job.update(values)
                 changed = True
-            if status and status != str(job.get("status")) and str(job.get("status")) not in (
+            cur_status = str(job.get("status"))
+            if status and status != cur_status and cur_status not in (
                     "Cancelled", "Failed", "Complete"):
-                job["status"] = status
-                changed = True
+                if not (cur_status == "Paused" and status == "Downloading"):
+                    job["status"] = status
+                    changed = True
         if changed:
-            self._render_jobs()
+            self._render_jobs(refresh_library=False)
 
     def _tick_thinking(self) -> None:
         if not self._think_started_at:
@@ -1561,9 +1768,8 @@ class MainWindow(QMainWindow):
         elapsed = time.time() - self._think_started_at
         for page in (self.search_page, self.analysis_page):
             thinking = getattr(page, "thinking", None)
-            if thinking is not None and thinking.isVisible():
-                detail = thinking.detail_label.text()
-                live_step = detail.split("   [")[0] if "   [" in detail else ""
+            if thinking is not None and thinking.isVisible() and getattr(thinking, "_running", False):
+                live_step = thinking.title_label.text()
                 thinking.tick(elapsed, live_step)
 
     def _copy_logs(self) -> None:

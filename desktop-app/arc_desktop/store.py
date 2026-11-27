@@ -174,7 +174,13 @@ class Store:
                       ".pdf", ".m3u8"}
         found: list[dict] = []
         try:
-            entries = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in extensions]
+            entries = [
+                p for p in root.rglob("*")
+                if p.is_file()
+                and p.suffix.lower() in extensions
+                and not any(part.startswith(".") for part in p.relative_to(root).parts)
+                and not p.stem.endswith((".part", ".temp", ".tmp", ".ytdl"))
+            ]
         except Exception:
             return []
         entries.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)

@@ -246,8 +246,15 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.CaptionStyleCompat
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import android.app.Activity
+import android.util.TypedValue
 import androidx.compose.material.icons.outlined.FitScreen
+import androidx.compose.material.icons.outlined.Subtitles
+import androidx.compose.material.icons.outlined.FolderOpen
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -272,6 +279,68 @@ private enum class AppTab(val label: String, val icon: ImageVector) {
 }
 
 private data class AudioChoice(val language: String, val url: String)
+private data class SubtitleChoice(
+    val lang: String,
+    val label: String,
+    val url: String,
+    val ext: String = "vtt",
+    val mime: String = "",
+    val source: String = "",
+    val auto: Boolean = false,
+    val trackGroupIndex: Int = -1,
+    val trackIndex: Int = -1,
+)
+
+private fun subtitleMimeForUrlOrExt(url: String, ext: String = "", explicitMime: String = ""): String {
+    val em = explicitMime.trim()
+    if (em.isNotBlank()) return em
+    val cleanExt = ext.trim().lowercase()
+    val cleanUrl = url.lowercase()
+    return when {
+        cleanExt == "srt" || cleanUrl.contains(".srt") -> MimeTypes.APPLICATION_SUBRIP
+        cleanExt == "ssa" || cleanExt == "ass" || cleanUrl.contains(".ssa") || cleanUrl.contains(".ass") -> MimeTypes.TEXT_SSA
+        else -> MimeTypes.TEXT_VTT
+    }
+}
+
+private fun parseSubtitleTracks(data: JSONObject?): List<SubtitleChoice> {
+    val arr = data?.optJSONArray("subtitle_tracks") ?: return emptyList()
+    val out = mutableListOf<SubtitleChoice>()
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val url = obj.optString("url").trim()
+        if (url.isBlank()) continue
+        val lang = obj.optString("lang").trim().ifBlank { "und" }
+        val label = obj.optString("label").trim().ifBlank { lang.uppercase() }
+        val ext = obj.optString("ext").trim().lowercase()
+        val mime = subtitleMimeForUrlOrExt(url, ext, obj.optString("mime"))
+        val source = obj.optString("source").trim()
+        val auto = obj.optBoolean("auto", false)
+        if (out.none { it.label.equals(label, ignoreCase = true) && it.url == url }) {
+            out.add(
+                SubtitleChoice(
+                    lang = lang,
+                    label = label,
+                    url = url,
+                    ext = ext,
+                    mime = mime,
+                    source = source,
+                    auto = auto,
+                )
+            )
+        }
+    }
+    return out
+}
+
+private fun queryUriDisplayName(context: Context, uri: Uri): String {
+    return runCatching {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx != -1 && cursor.moveToFirst()) cursor.getString(idx).orEmpty() else ""
+        }.orEmpty()
+    }.getOrDefault("")
+}
 private data class SearchHit(
     val title: String,
     val source: String,
@@ -337,6 +406,8 @@ private data class PlayerStreamTarget(
     val audioTrackUrls: Map<String, String> = emptyMap(),
     val audioTrackFormats: Map<String, String> = emptyMap(),
     val selectedAudioLang: String = "",
+    val subtitleTracks: List<SubtitleChoice> = emptyList(),
+    val selectedSubLang: String = "",
     val isSeries: Boolean = false,
     val selectedSeason: Int = 1,
     val selectedEpisode: Int = 1,
@@ -485,6 +556,8 @@ private data class MediaTarget(
     val audioTrackUrls: Map<String, String> = emptyMap(),
     val audioTrackFormats: Map<String, String> = emptyMap(),
     val selectedAudioLang: String = "",
+    val subtitleTracks: List<SubtitleChoice> = emptyList(),
+    val selectedSubLang: String = "",
     val year: String = "",
     val mediaCategory: String = "",
     val providers: String = "",
@@ -627,6 +700,9 @@ private fun loadSeriesEpisode(
         hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
         val epAudioUrls = parseStringMap(data?.optJSONObject("audio_track_urls"))
         val epAudioFormats = parseStringMap(data?.optJSONObject("audio_track_formats"))
+        val epSubTracks = parseSubtitleTracks(data)
+        val effSubTracks = if (epSubTracks.isNotEmpty()) epSubTracks else target.subtitleTracks
+        val effSelectedSub = if (target.selectedSubLang.isNotBlank() && effSubTracks.any { it.lang.equals(target.selectedSubLang, true) }) target.selectedSubLang else ""
         val updatedTarget = target.copy(
             selectedSeason = seasonNum,
             selectedEpisode = episodeNum,
@@ -643,6 +719,8 @@ private fun loadSeriesEpisode(
             fallbackFormat = resolvedSpec.fallbackFormat,
             audioTrackUrls = if (epAudioUrls.isNotEmpty()) epAudioUrls else target.audioTrackUrls,
             audioTrackFormats = if (epAudioFormats.isNotEmpty()) epAudioFormats else target.audioTrackFormats,
+            subtitleTracks = effSubTracks,
+            selectedSubLang = effSelectedSub,
             streamHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders,
         )
         onTargetUpdated(updatedTarget)
@@ -1363,7 +1441,7 @@ private fun ArcApp(
 
     // Live download progress polling loop from embedded engine
     LaunchedEffect(jobs) {
-        while (jobs.any { it.status == "Downloading" || it.status == "Paused" }) {
+        while (jobs.any { it.status in listOf("Downloading", "Muxing", "Mixing media", "Merging", "Fetching", "Queued", "Paused") }) {
             delay(400)
             val progressObj = withContext(Dispatchers.IO) {
                 EmbeddedEngine.getProgress()
@@ -1409,12 +1487,40 @@ private fun ArcApp(
                 return
             }
 
+            val localSubs = runCatching {
+                val stem = file.nameWithoutExtension
+                file.parentFile?.listFiles()?.filter { sf ->
+                    sf.isFile &&
+                        (sf.extension.equals("srt", ignoreCase = true) || sf.extension.equals("vtt", ignoreCase = true)) &&
+                        sf.nameWithoutExtension.startsWith(stem, ignoreCase = true)
+                }?.sortedBy { it.name }?.map { sf ->
+                    val afterStem = sf.nameWithoutExtension.removePrefix(stem).trimStart('.', '_', '-', ' ')
+                    val langTag = afterStem.ifBlank { "en" }
+                    val dispLabel = when (langTag.lowercase()) {
+                        "en", "eng", "english" -> "English"
+                        "hi", "hin", "hindi" -> "Hindi"
+                        else -> langTag.replaceFirstChar { c -> c.uppercase() }
+                    }
+                    val sUri = resolvePlayableLocalUri(context, sf, false)
+                    SubtitleChoice(
+                        lang = langTag,
+                        label = dispLabel,
+                        url = if (canOpenContentUri(context, sUri)) sUri.toString() else Uri.fromFile(sf).toString(),
+                        ext = sf.extension.lowercase(),
+                        mime = subtitleMimeForUrlOrExt(sf.name, sf.extension),
+                        source = "local",
+                    )
+                }.orEmpty()
+            }.getOrDefault(emptyList())
+
             if (chosenPlayer == "arc_player" || chosenPlayer == "system_chooser") {
                 inAppPlayerTarget = PlayerStreamTarget(
                     url = localUri.toString(),
                     title = displayTitle,
                     isAudioOnlyStream = isAudioFile,
                     downloadFilePath = file.absolutePath,
+                    subtitleTracks = localSubs,
+                    selectedSubLang = localSubs.firstOrNull()?.lang.orEmpty(),
                 )
                 return
             }
@@ -1441,6 +1547,8 @@ private fun ArcApp(
                     title = displayTitle,
                     isAudioOnlyStream = isAudioFile,
                     downloadFilePath = file.absolutePath,
+                    subtitleTracks = localSubs,
+                    selectedSubLang = localSubs.firstOrNull()?.lang.orEmpty(),
                 )
                 return
             }
@@ -1579,6 +1687,8 @@ private fun ArcApp(
         audioTrackUrls: Map<String, String> = emptyMap(),
         audioTrackFormats: Map<String, String> = emptyMap(),
         selectedAudioLang: String = "",
+        subtitleTracks: List<SubtitleChoice> = emptyList(),
+        selectedSubLang: String = "",
         isSeries: Boolean = false,
         selectedSeason: Int = 1,
         selectedEpisode: Int = 1,
@@ -1606,6 +1716,8 @@ private fun ArcApp(
                 audioTrackUrls = audioTrackUrls,
                 audioTrackFormats = audioTrackFormats,
                 selectedAudioLang = selectedAudioLang,
+                subtitleTracks = subtitleTracks,
+                selectedSubLang = selectedSubLang,
                 isSeries = isSeries,
                 selectedSeason = selectedSeason,
                 selectedEpisode = selectedEpisode,
@@ -1824,6 +1936,8 @@ private fun ArcApp(
                                             audioTrackUrls = parseStringMap(rData.optJSONObject("audio_track_urls")),
                                             audioTrackFormats = parseStringMap(rData.optJSONObject("audio_track_formats")),
                                             selectedAudioLang = prefLang,
+                                            subtitleTracks = parseSubtitleTracks(rData),
+                                            selectedSubLang = "",
                                             mediaCategory = if (isSeries) "TV SERIES" else "MOVIE",
                                             year = hit.year,
                                             providers = hit.providers,
@@ -2010,6 +2124,7 @@ private fun ArcApp(
 
                 val resolvedAudioUrls = parseStringMap(data?.optJSONObject("audio_track_urls"))
                 val resolvedAudioFormats = parseStringMap(data?.optJSONObject("audio_track_formats"))
+                val resolvedSubTracks = parseSubtitleTracks(data)
                 target = target.copy(
                     title = resolvedTitle,
                     source = finalSource,
@@ -2040,6 +2155,8 @@ private fun ArcApp(
                     audioTrackUrls = if (resolvedAudioUrls.isNotEmpty()) resolvedAudioUrls else target.audioTrackUrls,
                     audioTrackFormats = if (resolvedAudioFormats.isNotEmpty()) resolvedAudioFormats else target.audioTrackFormats,
                     selectedAudioLang = preferredLang,
+                    subtitleTracks = if (resolvedSubTracks.isNotEmpty()) resolvedSubTracks else target.subtitleTracks,
+                    selectedSubLang = "",
                     year = resolvedYear,
                     mediaCategory = resolvedCategory,
                     providers = resolvedProviders,
@@ -2558,6 +2675,19 @@ private fun ArcApp(
             if (activeAudioLang.isNotBlank()) {
                 put("audio_lang", activeAudioLang)
             }
+            val chosenSubKey = target.selectedSubLang.trim()
+            if (!isAudio && chosenSubKey.isNotBlank() && !chosenSubKey.equals("Off", ignoreCase = true)) {
+                val chosenSub = target.subtitleTracks.firstOrNull {
+                    it.lang.equals(chosenSubKey, ignoreCase = true) || it.label.equals(chosenSubKey, ignoreCase = true)
+                }
+                if (chosenSub != null) {
+                    put("subtitle_lang", chosenSub.lang)
+                    put("subtitle_url", chosenSub.url)
+                    put("subtitle_ext", chosenSub.ext)
+                } else {
+                    put("subtitle_lang", chosenSubKey)
+                }
+            }
             put("target_dir", downloadPath)
             put("cache_dir", context.cacheDir.absolutePath)
             put("job_id", job.id)
@@ -2753,7 +2883,9 @@ private fun ArcApp(
                                             audioOnly = false
                                             target = pre.copy(
                                                 audioTracks = if (sortedAudios.isNotEmpty()) sortedAudios else prioritizeAudioTracks(pre.audioTracks),
-                                                selectedAudioLang = chosenLang.ifBlank { pre.selectedAudioLang }
+                                                selectedAudioLang = chosenLang.ifBlank { pre.selectedAudioLang },
+                                                subtitleTracks = pre.subtitleTracks,
+                                                selectedSubLang = "",
                                             )
                                             overlay = "analysis"
                                             homeOverlay = "analysis"
@@ -2860,6 +2992,11 @@ private fun ArcApp(
                                             providersOverride = target.providers,
                                         )
                                     },
+                                    onSelectSubtitle = { subLang ->
+                                        target = target.copy(
+                                            selectedSubLang = if (subLang.isBlank() || subLang.equals("Off", ignoreCase = true)) "" else subLang
+                                        )
+                                    },
                                     onDownload = {
                                         if (target.isSeries) {
                                             showSeriesDownloadDialog = true
@@ -2920,6 +3057,8 @@ private fun ArcApp(
                                                     audioTrackUrls = target.audioTrackUrls,
                                                     audioTrackFormats = target.audioTrackFormats,
                                                     selectedAudioLang = target.selectedAudioLang,
+                                                    subtitleTracks = target.subtitleTracks,
+                                                    selectedSubLang = target.selectedSubLang,
                                                     isSeries = target.isSeries,
                                                     selectedSeason = target.selectedSeason,
                                                     selectedEpisode = target.selectedEpisode,
@@ -2969,6 +3108,8 @@ private fun ArcApp(
                                                     hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
                                                     val sAudioUrls = parseStringMap(data?.optJSONObject("audio_track_urls"))
                                                     val sAudioFormats = parseStringMap(data?.optJSONObject("audio_track_formats"))
+                                                    val sSubTracks = parseSubtitleTracks(data)
+                                                    val effSubTracks = if (sSubTracks.isNotEmpty()) sSubTracks else target.subtitleTracks
                                                     val effAudioUrls = if (sAudioUrls.isNotEmpty()) sAudioUrls else target.audioTrackUrls
                                                     val effAudioFormats = if (sAudioFormats.isNotEmpty()) sAudioFormats else target.audioTrackFormats
                                                     val playUrl = resolvedSpec.url.ifBlank { directUrl.ifBlank { proxyUrl } }
@@ -2989,6 +3130,7 @@ private fun ArcApp(
                                                             fallbackFormat = resolvedSpec.fallbackFormat,
                                                             audioTrackUrls = effAudioUrls,
                                                             audioTrackFormats = effAudioFormats,
+                                                            subtitleTracks = effSubTracks,
                                                             streamHeaders = effHeaders,
                                                         )
                                                         playStream(
@@ -3006,6 +3148,8 @@ private fun ArcApp(
                                                             audioTrackUrls = effAudioUrls,
                                                             audioTrackFormats = effAudioFormats,
                                                             selectedAudioLang = target.selectedAudioLang,
+                                                            subtitleTracks = effSubTracks,
+                                                            selectedSubLang = target.selectedSubLang,
                                                             isSeries = target.isSeries,
                                                             selectedSeason = target.selectedSeason,
                                                             selectedEpisode = target.selectedEpisode,
@@ -3078,7 +3222,7 @@ private fun ArcApp(
                         }
                     }
                     AppTab.ACTIVITY -> ActivityScreen(
-                        jobs = jobs.filter { it.status in listOf("Downloading", "Queued", "Paused", "Failed") },
+                        jobs = jobs.filter { it.status in listOf("Downloading", "Muxing", "Mixing media", "Merging", "Fetching", "Queued", "Paused", "Failed") },
                         onCancelJob = { cancelJob(it) },
                         onPauseJob = { pauseJob(it) },
                         onResumeJob = { resumeJob(it) },
@@ -3925,6 +4069,7 @@ private fun AnalysisScreen(
     onSelectEpisode: ((Int) -> Unit)? = null,
     onSelectPlaylistItem: ((PlaylistEntry) -> Unit)? = null,
     onSelectAudio: ((AudioChoice) -> Unit)? = null,
+    onSelectSubtitle: ((String) -> Unit)? = null,
 ) {
     val isSeriesTarget = (
         target.isSeries ||
@@ -4126,6 +4271,47 @@ private fun AnalysisScreen(
                             label = { Text(aChoice.language) },
                             colors = arcFilterChipColors(),
                             border = arcFilterChipBorder(isAudioSelected),
+                        )
+                    }
+                }
+            }
+        }
+
+        // Subtitle Tracks selector: visible only when subtitles were resolved
+        if (!loading && !audioOnly && target.subtitleTracks.isNotEmpty()) {
+            item {
+                val curSubKey = target.selectedSubLang.trim()
+                val curSubDisplay = if (curSubKey.isBlank() || curSubKey.equals("Off", ignoreCase = true)) {
+                    "Off"
+                } else {
+                    target.subtitleTracks.firstOrNull {
+                        it.lang.equals(curSubKey, ignoreCase = true) || it.label.equals(curSubKey, ignoreCase = true)
+                    }?.label ?: curSubKey
+                }
+                SectionHeader("Subtitles", curSubDisplay)
+                Spacer(Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item {
+                        val isOffSelected = curSubDisplay == "Off"
+                        FilterChip(
+                            selected = isOffSelected,
+                            onClick = { onSelectSubtitle?.invoke("") },
+                            label = { Text("Off") },
+                            colors = arcFilterChipColors(),
+                            border = arcFilterChipBorder(isOffSelected),
+                        )
+                    }
+                    items(target.subtitleTracks) { subChoice ->
+                        val isSubSelected = curSubDisplay != "Off" && (
+                            subChoice.lang.equals(curSubKey, ignoreCase = true) ||
+                                subChoice.label.equals(curSubKey, ignoreCase = true)
+                            )
+                        FilterChip(
+                            selected = isSubSelected,
+                            onClick = { onSelectSubtitle?.invoke(if (isSubSelected) "" else subChoice.lang) },
+                            label = { Text(subChoice.label) },
+                            colors = arcFilterChipColors(),
+                            border = arcFilterChipBorder(isSubSelected),
                         )
                     }
                 }
@@ -5634,6 +5820,26 @@ private fun ArcPlayerScreen(
     var overrideAudioFormat by remember(streamTarget) { mutableStateOf("") }
     var isSwitchingAudio by remember(streamTarget) { mutableStateOf(false) }
 
+    var embeddedSubtitleTracks by remember(streamTarget) { mutableStateOf<List<SubtitleChoice>>(emptyList()) }
+    var deviceSubtitleTracks by remember(streamTarget) { mutableStateOf<List<SubtitleChoice>>(emptyList()) }
+    var selectedSubKey by remember(streamTarget) {
+        mutableStateOf(
+            run {
+                val initSub = streamTarget.selectedSubLang.trim()
+                if (initSub.isBlank() || initSub.equals("Off", ignoreCase = true)) {
+                    ""
+                } else {
+                    streamTarget.subtitleTracks.firstOrNull {
+                        it.url == initSub ||
+                            it.lang.equals(initSub, ignoreCase = true) ||
+                            it.label.equals(initSub, ignoreCase = true)
+                    }?.url ?: initSub
+                }
+            }
+        )
+    }
+    var subtitleTextSizeSp by remember { mutableFloatStateOf(18f) }
+
     val selectableQualities = remember(currentTarget) {
         val raw = currentTarget.availableQualities
         if (raw.isEmpty()) {
@@ -5847,22 +6053,26 @@ private fun ArcPlayerScreen(
         DefaultDataSource.Factory(context, httpFactory)
     }
 
-    val exoPlayer = remember(context) {
-        val renderersFactory = DefaultRenderersFactory(context)
-            .setEnableDecoderFallback(true)
-        val trackSelector = DefaultTrackSelector(context).apply {
+    val trackSelector = remember(context) {
+        DefaultTrackSelector(context).apply {
             parameters = buildUponParameters()
                 .setExceedVideoConstraintsIfNecessary(true)
                 .setAllowVideoMixedMimeTypeAdaptiveness(true)
                 .build()
         }
+    }
+
+    val exoPlayer = remember(context, trackSelector) {
+        val renderersFactory = DefaultRenderersFactory(context)
+            .setEnableDecoderFallback(true)
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                20_000, // minBufferMs
-                60_000, // maxBufferMs
+                30_000, // minBufferMs: preload at least 30s ahead
+                90_000, // maxBufferMs
                 1_500,  // bufferForPlaybackMs
                 3_000   // bufferForPlaybackAfterRebufferMs
             )
+            .setBackBuffer(30_000, true) // retain 30s before playhead for instant rewind/back
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
         ExoPlayer.Builder(context, renderersFactory)
@@ -5871,16 +6081,104 @@ private fun ArcPlayerScreen(
             .build()
     }
 
-    fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean): MediaSource {
+    val subHttpDataSourceFactory = remember(context, dataSourceFactory) {
+        val cleanSubHttp = DefaultHttpDataSource.Factory()
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(15_000)
+            .setAllowCrossProtocolRedirects(true)
+            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        DefaultDataSource.Factory(context, cleanSubHttp)
+    }
+
+    val allSubOptions = remember(currentTarget.subtitleTracks, deviceSubtitleTracks, embeddedSubtitleTracks) {
+        val merged = mutableListOf<SubtitleChoice>()
+        for (item in currentTarget.subtitleTracks + deviceSubtitleTracks + embeddedSubtitleTracks) {
+            if (merged.none { it.url == item.url }) {
+                merged.add(item)
+            }
+        }
+        merged
+    }
+
+    val activeSubChoice = remember(selectedSubKey, allSubOptions) {
+        val key = selectedSubKey.trim()
+        if (key.isBlank() || key.equals("Off", ignoreCase = true)) {
+            null
+        } else {
+            allSubOptions.firstOrNull {
+                it.url == key || it.lang.equals(key, ignoreCase = true) || it.label.equals(key, ignoreCase = true)
+            }
+        }
+    }
+
+    val activeExternalSub = remember(activeSubChoice) {
+        activeSubChoice?.takeIf { it.trackGroupIndex < 0 && it.url.isNotBlank() }
+    }
+
+    val subPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { pickedUri: Uri? ->
+        if (pickedUri != null) {
+            val fileName = queryUriDisplayName(context, pickedUri).ifBlank { "Local Subtitle" }
+            val ext = fileName.substringAfterLast('.', "srt").lowercase()
+            val mime = subtitleMimeForUrlOrExt(fileName, ext)
+            val newSub = SubtitleChoice(
+                lang = "dev_${deviceSubtitleTracks.size + 1}",
+                label = fileName.substringBeforeLast('.').ifBlank { "Device Subtitle" },
+                url = pickedUri.toString(),
+                ext = ext,
+                mime = mime,
+                source = "device",
+            )
+            resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+            deviceSubtitleTracks = deviceSubtitleTracks + newSub
+            selectedSubKey = newSub.url
+            showSettingsSheet = false
+            interactionTick++
+        }
+    }
+
+    fun buildSubtitleConfig(sub: SubtitleChoice): MediaItem.SubtitleConfiguration {
+        val subUri = toPlayerMediaUri(sub.url)
+        val effMime = subtitleMimeForUrlOrExt(sub.url, sub.ext, sub.mime)
+        return MediaItem.SubtitleConfiguration.Builder(subUri)
+            .setMimeType(effMime)
+            .setLanguage(sub.lang.ifBlank { "en" })
+            .setLabel(sub.label.ifBlank { "Subtitle" })
+            .setId("arc_ext_sub")
+            .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+            .build()
+    }
+
+    fun buildExternalSubtitleSource(sub: SubtitleChoice): MediaSource {
+        val subConfig = buildSubtitleConfig(sub)
+        val useCleanSubFactory = sub.url.contains("strem.io", ignoreCase = true) ||
+            sub.url.startsWith("content://", ignoreCase = true) ||
+            sub.url.startsWith("file://", ignoreCase = true) ||
+            sub.url.startsWith("/")
+        val factoryToUse = if (useCleanSubFactory) subHttpDataSourceFactory else dataSourceFactory
+        return SingleSampleMediaSource.Factory(factoryToUse).createMediaSource(subConfig, C.TIME_UNSET)
+    }
+
+    fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean, externalSub: SubtitleChoice? = null): MediaSource {
         val uri = toPlayerMediaUri(rawUrl)
-        val item = MediaItem.fromUri(uri)
+        val itemBuilder = MediaItem.Builder().setUri(uri)
+        if (externalSub != null && !preferDirectExtractor) {
+            itemBuilder.setSubtitleConfigurations(listOf(buildSubtitleConfig(externalSub)))
+        }
+        val item = itemBuilder.build()
         val isHls = rawUrl.contains(".m3u8", ignoreCase = true) ||
             rawUrl.contains("manifest/hls_playlist", ignoreCase = true) ||
             rawUrl.contains("hls_playlist", ignoreCase = true)
-        return when {
+        val baseSource = when {
             isHls -> HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
             preferDirectExtractor -> ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
             else -> DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory).createMediaSource(item)
+        }
+        return if (externalSub != null && !preferDirectExtractor) {
+            MergingMediaSource(baseSource, buildExternalSubtitleSource(externalSub))
+        } else {
+            baseSource
         }
     }
 
@@ -5890,7 +6188,8 @@ private fun ArcPlayerScreen(
                 var selectedVideo = false
                 var selectedAudio = false
                 val summaryParts = mutableListOf<String>()
-                for (group in tracks.groups) {
+                val detectedEmbeddedSubs = mutableListOf<SubtitleChoice>()
+                for ((gIdx, group) in tracks.groups.withIndex()) {
                     val kind = when (group.type) {
                         C.TRACK_TYPE_VIDEO -> "video"
                         C.TRACK_TYPE_AUDIO -> "audio"
@@ -5902,7 +6201,34 @@ private fun ArcPlayerScreen(
                     for (idx in 0 until group.length) {
                         val fmt = group.getTrackFormat(idx)
                         summaryParts.add("$kind[sel=${group.isTrackSelected(idx)},sup=${group.isTrackSupported(idx)},mime=${fmt.sampleMimeType},codecs=${fmt.codecs},${fmt.width}x${fmt.height}]")
+                        if (group.type == C.TRACK_TYPE_TEXT && fmt.id != "arc_ext_sub") {
+                            val rawLang = fmt.language.orEmpty().trim()
+                            val rawLbl = fmt.label.orEmpty().trim()
+                            val disp = rawLbl.ifBlank {
+                                when (rawLang.lowercase()) {
+                                    "en", "eng", "english" -> "English"
+                                    "hi", "hin", "hindi" -> "Hindi"
+                                    "" -> "Embedded Track ${detectedEmbeddedSubs.size + 1}"
+                                    else -> rawLang.uppercase()
+                                }
+                            }
+                            detectedEmbeddedSubs.add(
+                                SubtitleChoice(
+                                    lang = rawLang.ifBlank { disp },
+                                    label = disp,
+                                    url = "hls:$gIdx:$idx",
+                                    ext = "vtt",
+                                    mime = fmt.sampleMimeType.orEmpty(),
+                                    source = "embedded",
+                                    trackGroupIndex = gIdx,
+                                    trackIndex = idx,
+                                )
+                            )
+                        }
                     }
+                }
+                if (detectedEmbeddedSubs != embeddedSubtitleTracks) {
+                    embeddedSubtitleTracks = detectedEmbeddedSubs
                 }
                 Log.i(
                     "ArcPlayer",
@@ -6002,21 +6328,44 @@ private fun ArcPlayerScreen(
         }
     }
 
-    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, lazyProxyUrl, retryCounter) {
+    LaunchedEffect(trackSelector, activeSubChoice, embeddedSubtitleTracks) {
+        val builder = trackSelector.buildUponParameters()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+        val sub = activeSubChoice
+        if (sub == null) {
+            builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+        } else if (sub.trackGroupIndex >= 0) {
+            val targetGroup = exoPlayer.currentTracks.groups.getOrNull(sub.trackGroupIndex)
+            builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            if (targetGroup != null && targetGroup.type == C.TRACK_TYPE_TEXT && sub.trackIndex in 0 until targetGroup.length) {
+                builder.setOverrideForType(TrackSelectionOverride(targetGroup.mediaTrackGroup, sub.trackIndex))
+            }
+        } else {
+            builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+        }
+        trackSelector.parameters = builder.build()
+    }
+
+    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, lazyProxyUrl, retryCounter, activeExternalSub?.url) {
         val hasSplitTracks = !usingFallback &&
             !currentTarget.isAudioOnlyStream &&
             activeTrack.videoUrl.isNotBlank() &&
             activeTrack.audioUrl.isNotBlank()
 
         val source = runCatching {
+            val extSub = if (!currentTarget.isAudioOnlyStream) activeExternalSub else null
             if (hasSplitTracks) {
                 val videoSource = buildMediaSource(activeTrack.videoUrl, preferDirectExtractor = true)
                 val audioSource = buildMediaSource(activeTrack.audioUrl, preferDirectExtractor = true)
                 Log.i(
                     "ArcPlayer",
-                    "Preparing MergingMediaSource -> video=[${activeTrack.videoFormat}] audio=[${activeTrack.audioFormat}]"
+                    "Preparing MergingMediaSource -> video=[${activeTrack.videoFormat}] audio=[${activeTrack.audioFormat}] sub=[${extSub?.label ?: "none"}]"
                 )
-                MergingMediaSource(videoSource, audioSource)
+                if (extSub != null) {
+                    MergingMediaSource(videoSource, audioSource, buildExternalSubtitleSource(extSub))
+                } else {
+                    MergingMediaSource(videoSource, audioSource)
+                }
             } else {
                 val singleUrl = if (usingFallback) effFallbackUrl.ifBlank { primaryUrl } else primaryUrl
                 if (singleUrl.isBlank()) {
@@ -6024,9 +6373,9 @@ private fun ArcPlayerScreen(
                 } else {
                     Log.i(
                         "ArcPlayer",
-                        "Preparing single MediaSource (usingFallback=$usingFallback) -> fmt=[${if (usingFallback) activeTrack.fallbackFormat else activeTrack.videoFormat.ifBlank { "muxed" }}]"
+                        "Preparing single MediaSource (usingFallback=$usingFallback) -> fmt=[${if (usingFallback) activeTrack.fallbackFormat else activeTrack.videoFormat.ifBlank { "muxed" }}] sub=[${extSub?.label ?: "none"}]"
                     )
-                    buildMediaSource(singleUrl, preferDirectExtractor = false)
+                    buildMediaSource(singleUrl, preferDirectExtractor = false, externalSub = extSub)
                 }
             }
         }.onFailure { err ->
@@ -6309,6 +6658,21 @@ private fun ArcPlayerScreen(
                     keepScreenOn = true
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     setKeepContentOnPlayerReset(true)
+                    subtitleView?.apply {
+                        setStyle(
+                            CaptionStyleCompat(
+                                android.graphics.Color.WHITE,
+                                android.graphics.Color.argb(170, 0, 0, 0),
+                                android.graphics.Color.TRANSPARENT,
+                                CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW,
+                                android.graphics.Color.argb(200, 0, 0, 0),
+                                null
+                            )
+                        )
+                        setApplyEmbeddedStyles(false)
+                        setApplyEmbeddedFontSizes(false)
+                        setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, subtitleTextSizeSp)
+                    }
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -6319,6 +6683,7 @@ private fun ArcPlayerScreen(
                 view.player = exoPlayer
                 view.useController = false
                 view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                view.subtitleView?.setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, subtitleTextSizeSp)
             },
             modifier = Modifier.fillMaxSize()
         )
@@ -6987,6 +7352,7 @@ private fun ArcPlayerScreen(
                                                             val newHeaders = parseStringMap(data.optJSONObject("stream_headers") ?: data.optJSONObject("headers"))
                                                             val newAudioUrls = parseStringMap(data.optJSONObject("audio_track_urls"))
                                                             val newAudioFormats = parseStringMap(data.optJSONObject("audio_track_formats"))
+                                                            val newSubTracks = parseSubtitleTracks(data)
                                                             val spec = resolveTrackForQuality(
                                                                 quality = selectedQuality,
                                                                 qualityTracks = qTrackMap,
@@ -7012,6 +7378,7 @@ private fun ArcPlayerScreen(
                                                                 audioTrackUrls = if (newAudioUrls.isNotEmpty()) newAudioUrls else currentTarget.audioTrackUrls,
                                                                 audioTrackFormats = if (newAudioFormats.isNotEmpty()) newAudioFormats else currentTarget.audioTrackFormats,
                                                                 selectedAudioLang = aOpt.language,
+                                                                subtitleTracks = if (newSubTracks.isNotEmpty()) newSubTracks else currentTarget.subtitleTracks,
                                                             )
                                                             retryCounter++
                                                         }
@@ -7027,6 +7394,99 @@ private fun ArcPlayerScreen(
                                     colors = arcFilterChipColors(),
                                     border = arcFilterChipBorder(isSel),
                                 )
+                            }
+                        }
+                    }
+                }
+
+                // Subtitles Track & Device Picker
+                if (!currentTarget.isAudioOnlyStream) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(Icons.Outlined.Subtitles, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(18.dp))
+                            Text("Subtitles", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ArcWhite)
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                activeSubChoice?.label ?: "Off",
+                                fontSize = 12.sp,
+                                color = ArcMuted,
+                            )
+                        }
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            item {
+                                val isOff = activeSubChoice == null
+                                FilterChip(
+                                    selected = isOff,
+                                    onClick = {
+                                        if (!isOff) {
+                                            if (activeExternalSub != null) {
+                                                resumeSeekMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                            }
+                                            selectedSubKey = ""
+                                        }
+                                        showSettingsSheet = false
+                                        interactionTick++
+                                    },
+                                    label = { Text("Off") },
+                                    colors = arcFilterChipColors(),
+                                    border = arcFilterChipBorder(isOff),
+                                )
+                            }
+                            items(allSubOptions) { subOpt ->
+                                val isSel = activeSubChoice?.url == subOpt.url
+                                FilterChip(
+                                    selected = isSel,
+                                    onClick = {
+                                        if (!isSel) {
+                                            val curPos = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                            val needsSourceReload = subOpt.trackGroupIndex < 0 || activeExternalSub != null
+                                            if (needsSourceReload) {
+                                                resumeSeekMs = curPos
+                                            }
+                                            selectedSubKey = subOpt.url
+                                        }
+                                        showSettingsSheet = false
+                                        interactionTick++
+                                    },
+                                    label = { Text(subOpt.label) },
+                                    colors = arcFilterChipColors(),
+                                    border = arcFilterChipBorder(isSel),
+                                )
+                            }
+                            item {
+                                FilterChip(
+                                    selected = false,
+                                    onClick = {
+                                        subPickerLauncher.launch(arrayOf("application/x-subrip", "text/vtt", "text/plain", "*/*"))
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    },
+                                    label = { Text("Load from device") },
+                                    colors = arcFilterChipColors(),
+                                    border = arcFilterChipBorder(false),
+                                )
+                            }
+                        }
+                        if (activeSubChoice != null) {
+                            val sizeOptions = listOf("Small" to 14f, "Medium" to 18f, "Large" to 22f)
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(sizeOptions) { (sizeLabel, spVal) ->
+                                    val isSizeSel = kotlin.math.abs(subtitleTextSizeSp - spVal) < 0.5f
+                                    FilterChip(
+                                        selected = isSizeSel,
+                                        onClick = {
+                                            subtitleTextSizeSp = spVal
+                                            interactionTick++
+                                        },
+                                        label = { Text("Size: $sizeLabel") },
+                                        colors = arcFilterChipColors(),
+                                        border = arcFilterChipBorder(isSizeSel),
+                                    )
+                                }
                             }
                         }
                     }

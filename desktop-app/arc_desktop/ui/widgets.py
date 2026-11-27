@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 from PySide6.QtCore import Qt, QUrl, Signal, QRectF
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QFontMetrics, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea,
@@ -76,17 +76,19 @@ class SectionHeader(QWidget):
 
 
 class StatusPill(QWidget):
-    """Small rounded status token, like the APK's badge boxes."""
+    """Small monochrome rounded status token, matching the APK badge pill."""
 
     def __init__(self, text: str = "Ready", parent=None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 12, 6)
+        layout.setContentsMargins(10, 5, 12, 5)
         layout.setSpacing(7)
         self.dot = QLabel()
         self.dot.setFixedSize(6, 6)
         self.text_label = QLabel(text)
-        self.text_label.setObjectName("Meta")
+        self.text_label.setStyleSheet(
+            f"color: {theme.ARC_WHITE}; font-size: 11px; font-weight: 600;"
+        )
         layout.addWidget(self.dot)
         layout.addWidget(self.text_label)
         self.set_style(theme.ARC_MUTED)
@@ -95,7 +97,7 @@ class StatusPill(QWidget):
         self.dot.setStyleSheet(f"background-color: {color}; border-radius: 3px;")
         self.setStyleSheet(
             f"StatusPill {{ background-color: {theme.ARC_SURFACE};"
-            f" border: 1px solid {theme.ARC_BORDER_STRONG}; border-radius: 11px; }}"
+            f" border: 1px solid {theme.ARC_BORDER_SUBTLE}; border-radius: 12px; }}"
         )
 
     def set_text(self, text: str, color: Optional[str] = None) -> None:
@@ -326,6 +328,7 @@ class ThinkingCard(QFrame):
     """
 
     copy_logs = Signal()
+    retry_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -337,7 +340,7 @@ class ThinkingCard(QFrame):
         self._running = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 13, 14, 13)
+        root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
         header = QWidget()
@@ -345,11 +348,12 @@ class ThinkingCard(QFrame):
         header_layout.setContentsMargins(2, 2, 2, 2)
         header_layout.setSpacing(10)
 
-        self.icon_tile = QLabel("\u25B6")
-        self.icon_tile.setFixedSize(28, 28)
+        self.icon_tile = QLabel("\u25CB")
+        self.icon_tile.setFixedSize(26, 26)
         self.icon_tile.setAlignment(Qt.AlignCenter)
         self.icon_tile.setStyleSheet(
-            f"background-color: #1E1E1E; border-radius: 14px; color: {theme.ARC_WHITE}; font-size: 13px;"
+            f"background-color: {theme.ARC_RAISED}; border: 1px solid {theme.ARC_BORDER_SUBTLE};"
+            f" border-radius: 13px; color: {theme.ARC_WHITE}; font-size: 12px;"
         )
         header_layout.addWidget(self.icon_tile)
 
@@ -357,13 +361,21 @@ class ThinkingCard(QFrame):
         text_column.setContentsMargins(0, 0, 0, 0)
         text_column.setSpacing(2)
         self.title_label = label("Ready", "SectionHeader")
-        self.title_label.setStyleSheet(f"font-size: 13px; font-weight: 700;")
+        self.title_label.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {theme.ARC_WHITE};")
         self.detail_label = label("", "Meta")
         text_column.addWidget(self.title_label)
         text_column.addWidget(self.detail_label)
         header_layout.addLayout(text_column, 1)
 
-        self.toggle_button = QPushButton("Details")
+        self.retry_button = QPushButton("Retry")
+        self.retry_button.setObjectName("Primary")
+        self.retry_button.setCursor(Qt.PointingHandCursor)
+        self.retry_button.setStyleSheet("padding: 5px 12px; font-size: 11px; border-radius: 10px;")
+        self.retry_button.clicked.connect(lambda: self.retry_clicked.emit())
+        self.retry_button.setVisible(False)
+        header_layout.addWidget(self.retry_button)
+
+        self.toggle_button = QPushButton("Details \u25BE")
         self.toggle_button.setObjectName("Ghost")
         self.toggle_button.setCursor(Qt.PointingHandCursor)
         self.toggle_button.clicked.connect(self.toggle)
@@ -425,14 +437,18 @@ class ThinkingCard(QFrame):
         self._steps = []
         self._logs = ""
         self._is_error = False
-        self.title_label.setText("Processing...")
-        self.detail_label.setText(live_step or action)
-        self.icon_tile.setText("\u203A")
+        self._expanded = False
+        self.body.setVisible(False)
+        self.toggle_button.setText("Details \u25BE")
+        self.retry_button.setVisible(False)
+        self.title_label.setText(live_step or action or "Searching catalog...")
+        self.detail_label.setText("0.0s")
+        self.icon_tile.setText("\u25CC")
         self.icon_tile.setStyleSheet(
-            f"background-color: #1E1E1E; border-radius: 14px;"
-            f" color: {theme.ARC_WARNING}; font-size: 15px; font-weight: 700;"
+            f"background-color: {theme.ARC_RAISED}; border: 1px solid {theme.ARC_BORDER_SUBTLE};"
+            f" border-radius: 13px; color: {theme.ARC_MUTED}; font-size: 13px; font-weight: 700;"
         )
-        self.log_dot.setStyleSheet(f"background-color: {theme.ARC_WARNING}; border-radius: 4px;")
+        self.log_dot.setStyleSheet(f"background-color: {theme.ARC_MUTED}; border-radius: 4px;")
         self._render()
         self.setVisible(True)
 
@@ -440,9 +456,8 @@ class ThinkingCard(QFrame):
         if not self._running:
             return
         if live_step:
-            self.detail_label.setText(f"{live_step}   [{elapsed_seconds:.1f}s]")
-        else:
-            self.detail_label.setText(f"[{elapsed_seconds:.1f}s]")
+            self.title_label.setText(live_step)
+        self.detail_label.setText(f"{elapsed_seconds:.1f}s")
 
     def finish(self, action: str, duration_seconds: float, steps: list[str],
                logs: str = "", is_error: bool = False) -> None:
@@ -451,15 +466,26 @@ class ThinkingCard(QFrame):
         self._logs = logs or ""
         self._is_error = bool(is_error)
         accent = theme.ARC_ERROR if is_error else theme.ARC_SUCCESS
-        self.title_label.setText(
-            f"{'Failed' if is_error else 'Completed'} in {duration_seconds:.1f}s \u00b7 {len(self._steps)} steps"
-        )
-        self.detail_label.setText(action)
-        self.icon_tile.setText("\u2715" if is_error else "\u2713")
-        self.icon_tile.setStyleSheet(
-            f"background-color: {'#381515' if is_error else '#1B2E1E'}; border-radius: 14px;"
-            f" color: {accent}; font-size: 13px; font-weight: 800;"
-        )
+        self.retry_button.setVisible(bool(is_error))
+        if is_error:
+            self.title_label.setText(f"Failed in {duration_seconds:.1f}s")
+            self.detail_label.setText(action or "Request failed")
+            self.icon_tile.setText("\u2715")
+            self.icon_tile.setStyleSheet(
+                f"background-color: #2A1616; border: 1px solid #4A2424; border-radius: 13px;"
+                f" color: {theme.ARC_ERROR}; font-size: 12px; font-weight: 800;"
+            )
+        else:
+            step_word = "step" if len(self._steps) == 1 else "steps"
+            self.title_label.setText(
+                f"Completed in {duration_seconds:.1f}s \u00b7 {len(self._steps)} {step_word}"
+            )
+            self.detail_label.setText(action)
+            self.icon_tile.setText("\u2713")
+            self.icon_tile.setStyleSheet(
+                f"background-color: #16281A; border: 1px solid #26482D; border-radius: 13px;"
+                f" color: {theme.ARC_SUCCESS}; font-size: 12px; font-weight: 800;"
+            )
         self.log_dot.setStyleSheet(f"background-color: {accent}; border-radius: 4px;")
         self.copy_button.setVisible(bool(self._logs.strip()))
         self._render()
@@ -468,7 +494,7 @@ class ThinkingCard(QFrame):
     def toggle(self) -> None:
         self._expanded = not self._expanded
         self.body.setVisible(self._expanded)
-        self.toggle_button.setText("Hide" if self._expanded else "Details")
+        self.toggle_button.setText("Hide \u25B4" if self._expanded else "Details \u25BE")
 
     def _render(self) -> None:
         if self._steps:
@@ -498,6 +524,7 @@ class JobCard(QFrame):
     dismiss_clicked = Signal(str)
     open_clicked = Signal(str)
     logs_clicked = Signal(str)
+    retry_clicked = Signal(str)
 
     def __init__(self, job: dict, parent=None) -> None:
         super().__init__(parent)
@@ -518,7 +545,9 @@ class JobCard(QFrame):
         column.setSpacing(3)
         self.title_label = QLabel(str(job.get("title", "Download")))
         self.title_label.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.title_label.setMinimumWidth(0)
         self.detail_label = label(str(job.get("detail", "")), "Meta")
+        self.detail_label.setWordWrap(True)
         column.addWidget(self.title_label)
         column.addWidget(self.detail_label)
         column.addStretch(1)
@@ -548,13 +577,15 @@ class JobCard(QFrame):
         actions.setSpacing(8)
         actions.addStretch(1)
         self.open_button = self._button("Open", self.open_clicked)
+        self.retry_button = self._button("Retry", self.retry_clicked)
         self.logs_button = self._button("Copy Logs", self.logs_clicked)
         self.pause_button = self._button("Pause", self.pause_clicked)
         self.resume_button = self._button("Resume", self.resume_clicked)
         self.cancel_button = self._button("Cancel", self.cancel_clicked)
         self.dismiss_button = self._button("Dismiss", self.dismiss_clicked)
-        for button in (self.open_button, self.logs_button, self.pause_button, self.resume_button,
-                       self.cancel_button, self.dismiss_button):
+        for button in (self.open_button, self.retry_button, self.logs_button,
+                       self.pause_button, self.resume_button, self.cancel_button,
+                       self.dismiss_button):
             actions.addWidget(button)
         root.addLayout(actions)
         self.update(job)
@@ -577,8 +608,14 @@ class JobCard(QFrame):
         eta = str(job.get("eta", "--")).replace("ETA", "").strip() or "--"
         downloaded = str(job.get("downloaded", "--"))
         total = str(job.get("total", "--"))
+
+        is_muxing = status in ("Muxing", "Mixing media", "Merging", "Processing")
+        is_finalizing = status == "Finalizing"
+        is_queued = status in ("Queued", "Fetching")
         connecting = (
-            status == "Downloading" and percent <= 0.5
+            (is_queued or status == "Downloading")
+            and not is_muxing and not is_finalizing
+            and percent <= 0.5
             and (speed in ("--", "", "Connecting...") or downloaded in ("0 MB", "--")
                  or downloaded.startswith("Starting"))
         )
@@ -588,13 +625,37 @@ class JobCard(QFrame):
         source = str(job.get("source", ""))
         if source and source.lower() not in ("netmirror", "stream", "catalog", "direct file", "arc"):
             detail = f"{detail} \u00b7 {source}" if detail else source
+        if status == "Failed":
+            err_msg = str(job.get("error_log") or "").strip().splitlines()
+            if err_msg and err_msg[-1] and err_msg[-1] not in detail:
+                detail = f"{detail} \u2014 {err_msg[-1][:140]}" if detail else err_msg[-1][:140]
         self.detail_label.setText(detail)
 
-        pill_label = "Muxing" if status == "Muxing" else ("Fetching" if connecting else status)
-        pill_color = theme.ARC_ERROR if status == "Failed" else (theme.ARC_WARNING if status == "Muxing" else theme.ARC_MUTED)
+        if is_muxing:
+            pill_label = "Mixing media"
+            pill_color = theme.ARC_WHITE
+        elif is_finalizing:
+            pill_label = "Finalizing"
+            pill_color = theme.ARC_WHITE
+        elif connecting:
+            pill_label = "Fetching"
+            pill_color = theme.ARC_MUTED
+        elif status == "Failed":
+            pill_label = "Failed"
+            pill_color = theme.ARC_ERROR
+        elif status == "Complete":
+            pill_label = "Complete"
+            pill_color = theme.ARC_SUCCESS
+        elif status == "Downloading":
+            pill_label = "Downloading"
+            pill_color = theme.ARC_WHITE
+        else:
+            pill_label = status
+            pill_color = theme.ARC_MUTED
+
         self.status_pill.set_text(pill_label, pill_color)
         self.progress.setObjectName("Failed" if status == "Failed" else "Progress")
-        if connecting:
+        if connecting or (is_muxing and (percent <= 0.5 or percent >= 99.0)):
             self.progress.setRange(0, 0)
         else:
             self.progress.setRange(0, 1000)
@@ -604,10 +665,20 @@ class JobCard(QFrame):
 
         if connecting:
             self.percent_label.setText("Connecting & resolving stream...")
-            self.speed_label.setText("Resolving...")
-        elif status == "Muxing":
-            self.percent_label.setText(f"Merging video & audio ({percent:.0f}%)...")
-            self.speed_label.setText(speed if speed != "--" else "Muxing")
+            self.speed_label.setText("Fetching...")
+        elif is_muxing:
+            if 1.0 <= percent < 99.0:
+                self.percent_label.setText(f"Mixing media \u00b7 {percent:.0f}%")
+            else:
+                self.percent_label.setText("Mixing media \u00b7 Merging video & audio...")
+            self.speed_label.setText(speed if speed not in ("--", "") else "Muxing")
+        elif is_finalizing:
+            self.percent_label.setText("100.0%  \u00b7  Finalizing output...")
+            self.speed_label.setText("Saving")
+        elif status == "Paused":
+            size_text = downloaded if total in ("--", "", "Done") else f"{downloaded} / {total}"
+            self.percent_label.setText(f"{percent:.1f}%  \u00b7  {size_text}")
+            self.speed_label.setText("Paused")
         else:
             size_text = downloaded if total in ("--", "", "Done") else f"{downloaded} / {total}"
             self.percent_label.setText(f"{percent:.1f}%  \u00b7  {size_text}")
@@ -616,10 +687,14 @@ class JobCard(QFrame):
         done = status == "Complete" and str(job.get("path", "")).strip() != ""
         has_err = status == "Failed" and bool(str(job.get("error_log") or job.get("detail") or "").strip())
         self.open_button.setVisible(done)
+        self.retry_button.setVisible(status == "Failed" and bool(job.get("payload")))
         self.logs_button.setVisible(has_err)
         self.pause_button.setVisible(status == "Downloading")
         self.resume_button.setVisible(status == "Paused")
-        self.cancel_button.setVisible(status in ("Downloading", "Paused", "Muxing"))
+        self.cancel_button.setVisible(
+            status in ("Downloading", "Paused", "Muxing", "Mixing media",
+                       "Merging", "Fetching", "Queued", "Processing", "Finalizing")
+        )
         self.dismiss_button.setVisible(status in ("Failed", "Cancelled", "Complete"))
 
 
@@ -646,9 +721,11 @@ class LibraryCard(QFrame):
         column = QVBoxLayout()
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(3)
-        self.title_label = QLabel(str(entry.get("title", "File")))
+        self._full_title = str(entry.get("title", "File"))
+        self.title_label = QLabel(self._full_title)
         self.title_label.setStyleSheet("font-size: 14px; font-weight: 700;")
         self.title_label.setWordWrap(False)
+        self.title_label.setMinimumWidth(0)
         self.meta_label = label(str(entry.get("detail", "")), "Meta")
         column.addWidget(self.title_label)
         column.addWidget(self.meta_label)
@@ -657,6 +734,9 @@ class LibraryCard(QFrame):
         root.addLayout(top)
 
         self.path_label = label(self.path, "MetaDim")
+        self.path_label.setMinimumWidth(0)
+        self.path_label.setWordWrap(False)
+        self.path_label.setToolTip(self.path)
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(self.path_label)
 
@@ -691,10 +771,34 @@ class LibraryCard(QFrame):
         size = human_size(entry.get("size_bytes"))
         detail = str(entry.get("detail", ""))
         self.meta_label.setText(f"{detail} \u00b7 {size}" if size != "--" else detail)
-        self.title_label.setText(str(entry.get("title", "File")))
-        p = str(entry.get("path", self.path) or "").lower()
+        self._full_title = str(entry.get("title", "File"))
+        self.path = str(entry.get("path", self.path) or "")
+        self.path_label.setToolTip(self.path)
+        self._apply_elision()
+        p = self.path.lower()
         is_media = p.endswith((".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".m3u8", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".opus"))
         self.open_button.setText("Play" if is_media or not p else "Open")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elision()
+
+    def _apply_elision(self) -> None:
+        title_txt = getattr(self, "_full_title", self.title_label.text())
+        tw = self.title_label.width()
+        if tw > 40:
+            self.title_label.setText(
+                QFontMetrics(self.title_label.font()).elidedText(title_txt, Qt.ElideRight, tw)
+            )
+        else:
+            self.title_label.setText(title_txt)
+        pw = self.path_label.width()
+        if pw > 40:
+            self.path_label.setText(
+                QFontMetrics(self.path_label.font()).elidedText(self.path, Qt.ElideMiddle, pw)
+            )
+        else:
+            self.path_label.setText(self.path)
 
 
 class Toast(QWidget):

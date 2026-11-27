@@ -279,16 +279,27 @@ def _ffmpeg_mux(video: str, audio: str, output: str) -> bool:
     ffmpeg = which("ffmpeg")
     if not ffmpeg or not (os.path.exists(video) and os.path.exists(audio)):
         return False
-    try:
-        Path(output).parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [ffmpeg, "-y", "-i", video, "-i", audio,
-             "-c", "copy", "-movflags", "+faststart", output],
-            check=True, capture_output=True,
-        )
-        return os.path.exists(output) and os.path.getsize(output) > 0
-    except Exception:
-        return False
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+    cmds = [
+        [ffmpeg, "-y", "-i", video, "-i", audio,
+         "-c", "copy", "-movflags", "+faststart", output],
+        [ffmpeg, "-y", "-i", video, "-i", audio,
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+         "-movflags", "+faststart", output],
+    ]
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, creationflags=flags)
+            if os.path.exists(output) and os.path.getsize(output) > 0:
+                return True
+        except Exception:
+            try:
+                if os.path.exists(output) and os.path.getsize(output) == 0:
+                    os.remove(output)
+            except OSError:
+                pass
+    return False
 
 
 def install_desktop_muxer() -> bool:

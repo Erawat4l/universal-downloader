@@ -24,6 +24,8 @@ import threading
 import concurrent.futures
 import asyncio
 import warnings
+import json
+import time
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 warnings.filterwarnings("ignore", message=".*unclosed.*")
@@ -69,6 +71,9 @@ def _patch_ytdlp_muxer():
 
         orig_merger_run = FFmpegMergerPP.run
         def custom_merger_run(self, info):
+            _jid = get_current_job_id()
+            if _jid:
+                render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=_jid, downloaded_str="Mixing media", status_override="Muxing")
             if shutil.which("ffmpeg"):
                 try:
                     return orig_merger_run(self, info)
@@ -563,6 +568,397 @@ def register_dynamic_playlist(subpath, content):
     active_port = LOCAL_PROXY_PORT or 8765
     return f"http://127.0.0.1:{active_port}/{clean_sub}"
 
+
+_SUB_LANG_META = {
+    "en": ("en", "English"), "eng": ("en", "English"), "english": ("en", "English"),
+    "hi": ("hi", "Hindi"), "hin": ("hi", "Hindi"), "hindi": ("hi", "Hindi"),
+    "ta": ("ta", "Tamil"), "tam": ("ta", "Tamil"), "tamil": ("ta", "Tamil"),
+    "te": ("te", "Telugu"), "tel": ("te", "Telugu"), "telugu": ("te", "Telugu"),
+    "bn": ("bn", "Bengali"), "ben": ("bn", "Bengali"), "bengali": ("bn", "Bengali"),
+    "ml": ("ml", "Malayalam"), "mal": ("ml", "Malayalam"), "malayalam": ("ml", "Malayalam"),
+    "kn": ("kn", "Kannada"), "kan": ("kn", "Kannada"), "kannada": ("kn", "Kannada"),
+    "mr": ("mr", "Marathi"), "mar": ("mr", "Marathi"), "marathi": ("mr", "Marathi"),
+    "pa": ("pa", "Punjabi"), "pan": ("pa", "Punjabi"), "punjabi": ("pa", "Punjabi"),
+    "ur": ("ur", "Urdu"), "urd": ("ur", "Urdu"), "urdu": ("ur", "Urdu"),
+    "es": ("es", "Spanish"), "spa": ("es", "Spanish"), "spanish": ("es", "Spanish"),
+    "fr": ("fr", "French"), "fra": ("fr", "French"), "fre": ("fr", "French"), "french": ("fr", "French"),
+    "de": ("de", "German"), "deu": ("de", "German"), "ger": ("de", "German"), "german": ("de", "German"),
+    "ja": ("ja", "Japanese"), "jpn": ("ja", "Japanese"), "japanese": ("ja", "Japanese"),
+    "ko": ("ko", "Korean"), "kor": ("ko", "Korean"), "korean": ("ko", "Korean"),
+    "pt": ("pt", "Portuguese"), "por": ("pt", "Portuguese"), "pob": ("pt", "Portuguese"), "portuguese": ("pt", "Portuguese"),
+    "ru": ("ru", "Russian"), "rus": ("ru", "Russian"), "russian": ("ru", "Russian"),
+    "zh": ("zh", "Chinese"), "zho": ("zh", "Chinese"), "chi": ("zh", "Chinese"), "chinese": ("zh", "Chinese"),
+    "ar": ("ar", "Arabic"), "ara": ("ar", "Arabic"), "arabic": ("ar", "Arabic"),
+    "id": ("id", "Indonesian"), "ind": ("id", "Indonesian"), "indonesian": ("id", "Indonesian"),
+    "it": ("it", "Italian"), "ita": ("it", "Italian"), "italian": ("it", "Italian"),
+    "tr": ("tr", "Turkish"), "tur": ("tr", "Turkish"), "turkish": ("tr", "Turkish"),
+}
+
+
+def _normalize_sub_lang_code(raw_lang):
+    s = str(raw_lang or "").strip().lower()
+    if not s:
+        return "en"
+    base = re.split(r"[-_.\s]+", s)[0]
+    if s in _SUB_LANG_META:
+        return _SUB_LANG_META[s][0]
+    if base in _SUB_LANG_META:
+        return _SUB_LANG_META[base][0]
+    clean = re.sub(r"[^a-z0-9]", "", base)
+    return (clean[:3] if clean else "und")
+
+
+def _sub_lang_display(raw_lang, fallback_label=""):
+    s = str(raw_lang or "").strip().lower()
+    fb = str(fallback_label or "").strip()
+    fb_clean = re.sub(r"\s*\(.*?\)", "", fb).strip().lower()
+    base = re.split(r"[-_.\s]+", s)[0] if s else ""
+    for key in (s, base, fb_clean):
+        if key and key in _SUB_LANG_META:
+            return _SUB_LANG_META[key][1]
+    if fb and len(fb) <= 28:
+        return fb
+    return s.upper() if s else "Unknown"
+
+
+def _srt_to_vtt(srt_text):
+    text = str(srt_text or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if text.upper().startswith("WEBVTT"):
+        return text + "\n"
+    converted = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", text)
+    return "WEBVTT\n\n" + converted + "\n"
+
+
+def _vtt_to_srt(vtt_text):
+    text = str(vtt_text or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    blocks = []
+    cur = []
+    skip_meta = False
+    for raw_ln in lines:
+        ln = raw_ln.rstrip()
+        if ln.startswith("WEBVTT") and not blocks and not cur:
+            continue
+        if ln.startswith(("NOTE", "STYLE", "REGION")) and not cur:
+            skip_meta = True
+            continue
+        if skip_meta:
+            if not ln.strip():
+                skip_meta = False
+            continue
+        if not ln.strip():
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append(cur)
+
+    out_cues = []
+    cue_num = 1
+    for blk in blocks:
+        ts_idx = -1
+        for i, bl in enumerate(blk):
+            if "-->" in bl:
+                ts_idx = i
+                break
+        if ts_idx < 0:
+            continue
+        ts_line = blk[ts_idx]
+        m_ts = re.match(
+            r"^\s*((?:\d{1,2}:)?\d{2}:\d{2})\.(\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2})\.(\d{3})",
+            ts_line,
+        )
+        if m_ts:
+            start_hms = m_ts.group(1) if m_ts.group(1).count(":") == 2 else "00:" + m_ts.group(1)
+            end_hms = m_ts.group(3) if m_ts.group(3).count(":") == 2 else "00:" + m_ts.group(3)
+            if len(start_hms.split(":")[0]) == 1:
+                start_hms = "0" + start_hms
+            if len(end_hms.split(":")[0]) == 1:
+                end_hms = "0" + end_hms
+            ts_clean = f"{start_hms},{m_ts.group(2)} --> {end_hms},{m_ts.group(4)}"
+        else:
+            ts_clean = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", ts_line)
+        body_lines = [re.sub(r"</?c[^>]*>", "", x) for x in blk[ts_idx + 1:] if x.strip()]
+        if not body_lines:
+            continue
+        out_cues.append(f"{cue_num}\n{ts_clean}\n" + "\n".join(body_lines))
+        cue_num += 1
+    return ("\n\n".join(out_cues) + "\n") if out_cues else ""
+
+
+def _sub_priority_key(item):
+    lang = _normalize_sub_lang_code(item.get("lang"))
+    is_auto = 1 if item.get("auto") else 0
+    ext = str(item.get("ext") or "").lower()
+    lang_rank = 0 if lang == "en" else (1 if lang == "hi" else 2)
+    major_order = ["ta", "te", "bn", "es", "fr", "de", "ja", "ko", "pt", "ru", "ar", "zh", "id", "it", "tr"]
+    sub_rank = major_order.index(lang) if lang in major_order else 50
+    ext_rank = 0 if ext == "vtt" else (1 if ext == "srt" else 2)
+    return (lang_rank, is_auto, sub_rank, ext_rank, str(item.get("label") or ""))
+
+
+def _normalize_subtitle_tracks(tracks, limit=15):
+    seen = {}
+    for t in (tracks or []):
+        if not isinstance(t, dict):
+            continue
+        if t.get("auto"):
+            continue
+        url = str(t.get("url") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        raw_lang = str(t.get("raw_lang") or t.get("lang") or "").strip()
+        norm_lang = _normalize_sub_lang_code(raw_lang or t.get("label"))
+        ext = str(t.get("ext") or "").strip().lower()
+        if ext not in ("vtt", "srt"):
+            ext = "vtt" if ".vtt" in url.lower() else ("srt" if ".srt" in url.lower() else "srt")
+        disp = str(t.get("label") or "").strip()
+        if not disp:
+            disp = _sub_lang_display(raw_lang or norm_lang)
+        norm_item = {
+            "lang": norm_lang,
+            "raw_lang": raw_lang or norm_lang,
+            "label": disp,
+            "url": url,
+            "ext": ext,
+            "mime": "text/vtt" if ext == "vtt" else "application/x-subrip",
+            "source": str(t.get("source") or "stream"),
+            "auto": False,
+        }
+        dedupe_key = norm_lang
+        existing = seen.get(dedupe_key)
+        if existing is None or _sub_priority_key(norm_item) < _sub_priority_key(existing):
+            seen[dedupe_key] = norm_item
+    final = sorted(seen.values(), key=_sub_priority_key)
+    return final[:limit]
+
+
+def _yt_extract_subtitles(info, limit=15):
+    if not isinstance(info, dict):
+        return []
+    raw_items = []
+
+    sub_map = info.get("subtitles") or {}
+    if isinstance(sub_map, dict):
+        for raw_code, fmt_list in sub_map.items():
+            if not isinstance(fmt_list, list) or not fmt_list:
+                continue
+            code_str = str(raw_code or "").strip()
+            if not code_str or code_str.lower() == "live_chat":
+                continue
+            vtt_cand = None
+            srt_cand = None
+            for f in fmt_list:
+                if not isinstance(f, dict):
+                    continue
+                u = str(f.get("url") or "").strip()
+                if not u.startswith(("http://", "https://")):
+                    continue
+                ext = str(f.get("ext") or "").strip().lower()
+                if ext == "vtt" and vtt_cand is None:
+                    vtt_cand = (u, "vtt", f.get("name"))
+                elif ext == "srt" and srt_cand is None:
+                    srt_cand = (u, "srt", f.get("name"))
+            chosen = vtt_cand or srt_cand
+            if not chosen:
+                continue
+            u, ext, yt_name = chosen
+            disp = _sub_lang_display(code_str, fallback_label=yt_name or "")
+            raw_items.append({
+                "lang": _normalize_sub_lang_code(code_str),
+                "raw_lang": code_str,
+                "label": disp,
+                "url": u,
+                "ext": ext,
+                "source": "youtube",
+                "auto": False,
+            })
+
+    return _normalize_subtitle_tracks(raw_items, limit=limit)
+
+
+def _extract_subs_from_obj(obj, base_dom="", source_name="stream"):
+    if not isinstance(obj, dict):
+        return []
+    found = []
+    for key in ("subtitles", "tracks", "captions", "subs"):
+        val = obj.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            for k, v in val.items():
+                if isinstance(v, str) and v.strip():
+                    u = urllib.parse.urljoin(base_dom + "/", v.strip()) if base_dom and not v.strip().startswith(("http://", "https://")) else v.strip()
+                    found.append({"lang": _normalize_sub_lang_code(k), "raw_lang": str(k), "label": _sub_lang_display(k), "url": u, "ext": "vtt" if ".vtt" in u.lower() else "srt", "source": source_name, "auto": False})
+                elif isinstance(v, dict):
+                    u = str(v.get("url") or v.get("file") or v.get("src") or "").strip()
+                    if u:
+                        u = urllib.parse.urljoin(base_dom + "/", u) if base_dom and not u.startswith(("http://", "https://")) else u
+                        lang_k = str(v.get("lang") or v.get("language") or v.get("srclang") or k)
+                        lbl = str(v.get("label") or v.get("name") or _sub_lang_display(lang_k))
+                        found.append({"lang": _normalize_sub_lang_code(lang_k), "raw_lang": lang_k, "label": lbl, "url": u, "ext": "vtt" if ".vtt" in u.lower() else "srt", "source": source_name, "auto": False})
+        elif isinstance(val, list):
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "").strip().lower()
+                if kind and kind not in ("captions", "subtitles", "subtitle", "text"):
+                    continue
+                u = str(item.get("url") or item.get("file") or item.get("src") or "").strip()
+                if not u:
+                    continue
+                if base_dom and not u.startswith(("http://", "https://")):
+                    u = urllib.parse.urljoin(base_dom + "/", u)
+                lang_k = str(item.get("lang") or item.get("language") or item.get("srclang") or item.get("code") or item.get("label") or "en")
+                lbl = str(item.get("label") or item.get("name") or "").strip() or _sub_lang_display(lang_k)
+                ext = "vtt" if ".vtt" in u.lower() else ("srt" if ".srt" in u.lower() else str(item.get("ext") or "vtt").lower())
+                found.append({"lang": _normalize_sub_lang_code(lang_k), "raw_lang": lang_k, "label": lbl, "url": u, "ext": ext, "source": source_name, "auto": False})
+    return found
+
+
+def _scan_html_subtitles(html_text, base_dom="", source_name="watchbox"):
+    if not html_text:
+        return []
+    found = []
+    # ArtPlayer / JWPlayer subtitle object & tracks arrays
+    for m in re.finditer(r"subtitle\s*:\s*\{([^}]{1,500})\}", html_text, re.I | re.S):
+        blk = m.group(1)
+        m_u = re.search(r"url\s*:\s*['\"]([^'\"]+)['\"]", blk)
+        if m_u:
+            u = m_u.group(1).strip()
+            if base_dom and not u.startswith(("http://", "https://")):
+                u = urllib.parse.urljoin(base_dom + "/", u)
+            found.append({"lang": "en", "raw_lang": "en", "label": "English", "url": u, "ext": "vtt" if ".vtt" in u.lower() else "srt", "source": source_name, "auto": False})
+
+    for m in re.finditer(r"tracks\s*:\s*(\[[^\]]{2,2000}\])", html_text, re.I | re.S):
+        try:
+            raw_arr = re.sub(r"(\w+)\s*:", r'"\1":', m.group(1).replace("'", '"'))
+            arr = json.loads(raw_arr)
+            found.extend(_extract_subs_from_obj({"tracks": arr}, base_dom=base_dom, source_name=source_name))
+        except Exception:
+            pass
+
+    for m in re.finditer(r"<track\b[^>]*src\s*=\s*['\"]([^'\"]+)['\"][^>]*>", html_text, re.I):
+        tag = m.group(0)
+        u = m.group(1).strip()
+        if base_dom and not u.startswith(("http://", "https://")):
+            u = urllib.parse.urljoin(base_dom + "/", u)
+        m_lang = re.search(r"srclang\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+        m_lbl = re.search(r"label\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+        lang_k = m_lang.group(1).strip() if m_lang else "en"
+        lbl = m_lbl.group(1).strip() if m_lbl else _sub_lang_display(lang_k)
+        found.append({"lang": _normalize_sub_lang_code(lang_k), "raw_lang": lang_k, "label": lbl, "url": u, "ext": "vtt" if ".vtt" in u.lower() else "srt", "source": source_name, "auto": False})
+
+    for m in re.finditer(r"['\"]((?:https?://|/|\.\.?/)[^'\"\s<>]+\.(?:vtt|srt)(?:\?[^'\"\s<>]*)?)['\"]", html_text, re.I):
+        u = m.group(1).strip()
+        if base_dom and not u.startswith(("http://", "https://")):
+            u = urllib.parse.urljoin(base_dom + "/", u)
+        found.append({"lang": "en", "raw_lang": "en", "label": "English", "url": u, "ext": "vtt" if ".vtt" in u.lower() else "srt", "source": source_name, "auto": False})
+    return found
+
+
+def _fetch_movie_subtitles_fallback(title, is_series=False, season=None, episode=None, imdb_id=None, timeout_sec=3.0):
+    deadline = time.time() + float(timeout_sec or 3.0)
+    try:
+        resolved_imdb = imdb_id
+        if not resolved_imdb:
+            clean = clean_title_for_search(title)
+            if not clean:
+                return []
+            q = urllib.parse.quote(clean)
+            kind = "series" if is_series else "movie"
+            cm_url = f"https://v3-cinemeta.strem.io/catalog/{kind}/top/search={q}.json"
+            rem = max(0.8, min(1.6, deadline - time.time()))
+            cm_r = requests.get(cm_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=rem)
+            if cm_r.status_code == 200:
+                metas = cm_r.json().get("metas") or []
+                if metas:
+                    resolved_imdb = metas[0].get("imdb_id") or metas[0].get("id")
+        if not resolved_imdb:
+            return []
+
+        rem = max(0.8, min(1.8, deadline - time.time()))
+        if rem <= 0.3:
+            return []
+        if is_series and season is not None and episode is not None and int(season or 0) > 0 and int(episode or 0) > 0:
+            os_url = f"https://opensubtitles-v3.strem.io/subtitles/series/{resolved_imdb}:{int(season)}:{int(episode)}.json"
+        else:
+            os_url = f"https://opensubtitles-v3.strem.io/subtitles/movie/{resolved_imdb}.json"
+        os_r = requests.get(os_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=rem)
+        if os_r.status_code != 200:
+            return []
+        raw_subs = os_r.json().get("subtitles") or []
+        parsed = []
+        for s in raw_subs:
+            if not isinstance(s, dict):
+                continue
+            su = str(s.get("url") or "").strip()
+            sl = str(s.get("lang") or "").strip()
+            if not su or not sl:
+                continue
+            parsed.append({
+                "lang": _normalize_sub_lang_code(sl),
+                "raw_lang": sl,
+                "label": _sub_lang_display(sl),
+                "url": su,
+                "ext": "vtt" if ".vtt" in su.lower() else "srt",
+                "source": "opensubtitles",
+                "auto": False,
+            })
+        norm = _normalize_subtitle_tracks(parsed, limit=15)
+        if norm:
+            langs_preview = ", ".join(t["lang"] for t in norm[:6])
+            print(f"[SUB] OpenSubtitles fallback resolved {len(norm)} track(s): {langs_preview}")
+        return norm
+    except Exception as e:
+        print(f"[SUB] Fallback subtitle lookup skipped: {e}")
+        return []
+
+
+def _save_sidecar_subtitle_srt(video_path, sub_url="", sub_lang="", sub_ext="", custom_headers=None):
+    try:
+        if not video_path or not os.path.isfile(video_path):
+            return None
+        v_low = video_path.lower()
+        if any(v_low.endswith(aext) for aext in (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".opus", ".zip", ".pdf", ".apk")):
+            return None
+        short_lang = _normalize_sub_lang_code(sub_lang) or "en"
+        base_no_ext = os.path.splitext(video_path)[0]
+        dest_srt = f"{base_no_ext}.{short_lang}.srt"
+        if os.path.exists(dest_srt) and os.path.getsize(dest_srt) > 0:
+            sync_to_sdcard_if_needed(dest_srt)
+            return dest_srt
+        if not sub_url or not str(sub_url).startswith(("http://", "https://")):
+            return None
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        if isinstance(custom_headers, dict):
+            vid_host = (urllib.parse.urlparse(sub_url).hostname or "").lower()
+            for hk, hv in custom_headers.items():
+                if str(hk).lower() in ("user-agent",) or (str(hk).lower() in ("referer", "origin") and "strem.io" not in vid_host):
+                    hdrs[hk] = hv
+        r = requests.get(sub_url, headers=hdrs, timeout=12, allow_redirects=True)
+        if r.status_code != 200 or not r.content:
+            return None
+        raw_text = r.content.decode("utf-8-sig", errors="replace")
+        is_vtt = (sub_ext == "vtt") or (".vtt" in sub_url.lower()) or raw_text.lstrip().startswith("WEBVTT")
+        srt_text = _vtt_to_srt(raw_text) if is_vtt else raw_text.lstrip("\ufeff")
+        if not srt_text.strip():
+            return None
+        with open(dest_srt, "w", encoding="utf-8") as f:
+            f.write(srt_text)
+        sync_to_sdcard_if_needed(dest_srt)
+        print(f"[SUB] Saved subtitle: {os.path.basename(dest_srt)}")
+        return dest_srt
+    except Exception as e:
+        print(f"[WARN] Sidecar subtitle save skipped: {e}")
+        return None
+
 def launch_player(target_uri, player_choice="vlc", custom_headers=None, title=None):
     """Launch stream URL or video in VLC Player with local header proxying."""
     clean_env = os.environ.copy()
@@ -983,7 +1379,7 @@ def cancel_download(job_id):
             ACTIVE_DOWNLOAD_PROGRESS[j_str]["status"] = "Cancelled"
     return True
 
-def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--", job_id=None, downloaded_str=None):
+def render_download_progress(percent, total_str="--", speed_str="--", eta_str="--", job_id=None, downloaded_str=None, status_override=None):
     """Render a sleek, animated single-line progress bar guaranteed not to wrap or spam."""
     global PROGRESS_SPINNER_INDEX, CURRENT_DOWNLOAD_JOB_ID, ACTIVE_DOWNLOAD_PROGRESS
     try:
@@ -991,7 +1387,7 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
     except Exception:
         pct = 0.0
 
-    spd_clean = speed_str if ('s' in speed_str.lower() or speed_str.lower() in ('--', 'done', 'complete', 'paused')) else f"{speed_str}/s"
+    spd_clean = speed_str if ('s' in speed_str.lower() or speed_str.lower() in ('--', 'done', 'complete', 'paused', 'muxing', 'merging', 'audio next')) else f"{speed_str}/s"
     
     eta_val = str(eta_str or "--").strip()
     if eta_val.lower().startswith('eta'):
@@ -1010,6 +1406,8 @@ def render_download_progress(percent, total_str="--", speed_str="--", eta_str="-
             status = "Paused"
         elif current_status == "Complete":
             status = "Complete"
+        elif status_override:
+            status = str(status_override)
         else:
             status = "Downloading"
 
@@ -1809,9 +2207,7 @@ def mux_video_and_audio(video_path, audio_path, output_path):
 
     jid = get_current_job_id()
     if jid:
-        render_download_progress(0.0, "Combining audio & video", "Muxing", "0%", job_id=jid, downloaded_str="Muxing 0%")
-        if str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
-            ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
+        render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
     temp_out = output_path
     needs_rename = False
@@ -1833,8 +2229,15 @@ def mux_video_and_audio(video_path, audio_path, output_path):
     # 2. Try FFmpeg (Desktop / CLI / Termux)
     if not muxed and shutil.which("ffmpeg"):
         try:
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", temp_out]
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            popen_kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if sys.platform == "win32":
+                popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", "-movflags", "+faststart", temp_out]
+            res = subprocess.run(cmd, **popen_kw)
+            if res.returncode != 0 or not (os.path.exists(temp_out) and os.path.getsize(temp_out) > 0):
+                # Fallback if e.g. WebM Opus audio cannot be stream-copied into MP4
+                cmd_fb = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", temp_out]
+                res = subprocess.run(cmd_fb, **popen_kw)
             if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
                 muxed = True
         except Exception as e:
@@ -1867,9 +2270,7 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
 
     jid = get_current_job_id()
     if jid:
-        render_download_progress(0.0, "Combining audio & video", "Muxing", "0%", job_id=jid, downloaded_str="Muxing 0%")
-        if str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
-            ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
+        render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
     temp_out = output_path
     needs_rename = False
@@ -1924,7 +2325,7 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
         except Exception: pass
     return False
 
-def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None):
+def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None, subtitle_lang=None):
     if not HAS_YTDLP:
         print("[WARN] yt-dlp is not installed. Falling back to generic download...")
         return False
@@ -2032,11 +2433,17 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 if is_video_only_stream:
                     render_download_progress(90.0, "Video downloaded", "Audio next", "--", job_id=jid, downloaded_str="Video ready")
                 elif is_audio_only_stream:
-                    render_download_progress(100.0, "100% Downloaded", "Muxing", "0%", job_id=jid, downloaded_str="100% Downloaded")
-                    if jid and str(jid) in ACTIVE_DOWNLOAD_PROGRESS:
-                        ACTIVE_DOWNLOAD_PROGRESS[str(jid)]["status"] = "Muxing"
+                    render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
                 else:
                     render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+
+    def ytdlp_pp_hook(d):
+        if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+            raise Exception("Download cancelled by user")
+        pp_status = str(d.get('status') or '').lower()
+        pp_name = str(d.get('postprocessor') or '').lower()
+        if jid and pp_status in ('started', 'processing') and any(k in pp_name for k in ('merger', 'ffmpeg', 'video', 'extractaudio', 'embed')):
+            render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
     stage_dir = None
     if is_playlist:
@@ -2085,17 +2492,27 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         )
 
     print(f"> Direct YouTube download [{format_spec if isinstance(format_spec, str) else 'audio+video'}]...")
+    clean_sub_lang = str(subtitle_lang or "").strip()
+    want_yt_subs = bool(clean_sub_lang and clean_sub_lang.lower() not in ("off", "none") and not is_audio_only)
+    yt_sub_langs = []
+    if want_yt_subs:
+        short_sub = _normalize_sub_lang_code(clean_sub_lang)
+        yt_sub_langs = list(dict.fromkeys([clean_sub_lang, short_sub, f"{short_sub}.*"]))
+
     yt_opts_dict = {
         'format': format_spec,
         'outtmpl': outtmpl_pattern,
         'quiet': False,
         'no_warnings': True,
         'progress_hooks': [ytdlp_progress_hook],
+        'postprocessor_hooks': [ytdlp_pp_hook],
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
         'nopart': False,
         'continuedl': True,
-        'writesubtitles': False,
+        'writesubtitles': want_yt_subs,
         'writeautomaticsub': False,
+        'subtitleslangs': yt_sub_langs if want_yt_subs else [],
+        'subtitlesformat': 'srt/vtt/best',
         'socket_timeout': 30,
         'retries': 20,
         'fragment_retries': 20,
@@ -2116,7 +2533,9 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 if info.get('_type') == 'playlist' or 'entries' in info or is_playlist:
                     filename = out_dir
                 else:
-                    filename = ydl.prepare_filename(info)
+                    req_dls = info.get('requested_downloads') or []
+                    req_fp = next((rd.get('filepath') for rd in req_dls if isinstance(rd, dict) and rd.get('filepath') and os.path.exists(rd.get('filepath'))), None)
+                    filename = req_fp or (info.get('filepath') if info.get('filepath') and os.path.exists(info.get('filepath')) else None) or ydl.prepare_filename(info)
 
                 if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
                     if filename and os.path.exists(filename):
@@ -2140,13 +2559,14 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                             raise RuntimeError(f"Downloaded media file not found on device: {filename}")
 
                 # Move from stage_dir to out_dir and ensure clean filename
+                pre_move_dir, pre_move_fn = os.path.split(filename) if filename else ("", "")
+                pre_move_stem = os.path.splitext(pre_move_fn)[0]
                 if stage_dir and filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
                     cleaned_fn = clean_filename(cur_fn, quality=q_tag if not is_audio_only else None)
                     final_dest = os.path.join(out_dir, cleaned_fn)
                     safe_move(filename, final_dest)
                     filename = final_dest
-                    shutil.rmtree(stage_dir, ignore_errors=True)
                 elif filename and os.path.exists(filename) and os.path.isfile(filename):
                     cur_dir, cur_fn = os.path.split(filename)
                     cleaned_fn = clean_filename(cur_fn, quality=q_tag if not is_audio_only else None)
@@ -2154,6 +2574,39 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                         cleaned_path = os.path.join(cur_dir, cleaned_fn)
                         safe_move(filename, cleaned_path)
                         filename = cleaned_path
+
+                # Relocate/convert any yt-dlp downloaded subtitle sidecar to <video name>.<lang>.srt
+                if want_yt_subs and filename and os.path.isfile(filename) and pre_move_dir and os.path.isdir(pre_move_dir):
+                    try:
+                        final_stem = os.path.splitext(os.path.basename(filename))[0]
+                        short_sub = _normalize_sub_lang_code(clean_sub_lang)
+                        sub_candidates = [
+                            sf for sf in os.listdir(pre_move_dir)
+                            if sf.startswith(pre_move_stem) and sf.lower().endswith(('.srt', '.vtt'))
+                        ]
+                        sub_candidates.sort(key=lambda s: 0 if s.lower().endswith('.srt') else 1)
+                        if sub_candidates:
+                            src_sub_path = os.path.join(pre_move_dir, sub_candidates[0])
+                            dest_sub_path = os.path.join(os.path.dirname(filename), f"{final_stem}.{short_sub}.srt")
+                            if src_sub_path.lower().endswith('.srt'):
+                                if os.path.abspath(src_sub_path) != os.path.abspath(dest_sub_path):
+                                    safe_move(src_sub_path, dest_sub_path)
+                            else:
+                                with open(src_sub_path, 'r', encoding='utf-8-sig', errors='replace') as sf_in:
+                                    srt_body = _vtt_to_srt(sf_in.read())
+                                if srt_body.strip():
+                                    with open(dest_sub_path, 'w', encoding='utf-8') as sf_out:
+                                        sf_out.write(srt_body)
+                                try: os.remove(src_sub_path)
+                                except Exception: pass
+                            if os.path.exists(dest_sub_path):
+                                sync_to_sdcard_if_needed(dest_sub_path)
+                                print(f"[SUB] Saved subtitle: {os.path.basename(dest_sub_path)}")
+                    except Exception as sub_e:
+                        print(f"[WARN] Subtitle relocate skipped: {sub_e}")
+
+                if stage_dir and os.path.exists(stage_dir):
+                    shutil.rmtree(stage_dir, ignore_errors=True)
 
                 # Purge any transient cache or fragment parts
                 _cleanup_download_cache(cache_dir, out_dir, job_id=jid, keep_path=filename)
@@ -2897,6 +3350,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             print(f"> Instant stream cache hit for {display_title} (0ms)")
             return c_res
 
+    nm_subtitles = []
     if not embed_json or is_tv_series:
         # Resolve stream via vidsync / NetMirror external & watchbox server APIs
         kind_label = f"series episode S{se_val}E{ep_val}" if is_tv_series else "movie"
@@ -2939,6 +3393,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             def _fetch_vidsync():
                 res_q = {}
                 res_c = []
+                res_s = []
                 try:
                     if is_tv_series:
                         vidsync_api = f"https://vidsync.pro/api/stream?type=tv&id={tm_id}&season={se_val}&episode={ep_val}"
@@ -2953,7 +3408,15 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     if v_res.status_code == 200:
                         v_data = v_res.json()
                         sources = v_data.get('sources', [])
+                        try:
+                            first_s_keys = list(sources[0].keys()) if sources and isinstance(sources[0], dict) else []
+                            print(f"[SUB] vidsync v_data keys={list(v_data.keys())} source_keys={first_s_keys}")
+                        except Exception:
+                            pass
+                        res_s.extend(_extract_subs_from_obj(v_data, 'https://vidsync.pro', 'vidsync'))
                         if sources:
+                            for s_all in sources:
+                                res_s.extend(_extract_subs_from_obj(s_all, 'https://vidsync.pro', 'vidsync'))
                             matching = [s for s in sources if s.get('audioLanguage') == target_lang] if target_lang else []
                             if not matching:
                                 matching = sources
@@ -2968,7 +3431,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                     res_c.append((u, 'https://vidsync.pro'))
                 except Exception:
                     pass
-                return res_q, res_c
+                return res_q, res_c, res_s
 
             na_b64 = base64.b64encode(we(clean_title).encode('latin1')).decode('utf-8')
             sig_tm = hmac.new(secret_key, f'{tm_id}:{ts}'.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -2982,10 +3445,12 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             def _fetch_watchbox(dom):
                 res_q = {}
                 res_c = []
+                res_s = []
                 try:
                     wb_url = f"{dom}/play/watchbox.php?{wb_query}"
                     wb_r = requests.get(wb_url, headers=headers, timeout=2.5)
                     if wb_r.status_code == 200 and len(wb_r.text) > 200:
+                        res_s.extend(_scan_html_subtitles(wb_r.text, dom, 'watchbox'))
                         for m_dl in re.finditer(r'<div class=[\"\']dl-item[\"\']>([^<]+)<[^>]+onclick=[\"\']myFunction_dl\([\"\']([^\"\']+)[\"\']', wb_r.text):
                             lbl = m_dl.group(1).strip()
                             u = m_dl.group(2).strip()
@@ -3021,7 +3486,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                                 res_c.append((dec_url, dom))
                 except Exception:
                     pass
-                return res_q, res_c
+                return res_q, res_c, res_s
 
             sys.stdout.write("  [2/4]  Querying stream gateways & CDN manifests concurrently... ")
             sys.stdout.flush()
@@ -3032,7 +3497,9 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                     futures.append(ex.submit(_fetch_watchbox, d))
                 for f in concurrent.futures.as_completed(futures):
                     try:
-                        q_map, c_list = f.result()
+                        q_map, c_list, s_list = f.result()
+                        if s_list:
+                            nm_subtitles.extend(s_list)
                         for k, v in q_map.items():
                             if k not in qualities_dict or '.mp4' in str(v.get('url', '')).lower():
                                 qualities_dict[k] = v
@@ -3126,6 +3593,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
                             s_url = s.get('url', '')
                             if 'watchcinemo.php' in s_url:
                                 r_c = requests.get(s_url, headers={'User-Agent': ext_headers['User-Agent'], 'Referer': ext_url}, timeout=5)
+                                nm_subtitles.extend(_scan_html_subtitles(r_c.text, 'https://webvp.watch21.shop', 'watchcinemo'))
                                 m_art = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', r_c.text)
                                 if m_art:
                                     val = m_art.group(1)
@@ -3205,6 +3673,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         if not player_html:
             raise Exception("Could not retrieve NetMirror player page from stream servers.")
 
+        nm_subtitles.extend(_scan_html_subtitles(player_html, domains[0], 'netmirror'))
         match = re.search(r'art\.tvVideoUrl\s*=\s*[\"\']([^\"\']+)[\"\']', player_html) or re.search(r'play_url\([\"\'\`](https?://[^\s\"\'\`]+)[\"\'\`]\)', player_html)
         if match:
             candidate = match.group(1) if match.lastindex else match.group(0)
@@ -3323,6 +3792,17 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
         except Exception:
             pass
 
+        resolved_sub_tracks = _normalize_subtitle_tracks(nm_subtitles, limit=15)
+        if not resolved_sub_tracks:
+            sub_lookup_title = show_base if (is_tv_series and 'show_base' in locals() and show_base) else clean_title
+            resolved_sub_tracks = _fetch_movie_subtitles_fallback(
+                sub_lookup_title,
+                is_series=is_tv_series,
+                season=se_val,
+                episode=ep_val,
+                timeout_sec=3.0,
+            )
+
         res_dict = {
             "url": direct_stream_url,
             "direct_url": direct_stream_url,
@@ -3338,6 +3818,7 @@ def handle_netmirror(url, out_name=None, target_dir=None, direct_link_only=False
             "quality_urls": quality_map,
             "audios": audio_choices_list,
             "audio_choices": audio_choices_list,
+            "subtitle_tracks": resolved_sub_tracks,
             "stream_headers": stream_headers,
             "is_series": is_tv_series,
             "seasons": formatted_seasons if is_tv_series else [],
@@ -5057,6 +5538,7 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None, audio_
                     "audio_track_urls": yt_res.get('audio_track_urls', {}),
                     "audio_track_formats": yt_res.get('audio_track_formats', {}),
                     "selected_audio_lang": yt_res.get('selected_audio_lang', ''),
+                    "subtitle_tracks": yt_res.get('subtitle_tracks', []),
                     "stream_headers": yt_res.get('stream_headers', {}),
                     "headers": yt_res.get('headers', {}),
                     "is_series": False,
@@ -5108,6 +5590,7 @@ def app_igl_resolve(target_id, quality="best", season=None, episode=None, audio_
         "quality_urls": quality_urls,
         "stream_headers": clean_headers,
         "headers": clean_headers,
+        "subtitle_tracks": [],
         "is_series": False,
         "filename": info.get('filename'),
         "can_stream": True,
@@ -5824,6 +6307,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             out["quality_urls"] = dict(base_payload.get("quality_urls") or {})
             out["audio_track_urls"] = dict(base_payload.get("audio_track_urls") or {})
             out["audio_track_formats"] = dict(base_payload.get("audio_track_formats") or {})
+            out["subtitle_tracks"] = list(base_payload.get("subtitle_tracks") or [])
             qt_map = {k: dict(v) for k, v in (base_payload.get("quality_tracks") or {}).items()}
             out["quality_tracks"] = qt_map
             out["quality"] = req_quality
@@ -6340,6 +6824,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
 
         thumb = info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else "") or (f"https://i.ytimg.com/vi/{info.get('id')}/hqdefault.jpg" if info.get("id") else "")
         yt_http_hdrs = dict(info.get("http_headers") or {})
+        yt_subtitle_tracks = _yt_extract_subtitles(info, limit=15)
 
         base_yt_payload = {
             "target_url": url,
@@ -6355,6 +6840,7 @@ def app_resolve(url, quality="best", season=None, episode=None, cookie=None, aud
             "audio_track_urls": audio_track_urls,
             "audio_track_formats": audio_track_formats,
             "selected_audio_lang": (matched_audio_disp or audio_lang or (audio_choices[0]["language"] if audio_choices else "")),
+            "subtitle_tracks": yt_subtitle_tracks,
             "audio_only": False,
             "can_stream": True,
             "media_type": "video",
@@ -6528,6 +7014,11 @@ def app_download(payload):
     scope = payload.get("scope", "episode")
     custom_headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     title = payload.get("title") or "download"
+    sub_lang = str(payload.get("subtitle_lang") or "").strip()
+    if sub_lang.lower() in ("off", "none"):
+        sub_lang = ""
+    sub_url = str(payload.get("subtitle_url") or "").strip()
+    sub_ext = str(payload.get("subtitle_ext") or "").strip().lower()
 
     lower = url.lower()
     stream_lower = stream_url.lower()
@@ -6673,6 +7164,7 @@ def app_download(payload):
                     job_id=jid,
                     cache_dir=cache_dir,
                     out_name=clean_name,
+                    subtitle_lang=sub_lang or None,
                 )
             else:
                 headers = igl_res.get("stream_headers") or {}
@@ -6725,6 +7217,7 @@ def app_download(payload):
             cache_dir=cache_dir,
             out_name=out_name or title,
             audio_lang=payload.get("audio_lang") or payload.get("selected_audio_lang") or payload.get("audio"),
+            subtitle_lang=sub_lang or None,
         )
 
     # Priority 4: Telegram media
@@ -6764,6 +7257,18 @@ def app_download(payload):
         if jid in CANCELLED_DOWNLOAD_JOBS:
             return {"cancelled": True, "status": "Cancelled", "job_id": jid}
         raise Exception("The downloader returned no output file")
+
+    if os.path.exists(path):
+        path = os.path.normpath(os.path.abspath(path))
+
+    if (sub_lang or sub_url) and not (payload.get("audio_only") or payload.get("is_audio")):
+        _save_sidecar_subtitle_srt(
+            path,
+            sub_url=sub_url,
+            sub_lang=sub_lang,
+            sub_ext=sub_ext,
+            custom_headers=custom_headers,
+        )
 
     _cleanup_download_cache(cache_dir, target_dir, jid, keep_path=path)
 
@@ -7277,6 +7782,9 @@ def run_app_json_request(payload):
             else:
                 raise Exception("Unknown app action. Use capabilities, search, resolve, download, progress, or cancel.")
         
+        if action in ("resolve", "igl_resolve") and isinstance(result, dict):
+            result.setdefault("subtitle_tracks", [])
+
         clean_logs = sanitize_app_logs(output.getvalue())
         return {"ok": True, "action": action, "result": result, "logs": clean_logs[-12000:]}
     except Exception as error:
