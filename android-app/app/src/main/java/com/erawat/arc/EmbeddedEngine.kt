@@ -16,8 +16,7 @@ import java.nio.ByteBuffer
  * No external terminal, shell, or companion app is required.
  */
 object EmbeddedEngine {
-    @Volatile
-    var currentMuxProgress: Double = -1.0
+    private val muxProgressByJob = java.util.concurrent.ConcurrentHashMap<String, Double>()
 
     fun execute(context: Context, request: JSONObject): JSONObject {
         if (!Python.isStarted()) {
@@ -51,24 +50,19 @@ object EmbeddedEngine {
             val module = Python.getInstance().getModule("dl")
             val raw = module.callAttr("get_download_progress_json", jobId ?: "")
             val obj = JSONObject(raw.toString())
-            val muxPct = currentMuxProgress
-            if (muxPct >= 0.0) {
-                val pctInt = muxPct.toInt()
-                val keysToUpdate = if (!jobId.isNullOrBlank()) {
-                    listOf(jobId)
-                } else {
-                    val kList = obj.keys().asSequence().toList()
-                    if (kList.isNotEmpty()) kList else listOf("job")
-                }
-                for (k in keysToUpdate) {
-                    val existing = obj.optJSONObject(k) ?: JSONObject()
+            for ((jidKey, muxPct) in muxProgressByJob.entries) {
+                if (muxPct < 0.0) continue
+                if (!jobId.isNullOrBlank() && jidKey != jobId) continue
+                if (!jobId.isNullOrBlank() || obj.has(jidKey)) {
+                    val pctInt = muxPct.toInt()
+                    val existing = obj.optJSONObject(jidKey) ?: JSONObject()
                     existing.put("percent", muxPct)
                     existing.put("status", "Muxing")
                     existing.put("speed", "Muxing")
                     existing.put("eta", "$pctInt%")
                     existing.put("downloaded_str", "Muxing $pctInt%")
                     existing.put("total_str", "Combining tracks")
-                    obj.put(k, existing)
+                    obj.put(jidKey, existing)
                 }
             }
             obj
@@ -101,18 +95,21 @@ object EmbeddedEngine {
         } catch (_: Exception) {}
     }
 
+    @JvmOverloads
     @JvmStatic
-    fun mux(videoPath: String, audioPath: String, outputPath: String): Boolean {
-        return muxMultiple(videoPath, listOf(audioPath), outputPath)
+    fun mux(videoPath: String, audioPath: String, outputPath: String, jobId: String = ""): Boolean {
+        return muxMultiple(videoPath, listOf(audioPath), outputPath, jobId)
     }
 
+    @JvmOverloads
     @JvmStatic
-    fun muxMultiple(videoPath: String, audioPaths: Array<String>, outputPath: String): Boolean {
-        return muxMultiple(videoPath, audioPaths.toList(), outputPath)
+    fun muxMultiple(videoPath: String, audioPaths: Array<String>, outputPath: String, jobId: String = ""): Boolean {
+        return muxMultiple(videoPath, audioPaths.toList(), outputPath, jobId)
     }
 
+    @JvmOverloads
     @JvmStatic
-    fun muxMultiple(videoPath: String, audioPaths: List<String>, outputPath: String): Boolean {
+    fun muxMultiple(videoPath: String, audioPaths: List<String>, outputPath: String, jobId: String = ""): Boolean {
         var videoExtractor: MediaExtractor? = null
         val audioExtractors = mutableListOf<MediaExtractor>()
         var muxer: MediaMuxer? = null
@@ -205,7 +202,9 @@ object EmbeddedEngine {
                     }
                 }
             } catch (_: Exception) {}
-            currentMuxProgress = 0.0
+            if (jobId.isNotBlank()) {
+                muxProgressByJob[jobId] = 0.0
+            }
 
             muxer.start()
             val maxBufferSize = 1024 * 1024
@@ -279,14 +278,16 @@ object EmbeddedEngine {
                 } catch (we: Exception) {
                     android.util.Log.w("EmbeddedEngine", "writeSampleData warning: ${we.message}")
                 }
-                if (totalDurationUs > 0) {
+                if (totalDurationUs > 0 && jobId.isNotBlank()) {
                     val pct = ((pts.toDouble() / totalDurationUs.toDouble()) * 100.0).coerceIn(0.0, 99.0)
-                    currentMuxProgress = pct
+                    muxProgressByJob[jobId] = pct
                 }
                 minSource.advance()
             }
 
-            currentMuxProgress = 100.0
+            if (jobId.isNotBlank()) {
+                muxProgressByJob[jobId] = 100.0
+            }
             muxer.stop()
             val success = outFile.exists() && outFile.length() > 0
             if (!success) {
@@ -297,7 +298,9 @@ object EmbeddedEngine {
             android.util.Log.e("EmbeddedEngine", "Native muxMultiple failed with exception", e)
             false
         } finally {
-            currentMuxProgress = -1.0
+            if (jobId.isNotBlank()) {
+                muxProgressByJob.remove(jobId)
+            }
             try { muxer?.release() } catch (_: Exception) {}
             try { videoExtractor?.release() } catch (_: Exception) {}
             for (a in audioExtractors) {

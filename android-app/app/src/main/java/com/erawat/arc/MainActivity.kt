@@ -249,7 +249,16 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.exoplayer.source.SingleSampleMediaSource
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.BaseDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.cache.CacheDataSink
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import android.app.Activity
 import android.util.TypedValue
 import androidx.compose.material.icons.outlined.FitScreen
@@ -5791,6 +5800,215 @@ private fun toPlayerMediaUri(raw: String): Uri {
     }
 }
 
+@androidx.annotation.OptIn(UnstableApi::class)
+private object ArcPlayerMediaCache {
+    @Volatile
+    private var instance: SimpleCache? = null
+
+    fun get(context: Context): SimpleCache {
+        return instance ?: synchronized(this) {
+            instance ?: run {
+                val appCtx = context.applicationContext
+                val cacheDir = File(appCtx.cacheDir, "arc_stream_cache").apply { mkdirs() }
+                SimpleCache(
+                    cacheDir,
+                    LeastRecentlyUsedCacheEvictor(180L * 1024L * 1024L),
+                    StandaloneDatabaseProvider(appCtx),
+                ).also { instance = it }
+            }
+        }
+    }
+}
+
+/**
+ * Splits long googlevideo.com requests into 2 MB HTTP range windows so YouTube
+ * does not throttle ExoPlayer preloading, while caching chunks into SimpleCache.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+private class YouTubeChunkedDataSource(
+    private val upstreamFactory: DataSource.Factory,
+) : BaseDataSource(/* isNetwork = */ true) {
+
+    companion object {
+        private const val CHUNK_BYTES = 2L * 1024L * 1024L
+        private val CONTENT_RANGE_TOTAL = Regex("""/\s*(\d+)""")
+    }
+
+    private val upstream: DataSource = upstreamFactory.createDataSource()
+    private var activeSpec: DataSpec? = null
+    private var upstreamOpen = false
+    private var chunkedMode = false
+    private var nextReadPos = 0L
+    private var totalResourceSize = C.LENGTH_UNSET.toLong()
+    private var chunkRemaining = 0L
+
+    private fun parseTotalSize(headers: Map<String, List<String>>): Long? {
+        val valStr = headers.entries.firstOrNull { it.key.equals("Content-Range", ignoreCase = true) }
+            ?.value?.firstOrNull() ?: return null
+        return CONTENT_RANGE_TOTAL.find(valStr)?.groupValues?.getOrNull(1)?.toLongOrNull()
+    }
+
+    private fun closeUpstreamQuietly() {
+        if (upstreamOpen) {
+            runCatching { upstream.close() }
+            upstreamOpen = false
+        }
+    }
+
+    override fun open(dataSpec: DataSpec): Long {
+        closeUpstreamQuietly()
+        activeSpec = dataSpec
+        chunkedMode = false
+        nextReadPos = 0L
+        totalResourceSize = C.LENGTH_UNSET.toLong()
+        chunkRemaining = 0L
+
+        transferInitializing(dataSpec)
+        val host = dataSpec.uri.host?.lowercase().orEmpty()
+        val wantsChunking = host.contains("googlevideo.com") && dataSpec.length == C.LENGTH_UNSET.toLong()
+        if (!wantsChunking) {
+            val len = upstream.open(dataSpec)
+            upstreamOpen = true
+            transferStarted(dataSpec)
+            return len
+        }
+
+        val startPos = dataSpec.position.coerceAtLeast(0L)
+        val firstChunk = dataSpec.buildUpon().setPosition(startPos).setLength(CHUNK_BYTES).build()
+        val firstLen = upstream.open(firstChunk)
+        upstreamOpen = true
+        val total = parseTotalSize(upstream.responseHeaders)
+        if (total != null && total > startPos) {
+            chunkedMode = true
+            nextReadPos = startPos
+            totalResourceSize = total
+            chunkRemaining = if (firstLen != C.LENGTH_UNSET.toLong()) firstLen else minOf(CHUNK_BYTES, total - startPos)
+            transferStarted(dataSpec)
+            return total - startPos
+        }
+
+        // Reopen unbounded cleanly if the server ignored Range / Content-Range total
+        closeUpstreamQuietly()
+        val fullLen = upstream.open(dataSpec)
+        upstreamOpen = true
+        transferStarted(dataSpec)
+        return fullLen
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        if (!chunkedMode) {
+            val n = upstream.read(buffer, offset, length)
+            if (n > 0) bytesTransferred(n)
+            return n
+        }
+        while (true) {
+            if (chunkRemaining <= 0L) {
+                closeUpstreamQuietly()
+                if (nextReadPos >= totalResourceSize) return C.RESULT_END_OF_INPUT
+                val baseSpec = activeSpec ?: return C.RESULT_END_OF_INPUT
+                val sliceLen = minOf(CHUNK_BYTES, totalResourceSize - nextReadPos)
+                if (sliceLen <= 0L) return C.RESULT_END_OF_INPUT
+                val nextSpec = baseSpec.buildUpon().setPosition(nextReadPos).setLength(sliceLen).build()
+                val openedLen = upstream.open(nextSpec)
+                upstreamOpen = true
+                chunkRemaining = if (openedLen != C.LENGTH_UNSET.toLong()) openedLen else sliceLen
+                if (chunkRemaining <= 0L) return C.RESULT_END_OF_INPUT
+            }
+            val toRead = minOf(length.toLong(), chunkRemaining).toInt()
+            val n = upstream.read(buffer, offset, toRead)
+            if (n == C.RESULT_END_OF_INPUT) {
+                chunkRemaining = 0L
+                if (nextReadPos >= totalResourceSize) return C.RESULT_END_OF_INPUT
+                continue
+            }
+            if (n > 0) {
+                nextReadPos += n
+                chunkRemaining -= n
+                bytesTransferred(n)
+            }
+            return n
+        }
+    }
+
+    override fun getUri(): Uri? = upstream.uri ?: activeSpec?.uri
+
+    override fun getResponseHeaders(): Map<String, List<String>> = upstream.responseHeaders
+
+    override fun close() {
+        val wasOpen = upstreamOpen || activeSpec != null
+        activeSpec = null
+        chunkedMode = false
+        try {
+            closeUpstreamQuietly()
+        } finally {
+            if (wasOpen) transferEnded()
+        }
+    }
+}
+
+private suspend fun cacheExternalSubtitleFile(
+    context: Context,
+    sub: SubtitleChoice,
+): SubtitleChoice? = withContext(Dispatchers.IO) {
+    val rawUrl = sub.url.trim()
+    if (rawUrl.isBlank()) return@withContext null
+    if (!rawUrl.startsWith("http://", ignoreCase = true) &&
+        !rawUrl.startsWith("https://", ignoreCase = true)
+    ) {
+        return@withContext sub
+    }
+    val digest = runCatching {
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(rawUrl.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(24)
+    }.getOrDefault(rawUrl.hashCode().toString())
+    val ext = when {
+        sub.ext.lowercase() in listOf("srt", "vtt", "ass", "ssa") -> sub.ext.lowercase()
+        rawUrl.lowercase().contains(".srt") -> "srt"
+        else -> "vtt"
+    }
+    val subDir = File(context.applicationContext.cacheDir, "arc_subs").apply { mkdirs() }
+    val outFile = File(subDir, "${digest}.${ext}")
+    if (outFile.exists() && outFile.length() > 16L) {
+        return@withContext sub.copy(url = Uri.fromFile(outFile).toString(), ext = ext)
+    }
+    runCatching {
+        val conn = (java.net.URL(rawUrl).openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = 12_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            setRequestProperty("Accept", "*/*")
+            setRequestProperty("Accept-Encoding", "identity")
+        }
+        try {
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                Log.w("ArcPlayer", "Subtitle fetch HTTP $code for ${sub.label}")
+                return@withContext null
+            }
+            var body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                .trimStart('\uFEFF').trim()
+            if (body.length < 8 || body.startsWith("<html", ignoreCase = true) || body.startsWith("<!doctype", ignoreCase = true)) {
+                Log.w("ArcPlayer", "Subtitle response not subtitle text for ${sub.label}")
+                return@withContext null
+            }
+            if (ext == "vtt" && !body.startsWith("WEBVTT", ignoreCase = true)) {
+                body = "WEBVTT\n\n$body"
+            }
+            outFile.writeText(body, Charsets.UTF_8)
+            sub.copy(url = Uri.fromFile(outFile).toString(), ext = ext)
+        } finally {
+            conn.disconnect()
+        }
+    }.onFailure { err ->
+        Log.w("ArcPlayer", "Subtitle fetch error for ${sub.label}: ${err.message}")
+    }.getOrNull()
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ArcPlayerScreen(
@@ -6033,7 +6251,7 @@ private fun ArcPlayerScreen(
         )
     }
 
-    val dataSourceFactory = remember(context, activeTrack, isOkCdn, cleanHeaders) {
+    val dataSourceFactory = remember(context, activeTrack, isOkCdn, cleanHeaders, primaryUrl) {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setConnectTimeoutMs(10_000)
             .setReadTimeoutMs(15_000)
@@ -6050,7 +6268,25 @@ private fun ArcPlayerScreen(
                     setDefaultRequestProperties(cleanHeaders)
                 }
             }
-        DefaultDataSource.Factory(context, httpFactory)
+        val chunkedUpstreamFactory = DataSource.Factory { YouTubeChunkedDataSource(httpFactory) }
+        val isLocalProxyOrHls = primaryUrl.contains("127.0.0.1") ||
+            primaryUrl.contains("localhost") ||
+            primaryUrl.contains(".m3u8", ignoreCase = true)
+        val networkOrCachedFactory: DataSource.Factory = if (isLocalProxyOrHls) {
+            chunkedUpstreamFactory
+        } else {
+            val mediaCache = ArcPlayerMediaCache.get(context)
+            CacheDataSource.Factory()
+                .setCache(mediaCache)
+                .setUpstreamDataSourceFactory(chunkedUpstreamFactory)
+                .setCacheWriteDataSinkFactory(
+                    CacheDataSink.Factory()
+                        .setCache(mediaCache)
+                        .setFragmentSize(2L * 1024L * 1024L)
+                )
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        }
+        DefaultDataSource.Factory(context, networkOrCachedFactory)
     }
 
     val trackSelector = remember(context) {
@@ -6072,6 +6308,7 @@ private fun ArcPlayerScreen(
                 1_500,  // bufferForPlaybackMs
                 3_000   // bufferForPlaybackAfterRebufferMs
             )
+            .setTargetBufferBytes(96 * 1024 * 1024) // plenty of headroom for 1080p/4K + backbuffer
             .setBackBuffer(30_000, true) // retain 30s before playhead for instant rewind/back
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -6114,6 +6351,36 @@ private fun ArcPlayerScreen(
     val activeExternalSub = remember(activeSubChoice) {
         activeSubChoice?.takeIf { it.trackGroupIndex < 0 && it.url.isNotBlank() }
     }
+    var cachedExternalSub by remember(streamTarget) { mutableStateOf<SubtitleChoice?>(null) }
+    var resolvedSubSourceUrl by remember(streamTarget) { mutableStateOf("") }
+
+    LaunchedEffect(currentTarget.subtitleTracks) {
+        for (track in currentTarget.subtitleTracks.take(4)) {
+            if (track.url.startsWith("http://", ignoreCase = true) ||
+                track.url.startsWith("https://", ignoreCase = true)
+            ) {
+                launch(Dispatchers.IO) {
+                    runCatching { cacheExternalSubtitleFile(context, track) }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(activeExternalSub?.url) {
+        val targetSub = activeExternalSub
+        if (targetSub == null) {
+            cachedExternalSub = null
+            resolvedSubSourceUrl = ""
+            return@LaunchedEffect
+        }
+        val cached = cacheExternalSubtitleFile(context, targetSub)
+        if (cached != null) {
+            cachedExternalSub = cached
+        } else {
+            cachedExternalSub = null
+        }
+        resolvedSubSourceUrl = targetSub.url
+    }
 
     val subPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -6150,35 +6417,27 @@ private fun ArcPlayerScreen(
             .build()
     }
 
-    fun buildExternalSubtitleSource(sub: SubtitleChoice): MediaSource {
-        val subConfig = buildSubtitleConfig(sub)
-        val useCleanSubFactory = sub.url.contains("strem.io", ignoreCase = true) ||
-            sub.url.startsWith("content://", ignoreCase = true) ||
-            sub.url.startsWith("file://", ignoreCase = true) ||
-            sub.url.startsWith("/")
-        val factoryToUse = if (useCleanSubFactory) subHttpDataSourceFactory else dataSourceFactory
-        return SingleSampleMediaSource.Factory(factoryToUse).createMediaSource(subConfig, C.TIME_UNSET)
-    }
-
     fun buildMediaSource(rawUrl: String, preferDirectExtractor: Boolean, externalSub: SubtitleChoice? = null): MediaSource {
         val uri = toPlayerMediaUri(rawUrl)
         val itemBuilder = MediaItem.Builder().setUri(uri)
-        if (externalSub != null && !preferDirectExtractor) {
+        if (externalSub != null) {
             itemBuilder.setSubtitleConfigurations(listOf(buildSubtitleConfig(externalSub)))
         }
         val item = itemBuilder.build()
         val isHls = rawUrl.contains(".m3u8", ignoreCase = true) ||
             rawUrl.contains("manifest/hls_playlist", ignoreCase = true) ||
             rawUrl.contains("hls_playlist", ignoreCase = true)
-        val baseSource = when {
+        return when {
             isHls -> HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
+            externalSub != null -> DefaultMediaSourceFactory(context)
+                .setDataSourceFactory(dataSourceFactory)
+                .experimentalParseSubtitlesDuringExtraction(true)
+                .createMediaSource(item)
             preferDirectExtractor -> ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
-            else -> DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory).createMediaSource(item)
-        }
-        return if (externalSub != null && !preferDirectExtractor) {
-            MergingMediaSource(baseSource, buildExternalSubtitleSource(externalSub))
-        } else {
-            baseSource
+            else -> DefaultMediaSourceFactory(context)
+                .setDataSourceFactory(dataSourceFactory)
+                .experimentalParseSubtitlesDuringExtraction(true)
+                .createMediaSource(item)
         }
     }
 
@@ -6334,6 +6593,7 @@ private fun ArcPlayerScreen(
         val sub = activeSubChoice
         if (sub == null) {
             builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            builder.setPreferredTextLanguage(null)
         } else if (sub.trackGroupIndex >= 0) {
             val targetGroup = exoPlayer.currentTracks.groups.getOrNull(sub.trackGroupIndex)
             builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
@@ -6342,30 +6602,41 @@ private fun ArcPlayerScreen(
             }
         } else {
             builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            builder.setPreferredTextLanguage(sub.lang.ifBlank { "en" })
         }
         trackSelector.parameters = builder.build()
     }
 
-    LaunchedEffect(currentTarget, selectedQuality, overrideAudioUrl, usingFallback, lazyProxyUrl, retryCounter, activeExternalSub?.url) {
+    LaunchedEffect(
+        currentTarget,
+        selectedQuality,
+        overrideAudioUrl,
+        usingFallback,
+        lazyProxyUrl,
+        retryCounter,
+        activeExternalSub?.url,
+        resolvedSubSourceUrl,
+        cachedExternalSub?.url,
+    ) {
+        val pendingSub = activeExternalSub
+        if (pendingSub != null && resolvedSubSourceUrl != pendingSub.url) {
+            return@LaunchedEffect
+        }
         val hasSplitTracks = !usingFallback &&
             !currentTarget.isAudioOnlyStream &&
             activeTrack.videoUrl.isNotBlank() &&
             activeTrack.audioUrl.isNotBlank()
 
         val source = runCatching {
-            val extSub = if (!currentTarget.isAudioOnlyStream) activeExternalSub else null
+            val extSub = if (!currentTarget.isAudioOnlyStream) cachedExternalSub else null
             if (hasSplitTracks) {
-                val videoSource = buildMediaSource(activeTrack.videoUrl, preferDirectExtractor = true)
+                val videoSource = buildMediaSource(activeTrack.videoUrl, preferDirectExtractor = true, externalSub = extSub)
                 val audioSource = buildMediaSource(activeTrack.audioUrl, preferDirectExtractor = true)
                 Log.i(
                     "ArcPlayer",
                     "Preparing MergingMediaSource -> video=[${activeTrack.videoFormat}] audio=[${activeTrack.audioFormat}] sub=[${extSub?.label ?: "none"}]"
                 )
-                if (extSub != null) {
-                    MergingMediaSource(videoSource, audioSource, buildExternalSubtitleSource(extSub))
-                } else {
-                    MergingMediaSource(videoSource, audioSource)
-                }
+                MergingMediaSource(videoSource, audioSource)
             } else {
                 val singleUrl = if (usingFallback) effFallbackUrl.ifBlank { primaryUrl } else primaryUrl
                 if (singleUrl.isBlank()) {

@@ -113,14 +113,14 @@ def _patch_ytdlp_muxer():
 
                     success = False
                     if len(audio_files) == 1:
-                        success = mux_video_and_audio(v_file, audio_files[0], temp_out)
+                        success = mux_video_and_audio(v_file, audio_files[0], temp_out, job_id=_jid)
                     else:
                         m4a_audios = [a for a in audio_files if os.path.splitext(a)[1].lower() in ('.m4a', '.aac', '.mp4')]
                         audios_to_mux = m4a_audios if m4a_audios else audio_files
-                        success = mux_multiple_audio_tracks(v_file, audios_to_mux, temp_out)
+                        success = mux_multiple_audio_tracks(v_file, audios_to_mux, temp_out, job_id=_jid)
                         if not success:
                             first_audio = audios_to_mux[0] if audios_to_mux else audio_files[0]
-                            success = mux_video_and_audio(v_file, first_audio, temp_out)
+                            success = mux_video_and_audio(v_file, first_audio, temp_out, job_id=_jid)
 
                     if success and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
                         if os.path.exists(target_out):
@@ -1477,7 +1477,7 @@ YTDLP_PROGRESS_REGEX = re.compile(
     r'\[download\]\s+([\d\.]+)%\s+of\s+~?\s*([\d\.]+\s*[A-Za-z]+)\s+at\s+([\d\.]+\s*[A-Za-z]+/s)\s+ETA\s+([\d:]+)'
 )
 
-def _process_progress_line(line):
+def _process_progress_line(line, job_id=None):
     line = line.strip()
     if not line:
         return
@@ -1491,7 +1491,7 @@ def _process_progress_line(line):
             pct = float(m_aria.group(3))
             spd = m_aria.group(4) or "--"
             eta = m_aria.group(5) or "--"
-            render_download_progress(pct, total_str=f"{downloaded}/{total}", speed_str=spd, eta_str=eta)
+            render_download_progress(pct, total_str=f"{downloaded}/{total}", speed_str=spd, eta_str=eta, job_id=job_id)
             return
         except Exception:
             pass
@@ -1502,7 +1502,7 @@ def _process_progress_line(line):
             downloaded = m_aria_s.group(1)
             total = m_aria_s.group(2)
             pct = float(m_aria_s.group(3))
-            render_download_progress(pct, total_str=f"{downloaded}/{total}")
+            render_download_progress(pct, total_str=f"{downloaded}/{total}", job_id=job_id)
             return
         except Exception:
             pass
@@ -1515,7 +1515,7 @@ def _process_progress_line(line):
             tot = m_yt.group(2).replace(' ', '')
             spd = m_yt.group(3).replace(' ', '')
             eta = m_yt.group(4)
-            render_download_progress(pct, total_str=tot, speed_str=spd, eta_str=eta)
+            render_download_progress(pct, total_str=tot, speed_str=spd, eta_str=eta, job_id=job_id)
             return
         except Exception:
             pass
@@ -1525,7 +1525,7 @@ def _process_progress_line(line):
     if m_pct:
         try:
             pct = float(m_pct.group(1))
-            render_download_progress(pct)
+            render_download_progress(pct, job_id=job_id)
             return
         except Exception:
             pass
@@ -1543,7 +1543,7 @@ def _process_progress_line(line):
 def run_command_with_clean_progress(cmd, cwd=None, job_id=None):
     """Run subprocess while processing \r and \n into clean single-line progress updates."""
     p = None
-    jid = str(job_id) if job_id else None
+    jid = str(job_id) if job_id else get_current_job_id()
     try:
         p = subprocess.Popen(
             cmd,
@@ -1574,11 +1574,11 @@ def run_command_with_clean_progress(cmd, cwd=None, job_id=None):
             ch = p.stdout.read(1)
             if not ch:
                 if buf:
-                    _process_progress_line("".join(buf))
+                    _process_progress_line("".join(buf), job_id=jid)
                 break
             if ch in ('\r', '\n'):
                 if buf:
-                    _process_progress_line("".join(buf))
+                    _process_progress_line("".join(buf), job_id=jid)
                     buf = []
             else:
                 buf.append(ch)
@@ -1755,7 +1755,7 @@ def download_file_stream(url, filename, custom_headers=None, target_dir=None, ca
                                     if total_bytes > 0:
                                         render_download_progress(percent, total_str=f"{mb_total:.1f} MB", speed_str=speed_str, eta_str=eta_str, job_id=jid, downloaded_str=f"{mb_done:.1f} MB")
                                     else:
-                                        render_download_progress(100.0, total_str="--", speed_str=speed_str, eta_str="--", job_id=jid, downloaded_str=f"{mb_done:.1f} MB")
+                                        render_download_progress(0.0, total_str="--", speed_str=speed_str, eta_str="--", job_id=jid, downloaded_str=f"{mb_done:.1f} MB")
                                 last_time = now
                                 last_downloaded = downloaded
                 break
@@ -2035,13 +2035,14 @@ def get_ytdlp_opts(custom_opts=None, cookie=None):
     return opts
 
 
-def download_hls_with_python(url, dest_path, headers=None):
+def download_hls_with_python(url, dest_path, headers=None, job_id=None):
     """Download an HLS stream without requiring an external yt-dlp executable."""
     if not HAS_YTDLP:
         return 1
+    jid = str(job_id or get_current_job_id() or "")
     try:
         def progress_hook(d):
-            if CURRENT_DOWNLOAD_JOB_ID in CANCELLED_DOWNLOAD_JOBS:
+            if jid and jid in CANCELLED_DOWNLOAD_JOBS:
                 raise Exception("Download cancelled by user")
             status = d.get('status')
             if status == 'downloading':
@@ -2050,12 +2051,18 @@ def download_hls_with_python(url, dest_path, headers=None):
                 speed = d.get('speed') or 0
                 eta = d.get('eta') or 0
                 percent = (downloaded / total * 100) if total > 0 else 0.0
+                mb_done = downloaded / (1024 * 1024)
+                mb_tot = total / (1024 * 1024) if total > 0 else 0
+                spd_s = f"{(speed / (1024 * 1024)):.2f}MB/s" if speed else "--"
+                em, es = divmod(int(eta) if eta else 0, 60)
+                eta_s = f"{em:02d}:{es:02d}" if eta else "--"
                 render_download_progress(
-                    percent=percent,
-                    speed=format_speed(speed),
-                    eta=format_eta(eta),
-                    downloaded_bytes=downloaded,
-                    total_bytes=total,
+                    percent,
+                    total_str=f"{mb_tot:.1f} MB" if total > 0 else "--",
+                    speed_str=spd_s,
+                    eta_str=eta_s,
+                    job_id=jid or None,
+                    downloaded_str=f"{mb_done:.1f} MB",
                 )
 
         options = get_ytdlp_opts({
@@ -2200,12 +2207,12 @@ def prompt_video_quality(url, quality_arg=None, cookie=None):
     print("> Selection invalid or default picked. Downloading Best Available quality.")
     return format_map['1'][0], False
 
-def mux_video_and_audio(video_path, audio_path, output_path):
+def mux_video_and_audio(video_path, audio_path, output_path, job_id=None):
     """Mux separate video and audio tracks into a single playable container without quality loss."""
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
         return False
 
-    jid = get_current_job_id()
+    jid = job_id or get_current_job_id()
     if jid:
         render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
@@ -2220,8 +2227,12 @@ def mux_video_and_audio(video_path, audio_path, output_path):
     try:
         from com.erawat.arc import EmbeddedEngine
         mux_fn = getattr(EmbeddedEngine, 'mux', None) or getattr(getattr(EmbeddedEngine, 'INSTANCE', None), 'mux', None)
-        if mux_fn and mux_fn(str(video_path), str(audio_path), str(temp_out)):
-            if os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+        if mux_fn:
+            try:
+                ok_mux = mux_fn(str(video_path), str(audio_path), str(temp_out), str(jid or ""))
+            except TypeError:
+                ok_mux = mux_fn(str(video_path), str(audio_path), str(temp_out))
+            if ok_mux and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
                 muxed = True
     except Exception as e:
         print(f"[WARN] Native Android muxing: {e}")
@@ -2260,7 +2271,7 @@ def mux_video_and_audio(video_path, audio_path, output_path):
         except Exception: pass
     return False
 
-def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
+def mux_multiple_audio_tracks(video_path, audio_paths, output_path, job_id=None):
     """Mux a video track with multiple audio tracks into a single container."""
     if not os.path.exists(video_path) or not audio_paths:
         return False
@@ -2268,7 +2279,7 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
     if not valid_audios:
         return False
 
-    jid = get_current_job_id()
+    jid = job_id or get_current_job_id()
     if jid:
         render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
@@ -2285,9 +2296,12 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path):
         mux_fn = getattr(EmbeddedEngine, 'muxMultiple', None) or getattr(getattr(EmbeddedEngine, 'INSTANCE', None), 'muxMultiple', None)
         if mux_fn:
             # Pass as Python list which Chaquopy marshals to java.util.List
-            if mux_fn(str(video_path), [str(p) for p in valid_audios], str(temp_out)):
-                if os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
-                    muxed = True
+            try:
+                ok_mux = mux_fn(str(video_path), [str(p) for p in valid_audios], str(temp_out), str(jid or ""))
+            except TypeError:
+                ok_mux = mux_fn(str(video_path), [str(p) for p in valid_audios], str(temp_out))
+            if ok_mux and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+                muxed = True
     except Exception as e:
         print(f"[WARN] Native Android multi-track muxing: {e}")
 
@@ -2829,7 +2843,7 @@ def handle_telegram(url, out_name=None, target_dir=None, telegram_config=None, j
                         render_download_progress(percent, f"{mb_done:.1f}/{mb_total:.1f}MB", job_id=jid)
                     else:
                         mb_done = current / (1024 * 1024)
-                        render_download_progress(100.0, f"{mb_done:.1f}MB", job_id=jid)
+                        render_download_progress(0.0, f"{mb_done:.1f}MB", job_id=jid)
 
                 # Resolve chat / username peer upfront
                 resolved_chat_id = chat_id
@@ -7241,7 +7255,7 @@ def app_download(payload):
 
         if ".m3u8" in target_direct.lower() or "m3u8" in str(s_headers.get("Accept", "")).lower():
             print(f"> Downloading HLS video stream via in-process engine: {target_direct[:70]}...")
-            ret = download_hls_with_python(target_direct, dest_path, s_headers)
+            ret = download_hls_with_python(target_direct, dest_path, s_headers, job_id=jid)
             if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 path = dest_path
             else:
@@ -7251,11 +7265,14 @@ def app_download(payload):
             path = download_file_stream(target_direct, clean_name, custom_headers=s_headers, target_dir=target_dir, cache_dir=cache_dir, job_id=jid)
 
     if jid in CANCELLED_DOWNLOAD_JOBS:
+        set_current_job_id(None)
         return {"cancelled": True, "status": "Cancelled", "job_id": jid}
 
     if not path:
         if jid in CANCELLED_DOWNLOAD_JOBS:
+            set_current_job_id(None)
             return {"cancelled": True, "status": "Cancelled", "job_id": jid}
+        set_current_job_id(None)
         raise Exception("The downloader returned no output file")
 
     if os.path.exists(path):
@@ -7281,6 +7298,7 @@ def app_download(payload):
         "status": "Complete",
         "path": path,
     }
+    set_current_job_id(None)
     return {"path": path, "quality": quality, "target_dir": target_dir, "job_id": jid, "status": "Complete"}
 
 
