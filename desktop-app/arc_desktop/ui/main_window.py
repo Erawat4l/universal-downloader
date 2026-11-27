@@ -466,7 +466,8 @@ class MainWindow(QMainWindow):
         self._submit(self._resolve_payload(url, self._default_quality()), "Resolve media")
 
     def _resolve_payload(self, url: str, quality: str) -> dict:
-        payload: dict = {"action": "resolve", "url": url, "quality": quality}
+        eff_q = "Best" if "ask" in (quality or "").lower() else quality
+        payload: dict = {"action": "resolve", "url": url, "quality": eff_q}
         season, episode = self._season_episode_from_text(url)
         if season:
             payload["season"] = season
@@ -817,6 +818,12 @@ class MainWindow(QMainWindow):
         self._update_location_hint()
 
     def _pick_quality(self, requested: str, target: dict) -> str:
+        if self.audio_only:
+            if requested and requested != "Ask each time":
+                match = match_quality_key(requested, AUDIO_QUALITIES)
+                if match:
+                    return str(match)
+            return AUDIO_QUALITIES[0]
         keys = [str(k) for k in (target.get("available_qualities") or [])]
         if not keys:
             return requested if requested != "Ask each time" else "Best Available"
@@ -832,8 +839,12 @@ class MainWindow(QMainWindow):
     def _default_quality(self) -> str:
         if self.audio_only:
             configured = str(self.store.get("default_audio_quality", "Ask each time"))
+            if configured == "Ask each time":
+                return "Ask each time"
             return configured if configured in AUDIO_QUALITIES else "Best Audio (320kbps)"
         configured = str(self.store.get("default_video_quality", "Ask each time"))
+        if configured == "Ask each time":
+            return "Ask each time"
         return configured if configured in VIDEO_QUALITY_DEFAULTS else "Best Available"
 
     # ------------------------------------------------------- analysis actions
@@ -862,7 +873,7 @@ class MainWindow(QMainWindow):
             return
         self.audio_only = audio_only
         self.analysis_page.set_audio_only(audio_only)
-        preferred = self._default_quality()
+        preferred = self._pick_quality(self._default_quality(), self.target)
         self.selected_quality = preferred
         spec = resolve_track_for_quality(
             preferred,
