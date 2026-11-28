@@ -192,15 +192,40 @@ class DownloadService : Service() {
 
         val existingJob = DownloadManager.getJobs().firstOrNull { it.id == jobId }
         val checkPath = if (path.isNotBlank()) path else existingJob?.path.orEmpty()
+        val batchPathsJson = data?.optJSONArray("paths")
+        val batchScanList = buildList {
+            if (batchPathsJson != null) {
+                for (i in 0 until batchPathsJson.length()) {
+                    val p = batchPathsJson.optString(i)
+                    if (p.isNotBlank()) add(File(p))
+                }
+            }
+        }
         val fileActuallyExists = checkPath.isNotBlank() && runCatching {
             val f = File(checkPath)
-            f.exists() && f.length() > 0
+            (f.isFile && f.length() > 0) || (f.isDirectory && (f.listFiles()?.any { it.isFile && it.length() > 0 } == true))
         }.getOrDefault(false)
+        val effectivePath = runCatching {
+            val f = File(checkPath)
+            if (f.isDirectory) {
+                f.listFiles()
+                    ?.filter { it.isFile && it.length() > 0 && it.extension.lowercase() in setOf("mp4", "mkv", "webm", "m4a", "mp3") }
+                    ?.sortedBy { it.name.lowercase() }
+                    ?.firstOrNull()
+                    ?.absolutePath ?: checkPath
+            } else {
+                checkPath
+            }
+        }.getOrDefault(checkPath)
+        val scanPaths = (batchScanList.filter { it.exists() && it.length() > 0 }.map { it.absolutePath } + listOf(effectivePath))
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toTypedArray()
 
         if (fileActuallyExists) {
-            runCatching { MediaScannerConnection.scanFile(applicationContext, arrayOf(checkPath), null, null) }
-            DownloadManager.markComplete(applicationContext, jobId, checkPath)
-            postCompletionNotification(title.ifBlank { "Download" }, checkPath)
+            runCatching { MediaScannerConnection.scanFile(applicationContext, scanPaths, null, null) }
+            DownloadManager.markComplete(applicationContext, jobId, effectivePath)
+            postCompletionNotification(title.ifBlank { "Download" }, effectivePath)
         } else if (!isOk || isCancelled || path.isBlank()) {
             if (isCancelled) {
                 DownloadManager.markCancelled(applicationContext, jobId)
@@ -210,9 +235,9 @@ class DownloadService : Service() {
                 DownloadManager.markFailed(applicationContext, jobId, errMsg, engineLogs)
             }
         } else {
-            runCatching { MediaScannerConnection.scanFile(applicationContext, arrayOf(path), null, null) }
-            DownloadManager.markComplete(applicationContext, jobId, path)
-            postCompletionNotification(title.ifBlank { "Download" }, path)
+            runCatching { MediaScannerConnection.scanFile(applicationContext, scanPaths, null, null) }
+            DownloadManager.markComplete(applicationContext, jobId, effectivePath)
+            postCompletionNotification(title.ifBlank { "Download" }, effectivePath)
         }
 
         activeJobIds.remove(jobId)

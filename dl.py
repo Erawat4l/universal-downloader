@@ -2339,7 +2339,9 @@ def mux_multiple_audio_tracks(video_path, audio_paths, output_path, job_id=None)
         except Exception: pass
     return False
 
-def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None, subtitle_lang=None):
+PLAYLIST_BATCH_PATHS = {}
+
+def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None, standalone=False, job_id=None, cache_dir=None, out_name=None, audio_lang=None, subtitle_lang=None, batch_info=None):
     if not HAS_YTDLP:
         print("[WARN] yt-dlp is not installed. Falling back to generic download...")
         return False
@@ -2356,8 +2358,13 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
             new_query = urllib.parse.urlencode(q_params, doseq=True)
             url = urllib.parse.urlunparse((parsed_u.scheme, parsed_u.netloc, parsed_u.path, parsed_u.params, new_query, parsed_u.fragment))
 
-    is_playlist_req = ("/playlist" in url or "list=PL" in url or "list=OLAK5uy" in url or "list=UU" in url or "list=FL" in url or "list=RD" in url or "list=RDM" in url)
+    is_playlist_req = (not batch_info) and ("/playlist" in url or "list=PL" in url or "list=OLAK5uy" in url or "list=UU" in url or "list=FL" in url or "list=RD" in url or "list=RDM" in url)
     is_playlist = is_playlist_req
+
+    q_text = str(quality_arg or "").lower()
+    q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
+    cap = int(q_match.group(1)) if q_match else 1080
+    q_tag = f"{cap}p"
 
     if is_playlist_req:
         q_clean = str(quality_arg or "").lower().strip()
@@ -2365,12 +2372,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         if is_audio_only:
             format_spec = "bestaudio[ext=m4a]/bestaudio/best"
         else:
-            m = re.search(r"(\d{3,4})p", q_clean)
-            if m:
-                h = m.group(1)
-                format_spec = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}][ext=mp4]/best[height<={h}]/best"
-            else:
-                format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            format_spec = f"bestvideo[height<={cap}][ext=mp4]+bestaudio[ext=m4a]/best[height<={cap}][ext=mp4]/best[height<={cap}]/best"
     else:
         try:
             format_spec, is_audio_only = prompt_video_quality(url, quality_arg=quality_arg, cookie=cookie)
@@ -2382,6 +2384,82 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
     os.makedirs(out_dir, exist_ok=True)
     
     jid = job_id or get_current_job_id()
+
+    if is_playlist and not batch_info:
+        p_title = clean_filename(out_name or 'YouTube Playlist')
+        playlist_dir = os.path.join(out_dir, p_title)
+        os.makedirs(playlist_dir, exist_ok=True)
+        print(f"> Resolving playlist entries into: {playlist_dir}")
+        flat_entries = []
+        try:
+            flat_opts = get_ytdlp_opts({
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': 'in_playlist',
+                'ignoreerrors': True,
+                'socket_timeout': 20,
+            }, cookie=cookie)
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                p_info = ydl.extract_info(url, download=False)
+                if isinstance(p_info, dict):
+                    raw_entries = [e for e in (p_info.get('entries') or []) if isinstance(e, dict)]
+                    for idx_e, entry in enumerate(raw_entries, start=1):
+                        e_id = str(entry.get('id') or '').strip()
+                        e_url = str(entry.get('url') or entry.get('webpage_url') or '').strip()
+                        if e_url and not e_url.startswith(('http://', 'https://')) and e_id:
+                            e_url = f"https://www.youtube.com/watch?v={e_id}"
+                        elif not e_url and e_id:
+                            e_url = f"https://www.youtube.com/watch?v={e_id}"
+                        if e_url:
+                            flat_entries.append((idx_e, entry.get('title') or f"Track {idx_e}", e_url))
+        except Exception as flat_err:
+            print(f"[WARN] Playlist flat scan fallback: {flat_err}")
+
+        if flat_entries:
+            total_items = len(flat_entries)
+            print(f"> Downloading playlist ({total_items} items) at {q_tag}...")
+            downloaded_files = []
+            for b_idx, (_, item_title, item_url) in enumerate(flat_entries, start=1):
+                if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                    return None
+                if jid and str(jid) in PAUSED_DOWNLOAD_JOBS:
+                    render_download_progress(round(((b_idx - 1) / total_items) * 100, 1), "Paused", "Paused", "--", job_id=jid)
+                    while str(jid) in PAUSED_DOWNLOAD_JOBS:
+                        if str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                            return None
+                        time.sleep(0.5)
+                item_name = clean_filename(f"{b_idx:02d}. {item_title}", default_ext="", quality="")
+                print(f"\n[{b_idx}/{total_items}] Downloading: {item_title}")
+                try:
+                    res_p = handle_youtube_or_video(
+                        item_url,
+                        target_dir=playlist_dir,
+                        quality_arg=quality_arg,
+                        cookie=cookie,
+                        standalone=True,
+                        job_id=jid,
+                        cache_dir=cache_dir,
+                        out_name=item_name,
+                        audio_lang=audio_lang,
+                        subtitle_lang=subtitle_lang,
+                        batch_info=(b_idx, total_items),
+                    )
+                    if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                        return None
+                    if res_p and isinstance(res_p, str) and os.path.exists(res_p):
+                        downloaded_files.append(res_p)
+                except Exception as item_e:
+                    if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
+                        return None
+                    print(f"[WARN] Playlist item {b_idx}/{total_items} skipped: {item_e}")
+            if downloaded_files:
+                if jid:
+                    PLAYLIST_BATCH_PATHS[str(jid)] = list(downloaded_files)
+                    render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                return downloaded_files[0]
+            raise RuntimeError("No playable videos could be downloaded from this playlist.")
+
+    b_idx, b_tot = batch_info if (isinstance(batch_info, (tuple, list)) and len(batch_info) == 2 and batch_info[1] and int(batch_info[1]) > 1) else (None, None)
 
     def ytdlp_progress_hook(d):
         if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
@@ -2397,9 +2475,14 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
         status = d.get('status')
         info = d.get('info_dict') or {}
-        p_idx = info.get('playlist_index')
-        p_total = info.get('n_entries') or info.get('playlist_count')
-        is_p = bool(p_total and p_total > 1)
+        if b_idx and b_tot:
+            p_idx = int(b_idx)
+            p_total = int(b_tot)
+            is_p = True
+        else:
+            p_idx = info.get('playlist_index')
+            p_total = info.get('n_entries') or info.get('playlist_count')
+            is_p = bool(p_total and p_total > 1)
 
         vcode = info.get('vcodec') or ''
         acode = info.get('acodec') or ''
@@ -2422,7 +2505,12 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
 
             if is_p:
                 cur_idx = p_idx or 1
-                item_pct = raw_percent / 100.0
+                if is_video_only_stream:
+                    item_pct = (raw_percent * 0.90) / 100.0
+                elif is_audio_only_stream:
+                    item_pct = (90.0 + (raw_percent * 0.10)) / 100.0
+                else:
+                    item_pct = raw_percent / 100.0
                 overall_pct = round(((cur_idx - 1 + item_pct) / p_total) * 100, 1)
                 p_label = f"[{cur_idx}/{p_total}] {tot_str}"
                 render_download_progress(overall_pct, p_label, spd_str, eta_str, job_id=jid)
@@ -2438,11 +2526,18 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         elif status == 'finished':
             if is_p:
                 cur_idx = p_idx or 1
-                if cur_idx < p_total:
+                if is_video_only_stream:
+                    overall_pct = round(((cur_idx - 1 + 0.90) / p_total) * 100, 1)
+                    render_download_progress(overall_pct, f"[{cur_idx}/{p_total}] Audio next", "Audio next", "--", job_id=jid)
+                elif is_audio_only_stream:
+                    overall_pct = round(((cur_idx - 0.02) / p_total) * 100, 1)
+                    dl_lbl = f"[{cur_idx}/{p_total}] Mixing"
+                    render_download_progress(overall_pct, dl_lbl, "Muxing", "--", job_id=jid, downloaded_str=dl_lbl, status_override="Muxing" if cur_idx >= p_total else None)
+                elif cur_idx < p_total:
                     overall_pct = round((cur_idx / p_total) * 100, 1)
-                    render_download_progress(overall_pct, f"[{cur_idx}/{p_total}] Done", "Done", "--", job_id=jid)
+                    render_download_progress(overall_pct, f"[{cur_idx}/{p_total}] Done", "Next...", "--", job_id=jid)
                 else:
-                    render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                    render_download_progress(99.5, "Finalizing", "Muxing", "--", job_id=jid)
             else:
                 if is_video_only_stream:
                     render_download_progress(90.0, "Video downloaded", "Audio next", "--", job_id=jid, downloaded_str="Video ready")
@@ -2457,7 +2552,12 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         pp_status = str(d.get('status') or '').lower()
         pp_name = str(d.get('postprocessor') or '').lower()
         if jid and pp_status in ('started', 'processing') and any(k in pp_name for k in ('merger', 'ffmpeg', 'video', 'extractaudio', 'embed')):
-            render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
+            if b_idx and b_tot and int(b_idx) < int(b_tot):
+                overall_pct = round(((int(b_idx) - 0.02) / int(b_tot)) * 100, 1)
+                dl_lbl = f"[{b_idx}/{b_tot}] Mixing"
+                render_download_progress(overall_pct, dl_lbl, "Muxing", "--", job_id=jid, downloaded_str=dl_lbl)
+            else:
+                render_download_progress(99.0, "Mixing media", "Muxing", "--", job_id=jid, downloaded_str="Mixing media", status_override="Muxing")
 
     stage_dir = None
     if is_playlist:
@@ -2465,14 +2565,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         playlist_dir = os.path.join(out_dir, p_title)
         os.makedirs(playlist_dir, exist_ok=True)
         out_dir = playlist_dir
-        outtmpl_pattern = os.path.join(out_dir, '%(title)s.%(ext)s')
+        outtmpl_pattern = os.path.join(out_dir, f'%(title)s[{q_tag}].%(ext)s')
     else:
         stage_dir = os.path.join(out_dir, f".arc_stage_{jid}")
         os.makedirs(stage_dir, exist_ok=True)
-        q_text = str(quality_arg or "").lower()
-        q_match = re.search(r"(4320|2160|1440|1080|720|480|360|240|144)\s*p?", q_text)
-        cap = int(q_match.group(1)) if q_match else 1080
-        q_tag = f"{cap}p"
 
         if out_name and not any(out_name.lower().startswith(p) for p in ('youtube video', 'video', 'download', 'stream')):
             clean_base = clean_filename(out_name, default_ext="", quality=q_tag)
@@ -2518,6 +2614,7 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
         'outtmpl': outtmpl_pattern,
         'quiet': False,
         'no_warnings': True,
+        'ignoreerrors': bool(is_playlist),
         'progress_hooks': [ytdlp_progress_hook],
         'postprocessor_hooks': [ytdlp_pp_hook],
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'},
@@ -2545,7 +2642,22 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 
                 # Check if result is a playlist
                 if info.get('_type') == 'playlist' or 'entries' in info or is_playlist:
-                    filename = out_dir
+                    fallback_files = []
+                    for ent in (info.get('entries') or []):
+                        if not isinstance(ent, dict):
+                            continue
+                        e_dls = ent.get('requested_downloads') or []
+                        e_fp = next((rd.get('filepath') for rd in e_dls if isinstance(rd, dict) and rd.get('filepath') and os.path.exists(rd.get('filepath'))), None)
+                        if not e_fp and ent.get('filepath') and os.path.exists(ent.get('filepath')):
+                            e_fp = ent.get('filepath')
+                        if e_fp:
+                            fallback_files.append(e_fp)
+                    if fallback_files:
+                        if jid:
+                            PLAYLIST_BATCH_PATHS[str(jid)] = list(fallback_files)
+                        filename = fallback_files[0]
+                    else:
+                        filename = out_dir
                 else:
                     req_dls = info.get('requested_downloads') or []
                     req_fp = next((rd.get('filepath') for rd in req_dls if isinstance(rd, dict) and rd.get('filepath') and os.path.exists(rd.get('filepath'))), None)
@@ -2626,7 +2738,10 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 _cleanup_download_cache(cache_dir, out_dir, job_id=jid, keep_path=filename)
                 sync_to_sdcard_if_needed(filename)
             if jid:
-                render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
+                if b_idx and b_tot and int(b_idx) < int(b_tot):
+                    render_download_progress(round((int(b_idx) / int(b_tot)) * 100, 1), f"[{b_idx}/{b_tot}] Saved", "Next...", "--", job_id=jid)
+                else:
+                    render_download_progress(100.0, "Complete", "Done", "0s", job_id=jid)
             return filename
         except Exception as e:
             if jid and str(jid) in CANCELLED_DOWNLOAD_JOBS:
@@ -2645,10 +2760,11 @@ def handle_youtube_or_video(url, target_dir=None, quality_arg=None, cookie=None,
                 print(" [WARN] Postprocessing failed: Video stream fragments were corrupted due to network disconnection.")
                 print(" > Cleaning corrupted partial fragments & retrying with network-resilient H.264 format...")
                 print("!"*60 + "\n")
-                for f in os.listdir(out_dir):
+                clean_target_dir = stage_dir if (stage_dir and os.path.isdir(stage_dir)) else out_dir
+                for f in os.listdir(clean_target_dir):
                     if ".f" in f or ".temp" in f or ".part" in f or ".ytdl" in f:
                         try:
-                            os.remove(os.path.join(out_dir, f))
+                            os.remove(os.path.join(clean_target_dir, f))
                             print(f"  - Cleaned partial fragment: {f}")
                         except Exception:
                             pass
@@ -7275,10 +7391,12 @@ def app_download(payload):
         set_current_job_id(None)
         raise Exception("The downloader returned no output file")
 
+    batch_paths = PLAYLIST_BATCH_PATHS.pop(str(jid), None) or []
+
     if os.path.exists(path):
         path = os.path.normpath(os.path.abspath(path))
 
-    if (sub_lang or sub_url) and not (payload.get("audio_only") or payload.get("is_audio")):
+    if (sub_lang or sub_url) and os.path.isfile(path) and not (payload.get("audio_only") or payload.get("is_audio")):
         _save_sidecar_subtitle_srt(
             path,
             sub_url=sub_url,
@@ -7299,7 +7417,10 @@ def app_download(payload):
         "path": path,
     }
     set_current_job_id(None)
-    return {"path": path, "quality": quality, "target_dir": target_dir, "job_id": jid, "status": "Complete"}
+    res_obj = {"path": path, "quality": quality, "target_dir": target_dir, "job_id": jid, "status": "Complete"}
+    if batch_paths:
+        res_obj["paths"] = [os.path.normpath(os.path.abspath(p)) for p in batch_paths if os.path.exists(p)]
+    return res_obj
 
 
 _PENDING_TG_CLIENTS = {}

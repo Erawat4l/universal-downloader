@@ -418,8 +418,12 @@ private data class PlayerStreamTarget(
     val subtitleTracks: List<SubtitleChoice> = emptyList(),
     val selectedSubLang: String = "",
     val isSeries: Boolean = false,
+    val seasons: List<SeasonInfo> = emptyList(),
     val selectedSeason: Int = 1,
     val selectedEpisode: Int = 1,
+    val isPlaylist: Boolean = false,
+    val playlistEntries: List<PlaylistEntry> = emptyList(),
+    val selectedPlaylistIndex: Int = 0,
 )
 
 private fun requiredLocalMediaPermissions(isAudioFile: Boolean): Array<String> {
@@ -557,6 +561,8 @@ private data class MediaTarget(
     val seasons: List<SeasonInfo> = emptyList(),
     val isPlaylist: Boolean = false,
     val playlistEntries: List<PlaylistEntry> = emptyList(),
+    val playlistContextEntries: List<PlaylistEntry> = emptyList(),
+    val selectedPlaylistIndex: Int = 0,
     val selectedSeason: Int = 1,
     val selectedEpisode: Int = 1,
     val canStream: Boolean = true,
@@ -1699,8 +1705,12 @@ private fun ArcApp(
         subtitleTracks: List<SubtitleChoice> = emptyList(),
         selectedSubLang: String = "",
         isSeries: Boolean = false,
+        seasons: List<SeasonInfo> = emptyList(),
         selectedSeason: Int = 1,
         selectedEpisode: Int = 1,
+        isPlaylist: Boolean = false,
+        playlistEntries: List<PlaylistEntry> = emptyList(),
+        selectedPlaylistIndex: Int = 0,
     ) {
         val spec = trackSpec ?: StreamTrackSpec(url = streamUrl)
         val effUrl = streamUrl.ifBlank { spec.url }.ifBlank { spec.fallbackUrl }
@@ -1728,8 +1738,12 @@ private fun ArcApp(
                 subtitleTracks = subtitleTracks,
                 selectedSubLang = selectedSubLang,
                 isSeries = isSeries,
+                seasons = seasons,
                 selectedSeason = selectedSeason,
                 selectedEpisode = selectedEpisode,
+                isPlaylist = isPlaylist,
+                playlistEntries = playlistEntries,
+                selectedPlaylistIndex = selectedPlaylistIndex,
             )
         } else {
             openStreamExternal(effUrl, headers, title, targetPackage = streamingPlayer)
@@ -2156,6 +2170,8 @@ private fun ArcApp(
                     seasons = seasonsList.ifEmpty { target.seasons },
                     isPlaylist = isPlaylist,
                     playlistEntries = playlistEntriesList,
+                    playlistContextEntries = if (playlistEntriesList.isNotEmpty()) playlistEntriesList else target.playlistContextEntries,
+                    selectedPlaylistIndex = if (playlistEntriesList.isNotEmpty()) 0 else target.selectedPlaylistIndex,
                     selectedSeason = data?.optInt("season", target.selectedSeason) ?: target.selectedSeason,
                     selectedEpisode = data?.optInt("episode", target.selectedEpisode) ?: target.selectedEpisode,
                     canStream = finalCanStream,
@@ -2385,6 +2401,8 @@ private fun ArcApp(
         mediaCategoryOverride: String? = null,
         yearOverride: String? = null,
         providersOverride: String? = null,
+        playlistContextEntries: List<PlaylistEntry> = emptyList(),
+        playlistContextIndex: Int = 0,
     ) {
         val clean = value.trim()
         if (clean.isEmpty()) {
@@ -2412,7 +2430,14 @@ private fun ArcApp(
             val cachedTarget = if (effLang.isNotBlank()) AppSessionCache.targets["${clean}#${effLang}"] else AppSessionCache.targets[clean]
             val cachedTargetTrace = if (effLang.isNotBlank()) AppSessionCache.targetTraces["${clean}#${effLang}"] else AppSessionCache.targetTraces[clean]
             if (cachedTarget != null && season == null && episode == null) {
-                target = cachedTarget
+                target = if (playlistContextEntries.isNotEmpty()) {
+                    cachedTarget.copy(
+                        playlistContextEntries = playlistContextEntries,
+                        selectedPlaylistIndex = playlistContextIndex,
+                    )
+                } else {
+                    cachedTarget
+                }
                 cachedTargetTrace?.let {
                     analysisTrace = it.trace
                     analysisLiveStepText = it.liveStep
@@ -2497,6 +2522,8 @@ private fun ArcApp(
                     seasons = emptyList(),
                     isPlaylist = false,
                     playlistEntries = emptyList(),
+                    playlistContextEntries = playlistContextEntries,
+                    selectedPlaylistIndex = playlistContextIndex,
                     selectedSeason = season ?: 1,
                     selectedEpisode = episode ?: 1,
                     canStream = initialCanStream,
@@ -3021,10 +3048,16 @@ private fun ArcApp(
                                             pendingActionAfterAudioSelect = "stream"
                                             showAudioSelectDialog = true
                                         } else {
-                                            val displayTitle = if (target.isSeries) {
-                                                "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
-                                            } else {
-                                                target.title
+                                            val effPlaylistEntries = if (target.playlistEntries.isNotEmpty()) target.playlistEntries else target.playlistContextEntries
+                                            val effPlaylistFlag = target.isPlaylist || effPlaylistEntries.isNotEmpty()
+                                            val firstIdx = target.selectedPlaylistIndex.coerceIn(0, (effPlaylistEntries.size - 1).coerceAtLeast(0))
+                                            val activePlaylistEntry = if (target.isPlaylist && effPlaylistEntries.isNotEmpty()) effPlaylistEntries.getOrNull(firstIdx) else null
+                                            val streamResolveUrl = activePlaylistEntry?.url?.takeIf { it.isNotBlank() } ?: target.targetUrl.ifBlank { input }
+                                            val effPlaylistIdx = if (activePlaylistEntry != null) firstIdx else target.selectedPlaylistIndex
+                                            val displayTitle = when {
+                                                activePlaylistEntry != null -> activePlaylistEntry.title.ifBlank { target.title }
+                                                target.isSeries -> "${cleanShowTitle(target.title)} S${target.selectedSeason}E${target.selectedEpisode}"
+                                                else -> target.title
                                             }
                                             val currentTrack = resolveTrackForQuality(
                                                 quality = selectedQuality,
@@ -3043,7 +3076,7 @@ private fun ArcApp(
                                             )
                                             val directCandidate = currentTrack.url.ifBlank { target.directStreamUrl.ifBlank { target.proxyUrl } }
                                             val hasMergedTracks = currentTrack.videoUrl.isNotBlank() && currentTrack.audioUrl.isNotBlank()
-                                            val isValidDirectStream = (directCandidate.isNotBlank() || hasMergedTracks) &&
+                                            val isValidDirectStream = !target.isPlaylist && (directCandidate.isNotBlank() || hasMergedTracks) &&
                                                 !directCandidate.startsWith("https://www.youtube.com/watch") &&
                                                 !directCandidate.startsWith("https://youtu.be/") &&
                                                 !directCandidate.startsWith("http://www.youtube.com/watch") &&
@@ -3069,8 +3102,12 @@ private fun ArcApp(
                                                     subtitleTracks = target.subtitleTracks,
                                                     selectedSubLang = target.selectedSubLang,
                                                     isSeries = target.isSeries,
+                                                    seasons = target.seasons,
                                                     selectedSeason = target.selectedSeason,
                                                     selectedEpisode = target.selectedEpisode,
+                                                    isPlaylist = effPlaylistFlag,
+                                                    playlistEntries = effPlaylistEntries,
+                                                    selectedPlaylistIndex = effPlaylistIdx,
                                                 )
                                                 scope.launch {
                                                     kotlinx.coroutines.delay(1200)
@@ -3081,11 +3118,11 @@ private fun ArcApp(
                                                 scope.launch {
                                                     val sPayload = JSONObject().apply {
                                                         put("action", "resolve")
-                                                        put("url", target.targetUrl.ifBlank { input })
+                                                        put("url", streamResolveUrl)
                                                         if (target.selectedAudioLang.isNotBlank()) {
                                                             put("audio_lang", target.selectedAudioLang)
                                                         }
-                                                        if (target.isSeries) {
+                                                        if (target.isSeries && activePlaylistEntry == null) {
                                                             put("season", target.selectedSeason)
                                                             put("episode", target.selectedEpisode)
                                                         }
@@ -3126,22 +3163,36 @@ private fun ArcApp(
                                                         val effHeaders = if (hMap.isNotEmpty()) hMap else target.streamHeaders
                                                         val effQTracks = if (qTrackMap.isNotEmpty()) qTrackMap else target.qualityTracks
                                                         val effQUrls = if (qUrlMap.isNotEmpty()) qUrlMap else target.qualityUrls
-                                                        target = target.copy(
-                                                            directStreamUrl = playUrl,
-                                                            proxyUrl = proxyUrl,
-                                                            qualityUrls = effQUrls,
-                                                            qualityTracks = effQTracks,
-                                                            videoUrl = resolvedSpec.videoUrl,
-                                                            audioUrl = resolvedSpec.audioUrl,
-                                                            fallbackUrl = resolvedSpec.fallbackUrl,
-                                                            videoFormat = resolvedSpec.videoFormat,
-                                                            audioFormat = resolvedSpec.audioFormat,
-                                                            fallbackFormat = resolvedSpec.fallbackFormat,
-                                                            audioTrackUrls = effAudioUrls,
-                                                            audioTrackFormats = effAudioFormats,
-                                                            subtitleTracks = effSubTracks,
-                                                            streamHeaders = effHeaders,
-                                                        )
+                                                        val resolvedQualities = mutableListOf<String>()
+                                                        data?.optJSONArray("qualities")?.let { qArr ->
+                                                            for (qi in 0 until qArr.length()) {
+                                                                val q = qArr.optString(qi)
+                                                                if (q.isNotBlank()) resolvedQualities.add(q)
+                                                            }
+                                                        }
+                                                        val effAvailQualities = if (activePlaylistEntry != null && resolvedQualities.isNotEmpty()) {
+                                                            sortQualitiesDescending(resolvedQualities)
+                                                        } else {
+                                                            target.availableQualities
+                                                        }
+                                                        if (activePlaylistEntry == null) {
+                                                            target = target.copy(
+                                                                directStreamUrl = playUrl,
+                                                                proxyUrl = proxyUrl,
+                                                                qualityUrls = effQUrls,
+                                                                qualityTracks = effQTracks,
+                                                                videoUrl = resolvedSpec.videoUrl,
+                                                                audioUrl = resolvedSpec.audioUrl,
+                                                                fallbackUrl = resolvedSpec.fallbackUrl,
+                                                                videoFormat = resolvedSpec.videoFormat,
+                                                                audioFormat = resolvedSpec.audioFormat,
+                                                                fallbackFormat = resolvedSpec.fallbackFormat,
+                                                                audioTrackUrls = effAudioUrls,
+                                                                audioTrackFormats = effAudioFormats,
+                                                                subtitleTracks = effSubTracks,
+                                                                streamHeaders = effHeaders,
+                                                            )
+                                                        }
                                                         playStream(
                                                             streamUrl = playUrl,
                                                             headers = effHeaders,
@@ -3149,10 +3200,10 @@ private fun ArcApp(
                                                             trackSpec = resolvedSpec,
                                                             isAudioOnlyStream = audioOnly,
                                                             currentQuality = selectedQuality,
-                                                            availableQualities = target.availableQualities,
+                                                            availableQualities = effAvailQualities,
                                                             qualityTracks = effQTracks,
                                                             qualityUrls = effQUrls,
-                                                            targetUrl = target.targetUrl.ifBlank { input },
+                                                            targetUrl = streamResolveUrl,
                                                             audioTracks = target.audioTracks,
                                                             audioTrackUrls = effAudioUrls,
                                                             audioTrackFormats = effAudioFormats,
@@ -3160,8 +3211,12 @@ private fun ArcApp(
                                                             subtitleTracks = effSubTracks,
                                                             selectedSubLang = target.selectedSubLang,
                                                             isSeries = target.isSeries,
+                                                            seasons = target.seasons,
                                                             selectedSeason = target.selectedSeason,
                                                             selectedEpisode = target.selectedEpisode,
+                                                            isPlaylist = effPlaylistFlag,
+                                                            playlistEntries = effPlaylistEntries,
+                                                            selectedPlaylistIndex = effPlaylistIdx,
                                                         )
                                                     } else {
                                                         message("Could not resolve stream for $displayTitle")
@@ -3206,7 +3261,13 @@ private fun ArcApp(
                                         )
                                     },
                                     onSelectPlaylistItem = { entry ->
-                                        analyze(entry.url, titleOverride = entry.title, posterOverride = entry.thumbnail)
+                                        analyze(
+                                            entry.url,
+                                            titleOverride = entry.title,
+                                            posterOverride = entry.thumbnail,
+                                            playlistContextEntries = target.playlistEntries,
+                                            playlistContextIndex = target.playlistEntries.indexOf(entry).coerceAtLeast(0),
+                                        )
                                     },
                                 )
                                 else -> HomeScreen(
@@ -3619,6 +3680,7 @@ private fun ArcApp(
     if (inAppPlayerTarget != null) {
         ArcPlayerScreen(
             streamTarget = inAppPlayerTarget!!,
+            onSwitchTarget = { newTarget -> inAppPlayerTarget = newTarget },
             onClose = { inAppPlayerTarget = null }
         )
     }
@@ -6013,6 +6075,7 @@ private suspend fun cacheExternalSubtitleFile(
 @Composable
 private fun ArcPlayerScreen(
     streamTarget: PlayerStreamTarget,
+    onSwitchTarget: (PlayerStreamTarget) -> Unit = {},
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -6037,6 +6100,10 @@ private fun ArcPlayerScreen(
     var overrideAudioUrl by remember(streamTarget) { mutableStateOf("") }
     var overrideAudioFormat by remember(streamTarget) { mutableStateOf("") }
     var isSwitchingAudio by remember(streamTarget) { mutableStateOf(false) }
+    var episodeSwitchLoading by remember(streamTarget) { mutableStateOf(false) }
+    var selectedSheetSeason by remember(streamTarget) {
+        mutableIntStateOf(streamTarget.selectedSeason.coerceAtLeast(1))
+    }
 
     var embeddedSubtitleTracks by remember(streamTarget) { mutableStateOf<List<SubtitleChoice>>(emptyList()) }
     var deviceSubtitleTracks by remember(streamTarget) { mutableStateOf<List<SubtitleChoice>>(emptyList()) }
@@ -7463,6 +7530,8 @@ private fun ArcPlayerScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState())
                     .navigationBarsPadding()
                     .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -7756,6 +7825,263 @@ private fun ArcPlayerScreen(
                                         label = { Text("Size: $sizeLabel") },
                                         colors = arcFilterChipColors(),
                                         border = arcFilterChipBorder(isSizeSel),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Episodes / Playlist Switcher
+                val hasSeriesEpisodes = currentTarget.isSeries && currentTarget.seasons.isNotEmpty()
+                val hasPlaylistEpisodes = currentTarget.playlistEntries.isNotEmpty()
+                if (hasSeriesEpisodes || hasPlaylistEpisodes) {
+                    val episodesListState = rememberLazyListState()
+                    LaunchedEffect(showSettingsSheet, currentTarget, selectedSheetSeason) {
+                        if (showSettingsSheet) {
+                            val targetIdx = if (hasPlaylistEpisodes) {
+                                currentTarget.selectedPlaylistIndex.coerceIn(0, (currentTarget.playlistEntries.size - 1).coerceAtLeast(0))
+                            } else if (selectedSheetSeason == currentTarget.selectedSeason) {
+                                (currentTarget.selectedEpisode - 1).coerceAtLeast(0)
+                            } else {
+                                0
+                            }
+                            episodesListState.scrollToItem(targetIdx)
+                        }
+                    }
+
+                    fun switchEpisodeInPlayer(
+                        seasonNum: Int? = null,
+                        episodeNum: Int? = null,
+                        playlistIdx: Int? = null,
+                        playlistEntry: PlaylistEntry? = null,
+                    ) {
+                        if (episodeSwitchLoading) return
+                        if (playlistEntry != null && playlistIdx != null) {
+                            if (playlistIdx == currentTarget.selectedPlaylistIndex && currentTarget.url.isNotBlank()) {
+                                showSettingsSheet = false
+                                return
+                            }
+                        } else if (seasonNum != null && episodeNum != null) {
+                            if (seasonNum == currentTarget.selectedSeason && episodeNum == currentTarget.selectedEpisode) {
+                                showSettingsSheet = false
+                                return
+                            }
+                        } else {
+                            return
+                        }
+                        val targetUrlToResolve = playlistEntry?.url?.takeIf { it.isNotBlank() } ?: currentTarget.targetUrl
+                        if (targetUrlToResolve.isBlank()) return
+                        episodeSwitchLoading = true
+                        playerErrorText = null
+                        coroutineScope.launch {
+                            val sPayload = JSONObject().apply {
+                                put("action", "resolve")
+                                put("url", targetUrlToResolve)
+                                if (selectedAudioLang.isNotBlank()) put("audio_lang", selectedAudioLang)
+                                if (seasonNum != null && episodeNum != null) {
+                                    put("season", seasonNum)
+                                    put("episode", episodeNum)
+                                }
+                                put("quality", if (selectedQuality.contains("Ask", ignoreCase = true)) "Best" else selectedQuality)
+                                val savedCookie = runCatching {
+                                    context.getSharedPreferences("arc_settings", Context.MODE_PRIVATE).getString("google_cookies", "").orEmpty()
+                                }.getOrDefault("")
+                                if (savedCookie.isNotBlank()) put("cookie", savedCookie)
+                            }
+                            val res = withContext(Dispatchers.IO) {
+                                runCatching { EmbeddedEngine.execute(context, sPayload) }.getOrNull()
+                            }
+                            val data = res?.optJSONObject("result")
+                            val qUrlMap = mutableMapOf<String, String>()
+                            data?.optJSONObject("quality_urls")?.let { qObj ->
+                                qObj.keys().forEach { k -> qUrlMap[k] = qObj.optString(k) }
+                            }
+                            val qTrackMap = parseQualityTracks(data)
+                            val topTrack = parseStreamTrackSpec(data) ?: StreamTrackSpec()
+                            val directUrl = data?.optString("direct_url").takeUnless { it.isNullOrBlank() }
+                                ?: data?.optString("stream_url").takeUnless { it.isNullOrBlank() }
+                                ?: data?.optString("url").orEmpty()
+                            val proxyUrl = data?.optString("proxy_url").orEmpty()
+                            val resolvedSpec = resolveTrackForQuality(
+                                quality = selectedQuality,
+                                qualityTracks = qTrackMap,
+                                qualityUrls = qUrlMap,
+                                fallbackDirectUrl = directUrl.ifBlank { proxyUrl },
+                                fallbackSpec = topTrack,
+                            )
+                            val hObj = data?.optJSONObject("stream_headers") ?: data?.optJSONObject("headers")
+                            val hMap = mutableMapOf<String, String>()
+                            hObj?.keys()?.forEach { k -> hMap[k] = hObj.optString(k) }
+                            val newAudioUrls = parseStringMap(data?.optJSONObject("audio_track_urls"))
+                            val newAudioFormats = parseStringMap(data?.optJSONObject("audio_track_formats"))
+                            val newSubTracks = parseSubtitleTracks(data)
+                            val newAudioList = mutableListOf<AudioChoice>()
+                            (data?.optJSONArray("audio_choices") ?: data?.optJSONArray("audios"))?.let { aArr ->
+                                for (ai in 0 until aArr.length()) {
+                                    val aObj = aArr.optJSONObject(ai) ?: continue
+                                    val lg = aObj.optString("language", "")
+                                    val u = aObj.optString("url", targetUrlToResolve)
+                                    if (lg.isNotBlank() && newAudioList.none { it.language.equals(lg, ignoreCase = true) }) {
+                                        newAudioList.add(AudioChoice(lg, u))
+                                    }
+                                }
+                            }
+                            val seasonsList = mutableListOf<SeasonInfo>()
+                            data?.optJSONArray("seasons")?.let { sArr ->
+                                for (si in 0 until sArr.length()) {
+                                    val sObj = sArr.optJSONObject(si) ?: continue
+                                    seasonsList.add(SeasonInfo(sObj.optInt("season", si + 1), sObj.optInt("episodes", 1)))
+                                }
+                            }
+                            val newQualities = mutableListOf<String>()
+                            data?.optJSONArray("qualities")?.let { qArr ->
+                                for (qi in 0 until qArr.length()) {
+                                    val q = qArr.optString(qi)
+                                    if (q.isNotBlank()) newQualities.add(q)
+                                }
+                            }
+                            val playUrl = resolvedSpec.url.ifBlank { directUrl.ifBlank { proxyUrl } }
+                            if (playUrl.isNotBlank() || (resolvedSpec.videoUrl.isNotBlank() && resolvedSpec.audioUrl.isNotBlank())) {
+                                val nextTitle = if (playlistEntry != null) {
+                                    playlistEntry.title.ifBlank { data?.optString("title").orEmpty().ifBlank { currentTarget.title } }
+                                } else {
+                                    val base = cleanShowTitle(currentTarget.title).ifBlank { currentTarget.title }
+                                    "$base S${seasonNum ?: 1}E${episodeNum ?: 1}"
+                                }
+                                val effTarget = PlayerStreamTarget(
+                                    url = playUrl,
+                                    headers = if (hMap.isNotEmpty()) hMap else currentTarget.headers,
+                                    title = nextTitle,
+                                    videoUrl = resolvedSpec.videoUrl,
+                                    audioUrl = resolvedSpec.audioUrl,
+                                    fallbackUrl = resolvedSpec.fallbackUrl,
+                                    videoFormat = resolvedSpec.videoFormat,
+                                    audioFormat = resolvedSpec.audioFormat,
+                                    fallbackFormat = resolvedSpec.fallbackFormat,
+                                    isAudioOnlyStream = currentTarget.isAudioOnlyStream && resolvedSpec.videoUrl.isBlank(),
+                                    currentQuality = selectedQuality,
+                                    availableQualities = if (newQualities.isNotEmpty()) sortQualitiesDescending(newQualities) else currentTarget.availableQualities,
+                                    qualityTracks = qTrackMap,
+                                    qualityUrls = qUrlMap,
+                                    targetUrl = targetUrlToResolve,
+                                    audioTracks = if (newAudioList.isNotEmpty()) prioritizeAudioTracks(newAudioList) else currentTarget.audioTracks,
+                                    audioTrackUrls = newAudioUrls,
+                                    audioTrackFormats = newAudioFormats,
+                                    selectedAudioLang = selectedAudioLang,
+                                    subtitleTracks = newSubTracks,
+                                    selectedSubLang = "",
+                                    isSeries = seasonNum != null && episodeNum != null,
+                                    seasons = seasonsList.ifEmpty { currentTarget.seasons },
+                                    selectedSeason = seasonNum ?: currentTarget.selectedSeason,
+                                    selectedEpisode = episodeNum ?: currentTarget.selectedEpisode,
+                                    isPlaylist = playlistEntry != null || currentTarget.isPlaylist,
+                                    playlistEntries = currentTarget.playlistEntries,
+                                    selectedPlaylistIndex = playlistIdx ?: currentTarget.selectedPlaylistIndex,
+                                )
+                                episodeSwitchLoading = false
+                                showSettingsSheet = false
+                                onSwitchTarget(effTarget)
+                            } else {
+                                episodeSwitchLoading = false
+                                playerErrorText = "Could not load selected episode"
+                            }
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(Icons.Outlined.PlayArrow, contentDescription = null, tint = ArcMuted, modifier = Modifier.size(18.dp))
+                            Text("Episodes", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ArcWhite)
+                            if (episodeSwitchLoading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                    color = ArcWhite,
+                                )
+                            }
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                if (hasPlaylistEpisodes) {
+                                    "${currentTarget.selectedPlaylistIndex + 1}/${currentTarget.playlistEntries.size}"
+                                } else {
+                                    "S${currentTarget.selectedSeason} E${currentTarget.selectedEpisode}"
+                                },
+                                fontSize = 12.sp,
+                                color = ArcMuted,
+                            )
+                        }
+                        if (hasPlaylistEpisodes) {
+                            LazyRow(
+                                state = episodesListState,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                itemsIndexed(currentTarget.playlistEntries) { idx, entry ->
+                                    val isSel = idx == currentTarget.selectedPlaylistIndex
+                                    val shortTitle = entry.title.trim().let {
+                                        if (it.length > 34) it.take(31) + "..." else it
+                                    }
+                                    FilterChip(
+                                        selected = isSel,
+                                        enabled = !episodeSwitchLoading,
+                                        onClick = {
+                                            switchEpisodeInPlayer(
+                                                playlistIdx = idx,
+                                                playlistEntry = entry,
+                                            )
+                                            interactionTick++
+                                        },
+                                        label = { Text("${idx + 1}. $shortTitle", maxLines = 1) },
+                                        colors = arcFilterChipColors(),
+                                        border = arcFilterChipBorder(isSel),
+                                    )
+                                }
+                            }
+                        } else {
+                            if (currentTarget.seasons.size > 1) {
+                                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    items(currentTarget.seasons) { seasonInfo ->
+                                        val isSeasonSel = seasonInfo.season == selectedSheetSeason
+                                        FilterChip(
+                                            selected = isSeasonSel,
+                                            enabled = !episodeSwitchLoading,
+                                            onClick = {
+                                                selectedSheetSeason = seasonInfo.season
+                                                interactionTick++
+                                            },
+                                            label = { Text("Season ${seasonInfo.season}") },
+                                            colors = arcFilterChipColors(),
+                                            border = arcFilterChipBorder(isSeasonSel),
+                                        )
+                                    }
+                                }
+                            }
+                            val activeSeasonInfo = currentTarget.seasons.firstOrNull { it.season == selectedSheetSeason }
+                                ?: currentTarget.seasons.first()
+                            val epCount = activeSeasonInfo.episodes.coerceAtLeast(1)
+                            LazyRow(
+                                state = episodesListState,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(epCount) { idx ->
+                                    val epNum = idx + 1
+                                    val isEpSel = selectedSheetSeason == currentTarget.selectedSeason && epNum == currentTarget.selectedEpisode
+                                    FilterChip(
+                                        selected = isEpSel,
+                                        enabled = !episodeSwitchLoading,
+                                        onClick = {
+                                            switchEpisodeInPlayer(
+                                                seasonNum = selectedSheetSeason,
+                                                episodeNum = epNum,
+                                            )
+                                            interactionTick++
+                                        },
+                                        label = { Text("Ep $epNum") },
+                                        colors = arcFilterChipColors(),
+                                        border = arcFilterChipBorder(isEpSel),
                                     )
                                 }
                             }

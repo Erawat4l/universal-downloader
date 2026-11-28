@@ -654,6 +654,89 @@ def t_store_scan_ignores_staging():
         assert names == ["Final Movie (2025).mp4"], names
 
 
+@test("dl.handle_youtube_or_video handles YouTube playlists without UnboundLocalError")
+def t_youtube_playlist_cap_and_batch():
+    import dl
+    with tempfile.TemporaryDirectory() as td:
+        seen_hooks = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def prepare_filename(self, info):
+                outtmpl = str(self.opts.get("outtmpl") or "")
+                return outtmpl.replace("%(title)s", info.get("title", "Video")).replace("%(ext)s", "mp4")
+
+            def extract_info(self, url, download=False):
+                if not download:
+                    return {
+                        "_type": "playlist",
+                        "entries": [
+                            {"id": "aaa11111111", "title": "First Lesson"},
+                            {"id": "bbb22222222", "title": "Second Lesson"},
+                        ],
+                    }
+                vid_title = "First Lesson" if "aaa11111111" in url else "Second Lesson"
+                fp = self.prepare_filename({"title": vid_title})
+                os.makedirs(os.path.dirname(fp), exist_ok=True)
+                Path(fp).write_bytes(b"fake-mp4-data")
+                for hook in self.opts.get("progress_hooks") or []:
+                    hook({
+                        "status": "downloading",
+                        "downloaded_bytes": 512,
+                        "total_bytes": 1024,
+                        "speed": 1024,
+                        "eta": 1,
+                        "info_dict": {"vcodec": "avc1", "acodec": "none"},
+                    })
+                    seen_hooks.append(dict(dl.ACTIVE_DOWNLOAD_PROGRESS.get("pl-job-1") or {}))
+                    hook({
+                        "status": "finished",
+                        "info_dict": {"vcodec": "avc1", "acodec": "none"},
+                    })
+                return {"id": vid_title, "title": vid_title, "filepath": fp, "requested_downloads": [{"filepath": fp}]}
+
+        orig_ydl = dl.yt_dlp.YoutubeDL
+        orig_prompt = dl.prompt_video_quality
+        try:
+            dl.yt_dlp.YoutubeDL = FakeYDL
+            dl.prompt_video_quality = lambda *a, **kw: ("bestvideo[height<=1080]+bestaudio/best", False)
+            res = dl.handle_youtube_or_video(
+                "https://www.youtube.com/playlist?list=PLH7P5bCUMKyg",
+                target_dir=td,
+                quality_arg="1080p (Full HD)",
+                standalone=True,
+                job_id="pl-job-1",
+                out_name="ICSE Class 10 Treasure Chest",
+            )
+            assert isinstance(res, str) and os.path.isfile(res), f"unexpected result: {res}"
+            batch_paths = dl.PLAYLIST_BATCH_PATHS.pop("pl-job-1", [])
+            assert len(batch_paths) == 2 and all(os.path.isfile(p) for p in batch_paths), batch_paths
+            assert any(h.get("status") != "Complete" and float(h.get("percent", 0)) < 100.0 for h in seen_hooks), seen_hooks
+            assert float((dl.ACTIVE_DOWNLOAD_PROGRESS.get("pl-job-1") or {}).get("percent", 0)) == 100.0
+        finally:
+            dl.yt_dlp.YoutubeDL = orig_ydl
+            dl.prompt_video_quality = orig_prompt
+            dl.ACTIVE_DOWNLOAD_PROGRESS.pop("pl-job-1", None)
+            dl.PLAYLIST_BATCH_PATHS.pop("pl-job-1", None)
+
+
+@test("MainActivity wires Episodes section into Playback Settings")
+def t_android_player_episodes_section():
+    kt = (REPO / "android-app" / "app" / "src" / "main" / "java" / "com" / "erawat" / "arc" / "MainActivity.kt").read_text(encoding="utf-8")
+    assert 'Text("Episodes"' in kt
+    assert "selectedPlaylistIndex" in kt
+    assert "playlistContextEntries" in kt
+    assert "onSwitchTarget" in kt
+
+
 # ============================================================== main
 def main() -> int:
     print("")
